@@ -23,8 +23,8 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 10] = [
-    "display", "newline", "+", "-", "*", "=", "<", "<=", ">", ">=",
+const NATIVE_NAMES: [&str; 11] = [
+    "display", "newline", "+", "-", "*", "/", "=", "<", "<=", ">", ">=",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -37,6 +37,7 @@ pub fn default_globals() -> HashMap<String, Value> {
 fn const_to_value(c: &Const) -> Value {
     match c {
         Const::Int(n) => Value::Int(*n),
+        Const::Float(n) => Value::Float(*n),
         Const::Bool(b) => Value::Bool(*b),
         Const::Str(s) => Value::Str(s.clone()),
         Const::Symbol(s) => Value::Symbol(s.clone()),
@@ -415,6 +416,7 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
         "+" => native_plus(args),
         "-" => native_minus(args),
         "*" => native_times(args),
+        "/" => native_divide(args),
         "=" => native_compare("=", args, |a, b| a == b),
         "<" => native_compare("<", args, |a, b| a < b),
         "<=" => native_compare("<=", args, |a, b| a <= b),
@@ -435,7 +437,26 @@ fn to_ints(opname: &str, args: &[Value]) -> Result<Vec<i64>, RuntimeError> {
         .collect()
 }
 
+fn any_float(args: &[Value]) -> bool {
+    args.iter().any(|v| matches!(v, Value::Float(_)))
+}
+
+fn to_f64s(opname: &str, args: &[Value]) -> Result<Vec<f64>, RuntimeError> {
+    args.iter()
+        .map(|v| match v {
+            Value::Int(n) => Ok(*n as f64),
+            Value::Float(n) => Ok(*n),
+            other => Err(error(format!(
+                "{opname} expects numeric arguments, found {other}"
+            ))),
+        })
+        .collect()
+}
+
 fn native_plus(args: &[Value]) -> Result<Value, RuntimeError> {
+    if any_float(args) {
+        return Ok(Value::Float(to_f64s("+", args)?.iter().sum()));
+    }
     let ints = to_ints("+", args)?;
     Ok(Value::Int(
         ints.iter().fold(0i64, |acc, n| acc.wrapping_add(*n)),
@@ -443,19 +464,30 @@ fn native_plus(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn native_minus(args: &[Value]) -> Result<Value, RuntimeError> {
-    if args.len() < 2 {
-        return Err(error("- requires at least 2 arguments"));
+    if args.is_empty() {
+        return Err(error("- requires at least 1 argument"));
+    }
+    if any_float(args) {
+        let nums = to_f64s("-", args)?;
+        let (first, rest) = nums.split_first().unwrap();
+        return Ok(Value::Float(if rest.is_empty() {
+            -first
+        } else {
+            rest.iter().fold(*first, |acc, n| acc - n)
+        }));
     }
     let ints = to_ints("-", args)?;
     let (first, rest) = ints.split_first().unwrap();
-    Ok(Value::Int(
-        rest.iter().fold(*first, |acc, n| acc.wrapping_sub(*n)),
-    ))
+    Ok(Value::Int(if rest.is_empty() {
+        first.wrapping_neg()
+    } else {
+        rest.iter().fold(*first, |acc, n| acc.wrapping_sub(*n))
+    }))
 }
 
 fn native_times(args: &[Value]) -> Result<Value, RuntimeError> {
-    if args.len() < 2 {
-        return Err(error("* requires at least 2 arguments"));
+    if any_float(args) {
+        return Ok(Value::Float(to_f64s("*", args)?.iter().product()));
     }
     let ints = to_ints("*", args)?;
     Ok(Value::Int(
@@ -463,16 +495,79 @@ fn native_times(args: &[Value]) -> Result<Value, RuntimeError> {
     ))
 }
 
+/// The result of dividing two exact integers: still exact if the divisor
+/// evenly divides the accumulator, otherwise the point where the running
+/// result must become a float (per the division rule: "exact at every
+/// step, or a float").
+enum IntDivStep {
+    Exact(i64),
+    Inexact(f64),
+}
+
+fn int_div_step(acc: i64, divisor: i64) -> Result<IntDivStep, RuntimeError> {
+    if divisor == 0 {
+        return Err(error("division by exact zero"));
+    }
+    if acc % divisor == 0 {
+        Ok(IntDivStep::Exact(acc / divisor))
+    } else {
+        Ok(IntDivStep::Inexact(acc as f64 / divisor as f64))
+    }
+}
+
+fn native_divide(args: &[Value]) -> Result<Value, RuntimeError> {
+    if args.is_empty() {
+        return Err(error("/ requires at least 1 argument"));
+    }
+    if any_float(args) {
+        let nums = to_f64s("/", args)?;
+        let (first, rest) = nums.split_first().unwrap();
+        return Ok(Value::Float(if rest.is_empty() {
+            1.0 / first
+        } else {
+            rest.iter().fold(*first, |acc, n| acc / n)
+        }));
+    }
+
+    let ints = to_ints("/", args)?;
+    if let [only] = ints[..] {
+        return Ok(match int_div_step(1, only)? {
+            IntDivStep::Exact(n) => Value::Int(n),
+            IntDivStep::Inexact(f) => Value::Float(f),
+        });
+    }
+    let (first, rest) = ints.split_first().unwrap();
+    // Stays an exact integer division as long as every step divides evenly;
+    // the moment one step doesn't, the whole result becomes (and, per the
+    // division rule, stays) a float for any remaining divisors.
+    let mut exact_acc = *first;
+    let mut float_acc: Option<f64> = None;
+    for &divisor in rest {
+        if let Some(acc) = float_acc {
+            float_acc = Some(acc / divisor as f64);
+            continue;
+        }
+        match int_div_step(exact_acc, divisor)? {
+            IntDivStep::Exact(n) => exact_acc = n,
+            IntDivStep::Inexact(f) => float_acc = Some(f),
+        }
+    }
+    Ok(match float_acc {
+        Some(f) => Value::Float(f),
+        None => Value::Int(exact_acc),
+    })
+}
+
 fn native_compare(
     opname: &str,
     args: &[Value],
-    holds: fn(i64, i64) -> bool,
+    holds: fn(f64, f64) -> bool,
 ) -> Result<Value, RuntimeError> {
     if args.len() < 2 {
         return Err(error(format!("{opname} requires at least 2 arguments")));
     }
-    let ints = to_ints(opname, args)?;
-    let all_hold = ints.windows(2).all(|pair| holds(pair[0], pair[1]));
+    let nums = to_f64s(opname, args)?;
+    let all_hold = nums.windows(2).all(|pair| holds(pair[0], pair[1]));
     Ok(Value::Bool(all_hold))
 }
 
@@ -766,8 +861,15 @@ mod tests {
     }
 
     #[test]
-    fn minus_with_fewer_than_two_arguments_is_a_runtime_error() {
-        assert!(eval("(display (- 5))").is_err());
+    fn minus_with_exactly_one_argument_negates_it() {
+        // B4 completes -'s variadic rule: unlike B2's original >=2 minimum,
+        // a single argument now negates rather than erroring.
+        assert_eq!(eval("(display (- 5))").unwrap(), "-5");
+    }
+
+    #[test]
+    fn minus_with_zero_arguments_is_a_runtime_error() {
+        assert!(eval("(display (-))").is_err());
     }
 
     #[test]
@@ -781,8 +883,15 @@ mod tests {
     }
 
     #[test]
-    fn times_with_fewer_than_two_arguments_is_a_runtime_error() {
-        assert!(eval("(display (* 5))").is_err());
+    fn times_with_exactly_one_argument_is_that_argument() {
+        // B4 completes *'s variadic rule: unlike B2's original >=2 minimum,
+        // 0 or 1 arguments now work like +'s (identity 1, or the value itself).
+        assert_eq!(eval("(display (* 5))").unwrap(), "5");
+    }
+
+    #[test]
+    fn times_with_zero_arguments_is_one() {
+        assert_eq!(eval("(display (*))").unwrap(), "1");
     }
 
     #[test]
@@ -827,6 +936,78 @@ mod tests {
             eval(&format!("(display (* {} 2))", i64::MAX)).unwrap(),
             i64::MAX.wrapping_mul(2).to_string()
         );
+    }
+
+    // --- B4: division and float arithmetic ---
+
+    #[test]
+    fn division_with_zero_arguments_is_a_runtime_error() {
+        assert!(eval("(display (/))").is_err());
+    }
+
+    #[test]
+    fn division_with_one_integer_argument_inverts_it_as_a_float_when_inexact() {
+        assert_eq!(eval("(display (/ 6))").unwrap(), "0.16666666666666666");
+    }
+
+    #[test]
+    fn division_with_one_integer_argument_stays_exact_when_it_divides_one_evenly() {
+        assert_eq!(eval("(display (/ 1))").unwrap(), "1");
+        assert_eq!(eval("(display (/ -1))").unwrap(), "-1");
+    }
+
+    #[test]
+    fn whole_number_division_that_comes_out_exact_yields_an_integer() {
+        assert_eq!(eval("(display (/ 6 3))").unwrap(), "2");
+    }
+
+    #[test]
+    fn whole_number_division_that_does_not_come_out_exact_yields_a_float() {
+        assert_eq!(eval("(display (/ 7 2))").unwrap(), "3.5");
+    }
+
+    #[test]
+    fn a_whole_number_divided_by_a_float_yields_a_float_even_when_exact() {
+        assert_eq!(eval("(display (/ 6 3.0))").unwrap(), "2.0");
+    }
+
+    #[test]
+    fn dividing_by_exact_integer_zero_is_a_runtime_error() {
+        assert!(eval("(display (/ 6 0))").is_err());
+    }
+
+    #[test]
+    fn once_a_division_chain_goes_inexact_a_later_integer_zero_divisor_follows_float_rules() {
+        // 7/2 is already inexact (3.5), so this must NOT error like an
+        // exact int/0 division would -- it follows IEEE float rules instead.
+        assert_eq!(eval("(display (/ 7 2 0))").unwrap(), "+inf.0");
+    }
+
+    #[test]
+    fn dividing_a_float_by_zero_follows_ieee_rules_instead_of_erroring() {
+        assert_eq!(eval("(display (/ 1.0 0.0))").unwrap(), "+inf.0");
+        assert_eq!(eval("(display (/ -1.0 0.0))").unwrap(), "-inf.0");
+    }
+
+    #[test]
+    fn plus_promotes_to_float_when_any_argument_is_a_float() {
+        assert_eq!(eval("(display (+ 1 2.0))").unwrap(), "3.0");
+    }
+
+    #[test]
+    fn minus_promotes_to_float_when_any_argument_is_a_float() {
+        assert_eq!(eval("(display (- 5.0 2))").unwrap(), "3.0");
+    }
+
+    #[test]
+    fn times_promotes_to_float_when_any_argument_is_a_float() {
+        assert_eq!(eval("(display (* 2 2.5))").unwrap(), "5.0");
+    }
+
+    #[test]
+    fn comparisons_support_mixed_integer_and_float_arguments() {
+        assert_eq!(eval("(display (< 1 1.5 2))").unwrap(), "#t");
+        assert_eq!(eval("(display (= 2 2.0))").unwrap(), "#t");
     }
 
     #[test]

@@ -198,6 +198,7 @@ fn parse_formals(sexpr: &Sexpr) -> Result<Formals, CompileError> {
 fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
     Ok(match sexpr {
         Sexpr::Int(n) => Const::Int(*n),
+        Sexpr::Float(n) => Const::Float(*n),
         Sexpr::Bool(b) => Const::Bool(*b),
         Sexpr::Str(s) => Const::Str(s.clone()),
         Sexpr::Symbol(s) => Const::Symbol(s.clone()),
@@ -228,6 +229,33 @@ fn expect_bindings_list(sexpr: &Sexpr) -> Result<Vec<(String, Sexpr)>, CompileEr
             })
             .collect(),
         other => Err(err(format!("expected a list of bindings, found {other:?}"))),
+    }
+}
+
+/// `do`'s bindings are `(name init step)` or, with the step omitted,
+/// `(name init)` — an omitted step just re-binds `name` to itself each
+/// iteration, so it defaults to a reference to the variable.
+fn expect_do_bindings(sexpr: &Sexpr) -> Result<Vec<(String, Sexpr, Sexpr)>, CompileError> {
+    match sexpr {
+        Sexpr::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Sexpr::List(triple) if triple.len() == 3 => {
+                    let name = expect_symbol_name(&triple[0])?;
+                    Ok((name, triple[1].clone(), triple[2].clone()))
+                }
+                Sexpr::List(pair) if pair.len() == 2 => {
+                    let name = expect_symbol_name(&pair[0])?;
+                    Ok((name.clone(), pair[1].clone(), Sexpr::Symbol(name)))
+                }
+                other => Err(err(format!(
+                    "expected a (name init step) or (name init) do-binding, found {other:?}"
+                ))),
+            })
+            .collect(),
+        other => Err(err(format!(
+            "expected a list of do-bindings, found {other:?}"
+        ))),
     }
 }
 
@@ -600,6 +628,80 @@ fn compile_named_let(
     Ok(())
 }
 
+/// `do`: standard iteration, desugared directly into the equivalent named
+/// `let` —
+///   (do ((v init step)...) (test result...) command...)
+///   =>
+///   (let LOOP ((v init)...)
+///     (if test (begin result...) (begin command... (LOOP step...))))
+/// — rather than given its own compilation strategy, so it reuses
+/// named-let's already-proven self-recursion mechanism (and, transitively,
+/// the VM's call-depth guard and dedicated large stack) instead of
+/// introducing a second, separate iteration construct with its own risk
+/// surface. `LOOP` is a plain placeholder symbol here: compile_named_let
+/// immediately rebinds it to a fresh gensym alias and never exposes it to
+/// user code, so it can't collide with anything.
+fn compile_do(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let bindings_sexpr = items
+        .get(1)
+        .ok_or_else(|| err("do requires a bindings list"))?;
+    let bindings = expect_do_bindings(bindings_sexpr)?;
+
+    let test_clause = match items.get(2) {
+        Some(Sexpr::List(clause)) => clause,
+        _ => return Err(err("do requires a (test result...) clause")),
+    };
+    let (test, results) = test_clause
+        .split_first()
+        .ok_or_else(|| err("do's test clause requires a test expression"))?;
+    let commands = &items[3..];
+
+    let loop_name = "do-loop".to_string();
+    let let_bindings = Sexpr::List(
+        bindings
+            .iter()
+            .map(|(name, init, _)| Sexpr::List(vec![Sexpr::Symbol(name.clone()), init.clone()]))
+            .collect(),
+    );
+
+    let recur = Sexpr::List(
+        std::iter::once(Sexpr::Symbol(loop_name.clone()))
+            .chain(bindings.iter().map(|(_, _, step)| step.clone()))
+            .collect(),
+    );
+    let else_branch = Sexpr::List(
+        std::iter::once(Sexpr::Symbol("begin".to_string()))
+            .chain(commands.iter().cloned())
+            .chain(std::iter::once(recur))
+            .collect(),
+    );
+    let then_branch = Sexpr::List(
+        std::iter::once(Sexpr::Symbol("begin".to_string()))
+            .chain(results.iter().cloned())
+            .collect(),
+    );
+    let if_form = Sexpr::List(vec![
+        Sexpr::Symbol("if".to_string()),
+        test.clone(),
+        then_branch,
+        else_branch,
+    ]);
+
+    let named_let = vec![
+        Sexpr::Symbol("let".to_string()),
+        Sexpr::Symbol(loop_name),
+        let_bindings,
+        if_form,
+    ];
+    compile_named_let(&named_let, ctx, chunk, comp, depth)
+}
+
 /// `set!`: mutates an existing binding in place. Resolves the target the
 /// same way a read would (local slot, then alias, then plain global);
 /// mutating a name that turns out not to exist as a global is a runtime
@@ -895,6 +997,10 @@ fn compile_expr(
             let idx = chunk.add_const(Const::Int(*n));
             chunk.emit_const(idx);
         }
+        Sexpr::Float(n) => {
+            let idx = chunk.add_const(Const::Float(*n));
+            chunk.emit_const(idx);
+        }
         Sexpr::Bool(b) => {
             let idx = chunk.add_const(Const::Bool(*b));
             chunk.emit_const(idx);
@@ -935,6 +1041,7 @@ fn compile_expr(
                     "unless" => return compile_unless(items, ctx, chunk, comp, depth),
                     "cond" => return compile_cond(items, ctx, chunk, comp, depth),
                     "case" => return compile_case(items, ctx, chunk, comp, depth),
+                    "do" => return compile_do(items, ctx, chunk, comp, depth),
                     _ => {}
                 }
             }
@@ -1590,6 +1697,71 @@ mod tests {
                 Op::Halt,
             ]
         );
+    }
+
+    #[test]
+    fn compiles_do_as_a_self_recursive_named_let_desugaring() {
+        // (do ((i 0 (+ i 1))) ((= i 3) i))
+        let program = [list(vec![
+            sym("do"),
+            list(vec![list(vec![
+                sym("i"),
+                Sexpr::Int(0),
+                list(vec![sym("+"), sym("i"), Sexpr::Int(1)]),
+            ])]),
+            list(vec![
+                list(vec![sym("="), sym("i"), Sexpr::Int(3)]),
+                sym("i"),
+            ]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        // Same shape as named-let's own test: a MakeFunction-bound loop
+        // called immediately, proving `do` reused that mechanism rather
+        // than introducing a separate one.
+        assert_eq!(module.functions.len(), 2);
+        let entry = entry_of(&module);
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![
+                Op::MakeFunction,
+                Op::DefGlobal,
+                Op::Pop,
+                Op::GetGlobal, // the immediate call to the loop function
+                Op::Const,     // initial value 0
+                Op::Call,
+                Op::Pop,
+                Op::Halt,
+            ]
+        );
+    }
+
+    #[test]
+    fn do_with_an_omitted_step_defaults_to_re_binding_the_variable_to_itself() {
+        // (do ((i 0)) (#t i)) -- no step given for i.
+        let program = [list(vec![
+            sym("do"),
+            list(vec![list(vec![sym("i"), Sexpr::Int(0)])]),
+            list(vec![Sexpr::Bool(true), sym("i")]),
+        ])];
+        // Compiles without error; the desugared recursive call `(loop i)`
+        // resolves `i` as a local reference, not an unbound global.
+        let module = compile_program(&program).unwrap();
+        let loop_fn = &module.functions[0];
+        assert!(opcode_sequence(&loop_fn.code).contains(&Op::GetLocal));
+    }
+
+    #[test]
+    fn a_do_binding_with_neither_two_nor_three_elements_is_a_compile_error() {
+        // Guards expect_do_bindings' two arity-checked match arms: a
+        // single-element binding matches neither the (name init step) nor
+        // the (name init) shape and must be rejected, not silently
+        // accepted by an over-loose guard.
+        let program = [list(vec![
+            sym("do"),
+            list(vec![list(vec![sym("i")])]),
+            list(vec![Sexpr::Bool(true), sym("i")]),
+        ])];
+        assert!(compile_program(&program).is_err());
     }
 
     #[test]

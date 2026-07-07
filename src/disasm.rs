@@ -27,6 +27,7 @@ fn consume_step(remaining: usize) -> usize {
 fn describe_const_value(c: &Const) -> String {
     match c {
         Const::Int(n) => n.to_string(),
+        Const::Float(n) => n.to_string(),
         Const::Bool(b) => b.to_string(),
         Const::Str(s) => format!("{s:?}"),
         Const::Symbol(s) => s.clone(),

@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Sexpr {
     Int(i64),
+    Float(f64),
     Bool(bool),
     Str(String),
     Symbol(String),
@@ -193,19 +194,67 @@ impl<'a> Scanner<'a> {
         if text.is_empty() {
             return Err(err("unexpected character while reading a token"));
         }
-        Ok(atom_from_text(&text))
+        atom_from_text(&text)
     }
 }
 
-fn atom_from_text(text: &str) -> Sexpr {
-    match text {
-        "true" | "#t" => Sexpr::Bool(true),
-        "false" | "#f" => Sexpr::Bool(false),
-        _ => match text.parse::<i64>() {
-            Ok(n) => Sexpr::Int(n),
-            Err(_) => Sexpr::Symbol(text.to_string()),
-        },
+/// Whether `text` should be parsed as a number at all, vs. treated as an
+/// ordinary symbol. A token counts as numeric-looking if, after an optional
+/// leading sign, it starts with a digit, or with a decimal point that is
+/// itself followed by a digit — e.g. `-`, `->vector`, `+`, and a lone `.`
+/// (the dotted-pair marker) all stay symbols, while `-7`, `.5`, and `-.5`
+/// are numeric.
+fn looks_numeric(text: &str) -> bool {
+    let mut chars = text.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    let first_digit_candidate = if first == '+' || first == '-' {
+        chars.next()
+    } else {
+        Some(first)
+    };
+    match first_digit_candidate {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
     }
+}
+
+fn parse_radix_int(body: &str, radix: u32, original: &str) -> Result<Sexpr, ReadError> {
+    i64::from_str_radix(body, radix)
+        .map(Sexpr::Int)
+        .map_err(|_| err(format!("invalid or out-of-range radix literal: {original}")))
+}
+
+fn atom_from_text(text: &str) -> Result<Sexpr, ReadError> {
+    match text {
+        "true" | "#t" => return Ok(Sexpr::Bool(true)),
+        "false" | "#f" => return Ok(Sexpr::Bool(false)),
+        _ => {}
+    }
+    if let Some(body) = text.strip_prefix("#x").or_else(|| text.strip_prefix("#X")) {
+        return parse_radix_int(body, 16, text);
+    }
+    if let Some(body) = text.strip_prefix("#b").or_else(|| text.strip_prefix("#B")) {
+        return parse_radix_int(body, 2, text);
+    }
+    if let Some(body) = text.strip_prefix("#o").or_else(|| text.strip_prefix("#O")) {
+        return parse_radix_int(body, 8, text);
+    }
+    if looks_numeric(text) {
+        return if text.contains('.') || text.contains('e') || text.contains('E') {
+            text.parse::<f64>()
+                .map(Sexpr::Float)
+                .map_err(|_| err(format!("invalid float literal: {text}")))
+        } else {
+            text.parse::<i64>()
+                .map(Sexpr::Int)
+                .map_err(|_| err(format!("integer literal out of range or malformed: {text}")))
+        };
+    }
+    Ok(Sexpr::Symbol(text.to_string()))
 }
 
 pub fn read_program(src: &str) -> Result<Vec<Sexpr>, ReadError> {
@@ -229,6 +278,77 @@ mod tests {
     #[test]
     fn reads_a_negative_number() {
         assert_eq!(read_program("-7").unwrap(), vec![Sexpr::Int(-7)]);
+    }
+
+    #[test]
+    fn reads_a_decimal_point_float() {
+        assert_eq!(read_program("1.5").unwrap(), vec![Sexpr::Float(1.5)]);
+    }
+
+    #[test]
+    fn reads_a_leading_dot_float() {
+        assert_eq!(read_program(".5").unwrap(), vec![Sexpr::Float(0.5)]);
+    }
+
+    #[test]
+    fn reads_a_negative_leading_dot_float() {
+        assert_eq!(read_program("-.5").unwrap(), vec![Sexpr::Float(-0.5)]);
+    }
+
+    #[test]
+    fn reads_an_exponent_form_float_with_no_decimal_point() {
+        assert_eq!(read_program("1e3").unwrap(), vec![Sexpr::Float(1000.0)]);
+    }
+
+    #[test]
+    fn reads_a_decimal_point_and_exponent_float() {
+        assert_eq!(read_program("1.5e-3").unwrap(), vec![Sexpr::Float(0.0015)]);
+    }
+
+    #[test]
+    fn a_lone_dot_stays_a_symbol_not_a_malformed_float() {
+        // Guards looks_numeric's ".5 is numeric but a bare '.' is not"
+        // distinction directly, independent of dotted-pair-list parsing.
+        assert_eq!(
+            read_program(".").unwrap(),
+            vec![Sexpr::Symbol(".".to_string())]
+        );
+    }
+
+    #[test]
+    fn reads_a_hexadecimal_integer_literal() {
+        assert_eq!(read_program("#x1A").unwrap(), vec![Sexpr::Int(26)]);
+    }
+
+    #[test]
+    fn reads_a_binary_integer_literal() {
+        assert_eq!(read_program("#b101").unwrap(), vec![Sexpr::Int(5)]);
+    }
+
+    #[test]
+    fn reads_an_octal_integer_literal() {
+        assert_eq!(read_program("#o17").unwrap(), vec![Sexpr::Int(15)]);
+    }
+
+    #[test]
+    fn reads_a_negative_radix_integer_literal() {
+        assert_eq!(read_program("#x-1A").unwrap(), vec![Sexpr::Int(-26)]);
+    }
+
+    #[test]
+    fn an_integer_literal_outside_the_signed_64_bit_range_is_a_read_error() {
+        let src = format!("{}0", i64::MAX);
+        let err = read_program(&src).unwrap_err();
+        assert!(
+            err.message.contains("range") || err.message.contains("malformed"),
+            "expected an out-of-range error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_hex_literal_is_a_read_error() {
+        assert!(read_program("#xFFFFFFFFFFFFFFFFF").is_err());
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub enum Op {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Const {
     Int(i64),
+    Float(f64),
     Bool(bool),
     Str(String),
     Symbol(String),
@@ -184,6 +185,10 @@ fn encode_const(out: &mut Vec<u8>, c: &Const) {
             out.push(0);
             out.extend_from_slice(&n.to_le_bytes());
         }
+        Const::Float(n) => {
+            out.push(6);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
         Const::Bool(b) => {
             out.push(1);
             out.push(if *b { 1 } else { 0 });
@@ -267,6 +272,10 @@ impl<'a> Reader<'a> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    fn f64(&mut self) -> Result<f64, BytecodeError> {
+        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
     fn bytes_owned(&mut self, n: usize) -> Result<Vec<u8>, BytecodeError> {
         Ok(self.take(n)?.to_vec())
     }
@@ -301,6 +310,7 @@ fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
             Const::List(items)
         }
         5 => Const::Unspecified,
+        6 => Const::Float(r.f64()?),
         _ => return Err(BytecodeError::Truncated),
     })
 }
@@ -395,6 +405,21 @@ mod tests {
     #[test]
     fn round_trips_a_module_byte_for_byte_through_encode_and_decode() {
         let module = sample_module();
+        let bytes = encode(&module);
+        let decoded = decode(&bytes).expect("valid module should decode");
+        assert_eq!(decoded, module);
+    }
+
+    #[test]
+    fn round_trips_a_float_constant_byte_for_byte() {
+        let mut chunk = Chunk::new();
+        let idx = chunk.add_const(Const::Float(3.5));
+        chunk.emit_const(idx);
+        chunk.emit_halt();
+        let module = Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        };
         let bytes = encode(&module);
         let decoded = decode(&bytes).expect("valid module should decode");
         assert_eq!(decoded, module);

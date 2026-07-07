@@ -5,6 +5,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
+    Float(f64),
     Bool(bool),
     Str(String),
     Symbol(String),
@@ -15,10 +16,50 @@ pub enum Value {
     Unspecified,
 }
 
+/// Formats a float per spec: the shortest decimal text that reads back to
+/// the exact same value (delegated to Rust's own Display for f64, which
+/// already implements shortest-round-trip digit generation — reimplementing
+/// that algorithm by hand would just be a worse copy of it), always with an
+/// explicit decimal point (a whole-valued float still shows a trailing
+/// `.0`), switching to exponential notation outside the ordinary magnitude
+/// range [1e-3, 1e15], with dedicated forms for the special values and for
+/// negative zero (which Rust's own Display collapses to "-0", losing the
+/// distinction this language needs to preserve).
+fn format_float(n: f64) -> String {
+    if n.is_nan() {
+        return "+nan.0".to_string();
+    }
+    if n.is_infinite() {
+        return if n.is_sign_positive() {
+            "+inf.0".to_string()
+        } else {
+            "-inf.0".to_string()
+        };
+    }
+    if n == 0.0 {
+        return if n.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        };
+    }
+    if (1e-3..=1e15).contains(&n.abs()) {
+        let plain = format!("{n}");
+        if plain.contains('.') {
+            plain
+        } else {
+            format!("{plain}.0")
+        }
+    } else {
+        format!("{n:e}")
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{n}"),
+            Value::Float(n) => write!(f, "{}", format_float(*n)),
             Value::Bool(true) => write!(f, "#t"),
             Value::Bool(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "{s}"),
@@ -99,6 +140,45 @@ mod tests {
             Value::List(vec![Value::Int(2), Value::Int(3)]),
         ]);
         assert_eq!(list.to_string(), "(1 (2 3))");
+    }
+
+    #[test]
+    fn displays_a_whole_valued_float_with_a_trailing_dot_zero() {
+        assert_eq!(Value::Float(1.0).to_string(), "1.0");
+        assert_eq!(Value::Float(-3.0).to_string(), "-3.0");
+    }
+
+    #[test]
+    fn displays_a_fractional_float_with_its_shortest_round_tripping_digits() {
+        assert_eq!(Value::Float(3.5).to_string(), "3.5");
+        assert_eq!(Value::Float(0.1).to_string(), "0.1");
+    }
+
+    #[test]
+    fn displays_positive_and_negative_zero_distinctly() {
+        assert_eq!(Value::Float(0.0).to_string(), "0.0");
+        assert_eq!(Value::Float(-0.0).to_string(), "-0.0");
+    }
+
+    #[test]
+    fn displays_the_special_float_values_in_their_dedicated_forms() {
+        assert_eq!(Value::Float(f64::NAN).to_string(), "+nan.0");
+        assert_eq!(Value::Float(f64::INFINITY).to_string(), "+inf.0");
+        assert_eq!(Value::Float(f64::NEG_INFINITY).to_string(), "-inf.0");
+    }
+
+    #[test]
+    fn displays_ordinary_magnitudes_in_plain_non_exponent_notation() {
+        // The boundary itself (1e15) is still plain, per spec's inclusive
+        // [1e-3, 1e15] range.
+        assert_eq!(Value::Float(1e15).to_string(), "1000000000000000.0");
+        assert_eq!(Value::Float(1e-3).to_string(), "0.001");
+    }
+
+    #[test]
+    fn switches_to_exponential_notation_outside_the_ordinary_magnitude_range() {
+        assert_eq!(Value::Float(1e16).to_string(), "1e16");
+        assert_eq!(Value::Float(1e-4).to_string(), "1e-4");
     }
 
     #[test]
