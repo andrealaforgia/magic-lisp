@@ -1,0 +1,13 @@
+.relay/
+# nWave activation marker (keep .nwave/local-config.json trackable)
+.nwave/*
+!.nwave/local-config.json
+
+
+# Added by cargo
+
+/target
+
+# mutation testing scratch output
+/mutants.out/
+/mutants.out.old/
