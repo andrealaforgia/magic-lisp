@@ -232,15 +232,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_expression_nesting_deeper_than_the_configured_maximum() {
-        // Guards against unbounded recursion in compile_expr on a
-        // pathologically deep (but structurally valid) expression tree
-        // (a security-review finding on B1).
-        let program = [nested_call(600)];
-        assert!(compile_program(&program).is_err());
-    }
-
-    #[test]
     fn accepts_expression_nesting_comfortably_under_the_configured_maximum() {
         let program = [nested_call(100)];
         assert!(compile_program(&program).is_ok());
@@ -254,8 +245,16 @@ mod tests {
 
     #[test]
     fn rejects_expression_nesting_of_one_more_than_the_configured_maximum_depth() {
+        // Guards against unbounded recursion in compile_expr on a
+        // pathologically deep (but structurally valid) expression tree
+        // (a security-review finding on B1).
         let program = [nested_call(MAX_NESTING_DEPTH + 1)];
-        assert!(compile_program(&program).is_err());
+        let err = compile_program(&program).unwrap_err();
+        assert!(
+            err.message.contains("nesting") && err.message.contains("depth"),
+            "expected a nesting-depth error, got: {}",
+            err.message
+        );
     }
 
     fn nested_in_callee_position(depth: usize) -> Sexpr {
@@ -270,14 +269,25 @@ mod tests {
     }
 
     #[test]
-    fn tracks_depth_through_the_callee_position_not_just_the_argument_list() {
-        let program = [nested_in_callee_position(600)];
-        assert!(compile_program(&program).is_err());
-    }
-
-    #[test]
     fn accepts_callee_position_nesting_comfortably_under_the_configured_maximum() {
         let program = [nested_in_callee_position(100)];
         assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    fn accepts_callee_position_nesting_of_exactly_the_configured_maximum_depth() {
+        let program = [nested_in_callee_position(MAX_NESTING_DEPTH)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    fn rejects_callee_position_nesting_of_one_more_than_the_configured_maximum_depth() {
+        let program = [nested_in_callee_position(MAX_NESTING_DEPTH + 1)];
+        let err = compile_program(&program).unwrap_err();
+        assert!(
+            err.message.contains("nesting") && err.message.contains("depth"),
+            "expected a nesting-depth error, got: {}",
+            err.message
+        );
     }
 }
