@@ -1,6 +1,6 @@
-//! Human-readable disassembly of a compiled chunk.
+//! Human-readable disassembly of a compiled module.
 
-use crate::bytecode::{Chunk, Const, Op};
+use crate::bytecode::{Chunk, Const, Module, Op};
 use std::fmt::Write as _;
 
 fn read_u32(code: &[u8], ip: usize) -> Option<u32> {
@@ -24,24 +24,31 @@ fn consume_step(remaining: usize) -> usize {
     remaining.saturating_sub(1)
 }
 
+fn describe_const_value(c: &Const) -> String {
+    match c {
+        Const::Int(n) => n.to_string(),
+        Const::Bool(b) => b.to_string(),
+        Const::Str(s) => format!("{s:?}"),
+        Const::Symbol(s) => s.clone(),
+        Const::List(items) => {
+            let inner: Vec<String> = items.iter().map(describe_const_value).collect();
+            format!("({})", inner.join(" "))
+        }
+        Const::Unspecified => "<unspecified>".to_string(),
+    }
+}
+
 fn describe_const(chunk: &Chunk, idx: u32) -> String {
     match chunk.constants.get(idx as usize) {
-        Some(Const::Int(n)) => n.to_string(),
-        Some(Const::Bool(b)) => b.to_string(),
-        Some(Const::Str(s)) => format!("{s:?}"),
-        Some(Const::Symbol(s)) => s.clone(),
+        Some(c) => describe_const_value(c),
         None => "<out of range>".to_string(),
     }
 }
 
-pub fn disassemble(chunk: &Chunk) -> String {
+/// Disassembles a single function's bytecode into a legible instruction
+/// listing, one instruction per line, without any surrounding header.
+pub fn disassemble_chunk(chunk: &Chunk) -> String {
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "== chunk: {} bytes code, {} constants ==",
-        chunk.code.len(),
-        chunk.constants.len()
-    );
     let code = &chunk.code;
     let mut ip = 0usize;
 
@@ -68,10 +75,10 @@ pub fn disassemble(chunk: &Chunk) -> String {
             op if op == Op::Const as u8 => match read_u32(code, ip) {
                 Some(idx) => {
                     ip += 4;
-                    format!("CONST      {idx:<6} ; {}", describe_const(chunk, idx))
+                    format!("CONST         {idx:<6} ; {}", describe_const(chunk, idx))
                 }
                 None => {
-                    let line = "CONST      <truncated operand>".to_string();
+                    let line = "CONST         <truncated operand>".to_string();
                     ip = code.len();
                     line
                 }
@@ -79,10 +86,65 @@ pub fn disassemble(chunk: &Chunk) -> String {
             op if op == Op::GetGlobal as u8 => match read_u32(code, ip) {
                 Some(idx) => {
                     ip += 4;
-                    format!("GET_GLOBAL {idx:<6} ; {}", describe_const(chunk, idx))
+                    format!("GET_GLOBAL    {idx:<6} ; {}", describe_const(chunk, idx))
                 }
                 None => {
-                    let line = "GET_GLOBAL <truncated operand>".to_string();
+                    let line = "GET_GLOBAL    <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::DefGlobal as u8 => match read_u32(code, ip) {
+                Some(idx) => {
+                    ip += 4;
+                    format!("DEF_GLOBAL    {idx:<6} ; {}", describe_const(chunk, idx))
+                }
+                None => {
+                    let line = "DEF_GLOBAL    <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::GetLocal as u8 => match code.get(ip) {
+                Some(&slot) => {
+                    ip += 1;
+                    format!("GET_LOCAL     {slot}")
+                }
+                None => {
+                    let line = "GET_LOCAL     <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::MakeFunction as u8 => match read_u32(code, ip) {
+                Some(idx) => {
+                    ip += 4;
+                    format!("MAKE_FUNCTION {idx}")
+                }
+                None => {
+                    let line = "MAKE_FUNCTION <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::Jump as u8 => match read_u32(code, ip) {
+                Some(target) => {
+                    ip += 4;
+                    format!("JUMP          -> {target:04x}")
+                }
+                None => {
+                    let line = "JUMP          <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::JumpIfFalse as u8 => match read_u32(code, ip) {
+                Some(target) => {
+                    ip += 4;
+                    format!("JUMP_IF_FALSE -> {target:04x}")
+                }
+                None => {
+                    let line = "JUMP_IF_FALSE <truncated operand>".to_string();
                     ip = code.len();
                     line
                 }
@@ -90,15 +152,16 @@ pub fn disassemble(chunk: &Chunk) -> String {
             op if op == Op::Call as u8 => match code.get(ip) {
                 Some(&argc) => {
                     ip += 1;
-                    format!("CALL       {argc}")
+                    format!("CALL          {argc}")
                 }
                 None => {
-                    let line = "CALL       <truncated operand>".to_string();
+                    let line = "CALL          <truncated operand>".to_string();
                     ip = code.len();
                     line
                 }
             },
             op if op == Op::Pop as u8 => "POP".to_string(),
+            op if op == Op::Return as u8 => "RETURN".to_string(),
             op if op == Op::Halt as u8 => "HALT".to_string(),
             other => format!("<unknown opcode {other}>"),
         };
@@ -108,6 +171,29 @@ pub fn disassemble(chunk: &Chunk) -> String {
         ip = advance_past(offset, ip);
     }
 
+    out
+}
+
+/// Disassembles every function in a compiled module, labeling each with its
+/// index and marking the entry function.
+pub fn disassemble(module: &Module) -> String {
+    let mut out = String::new();
+    for (index, chunk) in module.functions.iter().enumerate() {
+        let marker = if index as u32 == module.entry_index {
+            " (entry)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "== function {index}{marker}: arity={}, has_rest={}, {} bytes code, {} constants ==",
+            chunk.arity,
+            chunk.has_rest,
+            chunk.code.len(),
+            chunk.constants.len()
+        );
+        out.push_str(&disassemble_chunk(chunk));
+    }
     out
 }
 
@@ -141,20 +227,26 @@ mod tests {
         assert_eq!(consume_step(0), 0);
     }
 
-    fn chunk_for(src: &str) -> Chunk {
+    fn entry_chunk_for(src: &str) -> Chunk {
+        let forms = read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        module.functions[module.entry_index as usize].clone()
+    }
+
+    fn module_for(src: &str) -> Module {
         let forms = read_program(src).unwrap();
         compile_program(&forms).unwrap()
     }
 
     #[test]
     fn lists_a_halt_only_program() {
-        let listing = disassemble(&chunk_for("1"));
+        let listing = disassemble_chunk(&entry_chunk_for("1"));
         assert!(listing.contains("HALT"));
     }
 
     #[test]
     fn names_every_opcode_used_by_a_call_expression() {
-        let listing = disassemble(&chunk_for("(display (+ 1 2))"));
+        let listing = disassemble_chunk(&entry_chunk_for("(display (+ 1 2))"));
         assert!(listing.contains("GET_GLOBAL"), "{listing}");
         assert!(listing.contains("CONST"), "{listing}");
         assert!(listing.contains("CALL"), "{listing}");
@@ -164,29 +256,28 @@ mod tests {
 
     #[test]
     fn annotates_get_global_with_the_resolved_symbol_name() {
-        let listing = disassemble(&chunk_for("(newline)"));
+        let listing = disassemble_chunk(&entry_chunk_for("(newline)"));
         assert!(listing.contains("newline"), "{listing}");
     }
 
     #[test]
     fn annotates_const_with_the_literal_value() {
-        let listing = disassemble(&chunk_for("42"));
+        let listing = disassemble_chunk(&entry_chunk_for("42"));
         assert!(listing.contains("42"), "{listing}");
     }
 
     #[test]
     fn is_legible_multi_line_text_not_a_single_opaque_blob() {
-        let listing = disassemble(&chunk_for("(display (+ 1 2)) (newline)"));
+        let listing = disassemble_chunk(&entry_chunk_for("(display (+ 1 2)) (newline)"));
         assert!(listing.lines().count() > 3);
     }
 
     #[test]
     fn does_not_panic_on_a_chunk_with_a_truncated_trailing_instruction() {
-        use crate::bytecode::Op;
         let mut chunk = Chunk::new();
         chunk.code.push(Op::Const as u8);
         chunk.code.push(0); // only 1 of the required 4 operand bytes
-        let listing = disassemble(&chunk); // must return, not panic
+        let listing = disassemble_chunk(&chunk); // must return, not panic
         assert!(!listing.is_empty());
     }
 
@@ -195,7 +286,7 @@ mod tests {
         // "(+ 1 2)" has constants [Symbol("+"), Int(1), Int(2)] at indices 0, 1, 2.
         // A disassembler that always resolved index 0 would show "+" for every
         // operand instead of the actual 1 and 2.
-        let listing = disassemble(&chunk_for("(+ 1 2)"));
+        let listing = disassemble_chunk(&entry_chunk_for("(+ 1 2)"));
         assert!(listing.contains("; 1"), "{listing}");
         assert!(listing.contains("; 2"), "{listing}");
     }
@@ -203,8 +294,8 @@ mod tests {
     #[test]
     fn an_unrecognised_opcode_byte_is_reported_as_unknown_not_mistaken_for_halt() {
         let mut chunk = Chunk::new();
-        chunk.code.push(250); // no opcode is numbered 250
-        let listing = disassemble(&chunk);
+        chunk.code.push(253); // no opcode is numbered 253
+        let listing = disassemble_chunk(&chunk);
         assert!(listing.contains("unknown opcode"), "{listing}");
         assert!(!listing.contains("HALT"), "{listing}");
     }
@@ -212,12 +303,81 @@ mod tests {
     #[test]
     fn never_loops_forever_on_a_pathological_chunk() {
         // A regression guard for the instruction-pointer-advancement invariant:
-        // no matter how odd the bytes are, disassemble() must return.
-        let chunk = Chunk {
-            code: vec![Op::Const as u8, 0, 0, 0, 0, Op::Call as u8, 0, 99, 99, 99],
-            constants: vec![],
-        };
-        let listing = disassemble(&chunk);
+        // no matter how odd the bytes are, disassemble_chunk() must return.
+        let mut chunk = Chunk::new();
+        chunk.code = vec![Op::Const as u8, 0, 0, 0, 0, Op::Call as u8, 0, 99, 99, 99];
+        let listing = disassemble_chunk(&chunk);
         assert!(!listing.is_empty());
+    }
+
+    #[test]
+    fn module_level_disassembly_shows_every_function() {
+        // (define (f x) x) defines a second function alongside the entry.
+        let module = module_for("(define (f x) x)");
+        assert_eq!(module.functions.len(), 2);
+        let listing = disassemble(&module);
+        assert!(listing.contains("function 0"), "{listing}");
+        assert!(listing.contains("function 1"), "{listing}");
+    }
+
+    #[test]
+    fn module_level_disassembly_marks_the_entry_function() {
+        let module = module_for("(define (f x) x)");
+        let listing = disassemble(&module);
+        assert!(listing.contains("(entry)"), "{listing}");
+    }
+
+    #[test]
+    fn names_the_new_b2_opcodes() {
+        let listing = disassemble(&module_for("(define x (if #t 1 2))"));
+        assert!(listing.contains("DEF_GLOBAL"), "{listing}");
+        assert!(listing.contains("JUMP_IF_FALSE"), "{listing}");
+        assert!(listing.contains("JUMP "), "{listing}");
+    }
+
+    #[test]
+    fn names_get_local_make_function_and_return_for_a_lambda() {
+        let listing = disassemble(&module_for("(lambda (x) x)"));
+        assert!(listing.contains("GET_LOCAL"), "{listing}");
+        assert!(listing.contains("MAKE_FUNCTION"), "{listing}");
+        assert!(listing.contains("RETURN"), "{listing}");
+    }
+
+    #[test]
+    fn advances_past_def_globals_operand_to_the_correct_next_instruction() {
+        // (define x 1) at the entry level compiles to CONST, DEF_GLOBAL, POP,
+        // HALT. If DEF_GLOBAL's operand advance were wrong, the decoder would
+        // start reading POP/HALT's bytes from mid-operand instead, corrupting
+        // or dropping them.
+        let listing = disassemble_chunk(&entry_chunk_for("(define x 1)"));
+        assert_eq!(listing.matches("POP").count(), 1, "{listing}");
+        assert_eq!(listing.matches("HALT").count(), 1, "{listing}");
+        assert!(!listing.contains("unknown opcode"), "{listing}");
+    }
+
+    #[test]
+    fn advances_past_make_functions_operand_to_the_correct_next_instruction() {
+        let listing = disassemble_chunk(&entry_chunk_for("(lambda () 1)"));
+        assert_eq!(listing.matches("POP").count(), 1, "{listing}");
+        assert_eq!(listing.matches("HALT").count(), 1, "{listing}");
+        assert!(!listing.contains("unknown opcode"), "{listing}");
+    }
+
+    #[test]
+    fn marks_only_the_actual_entry_function_not_the_others() {
+        let module = module_for("(define (f x) x)");
+        let listing = disassemble(&module);
+        let function_headers: Vec<&str> = listing
+            .lines()
+            .filter(|l| l.starts_with("== function"))
+            .collect();
+        assert_eq!(function_headers.len(), 2, "{listing}");
+        for (index, header) in function_headers.iter().enumerate() {
+            if index as u32 == module.entry_index {
+                assert!(header.contains("(entry)"), "{header}");
+            } else {
+                assert!(!header.contains("(entry)"), "{header}");
+            }
+        }
     }
 }

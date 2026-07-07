@@ -20,8 +20,8 @@ pub fn run(input: impl BufRead, out: &mut impl Write, err: &mut impl Write) -> i
 
 fn eval_line(line: &str, out: &mut impl Write) -> Result<(), String> {
     let forms = reader::read_program(line).map_err(|e| e.to_string())?;
-    let chunk = compiler::compile_program(&forms).map_err(|e| e.to_string())?;
-    vm::run(&chunk, out).map_err(|e| e.to_string())
+    let module = compiler::compile_program(&forms).map_err(|e| e.to_string())?;
+    vm::run(&module, out).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

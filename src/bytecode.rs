@@ -2,7 +2,12 @@
 
 pub const MAGIC: [u8; 4] = *b"MLBC";
 pub const VERSION_MAJOR: u8 = 1;
-pub const VERSION_MINOR: u8 = 0;
+pub const VERSION_MINOR: u8 = 1;
+
+/// Caps recursion depth when decoding nested `Const::List` constants from an
+/// MLBC file, so a maliciously crafted artifact with deeply nested list
+/// constants can't overflow the native stack during decode.
+const MAX_CONST_NESTING_DEPTH: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -12,6 +17,12 @@ pub enum Op {
     Call = 2,
     Pop = 3,
     Halt = 4,
+    DefGlobal = 5,
+    GetLocal = 6,
+    Jump = 7,
+    JumpIfFalse = 8,
+    Return = 9,
+    MakeFunction = 10,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,12 +31,19 @@ pub enum Const {
     Bool(bool),
     Str(String),
     Symbol(String),
+    List(Vec<Const>),
+    Unspecified,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Chunk {
     pub code: Vec<u8>,
     pub constants: Vec<Const>,
+    /// Number of fixed (non-rest) parameters. Zero for the top-level entry
+    /// chunk, which takes no arguments.
+    pub arity: u32,
+    /// Whether the last parameter collects any extra arguments into a list.
+    pub has_rest: bool,
 }
 
 impl Chunk {
@@ -48,6 +66,21 @@ impl Chunk {
         self.code.extend_from_slice(&idx.to_le_bytes());
     }
 
+    pub fn emit_def_global(&mut self, idx: u32) {
+        self.code.push(Op::DefGlobal as u8);
+        self.code.extend_from_slice(&idx.to_le_bytes());
+    }
+
+    pub fn emit_get_local(&mut self, slot: u8) {
+        self.code.push(Op::GetLocal as u8);
+        self.code.push(slot);
+    }
+
+    pub fn emit_make_function(&mut self, fn_index: u32) {
+        self.code.push(Op::MakeFunction as u8);
+        self.code.extend_from_slice(&fn_index.to_le_bytes());
+    }
+
     pub fn emit_call(&mut self, argc: u8) {
         self.code.push(Op::Call as u8);
         self.code.push(argc);
@@ -59,6 +92,28 @@ impl Chunk {
 
     pub fn emit_halt(&mut self) {
         self.code.push(Op::Halt as u8);
+    }
+
+    pub fn emit_return(&mut self) {
+        self.code.push(Op::Return as u8);
+    }
+
+    /// Emits a jump opcode with a placeholder target and returns the byte
+    /// offset of that 4-byte operand, to be patched later via [`Chunk::patch_jump`]
+    /// once the real target address is known.
+    pub fn emit_jump(&mut self, op: Op) -> usize {
+        debug_assert!(matches!(op, Op::Jump | Op::JumpIfFalse));
+        self.code.push(op as u8);
+        let operand_pos = self.code.len();
+        self.code.extend_from_slice(&0u32.to_le_bytes());
+        operand_pos
+    }
+
+    /// Patches a jump operand (previously emitted at `operand_pos` by
+    /// [`Chunk::emit_jump`]) to target the chunk's current end.
+    pub fn patch_jump(&mut self, operand_pos: usize) {
+        let target = (self.code.len() as u32).to_le_bytes();
+        self.code[operand_pos..operand_pos + 4].copy_from_slice(&target);
     }
 }
 
@@ -91,6 +146,37 @@ impl std::fmt::Display for BytecodeError {
     }
 }
 
+fn encode_const(out: &mut Vec<u8>, c: &Const) {
+    match c {
+        Const::Int(n) => {
+            out.push(0);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Const::Bool(b) => {
+            out.push(1);
+            out.push(if *b { 1 } else { 0 });
+        }
+        Const::Str(s) => {
+            out.push(2);
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        Const::Symbol(s) => {
+            out.push(3);
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        Const::List(items) => {
+            out.push(4);
+            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for item in items {
+                encode_const(out, item);
+            }
+        }
+        Const::Unspecified => out.push(5),
+    }
+}
+
 pub fn encode(module: &Module) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
@@ -100,30 +186,13 @@ pub fn encode(module: &Module) -> Vec<u8> {
     out.extend_from_slice(&module.entry_index.to_le_bytes());
     out.extend_from_slice(&(module.functions.len() as u32).to_le_bytes());
     for chunk in &module.functions {
+        out.extend_from_slice(&chunk.arity.to_le_bytes());
+        out.push(if chunk.has_rest { 1 } else { 0 });
         out.extend_from_slice(&(chunk.code.len() as u32).to_le_bytes());
         out.extend_from_slice(&chunk.code);
         out.extend_from_slice(&(chunk.constants.len() as u32).to_le_bytes());
         for c in &chunk.constants {
-            match c {
-                Const::Int(n) => {
-                    out.push(0);
-                    out.extend_from_slice(&n.to_le_bytes());
-                }
-                Const::Bool(b) => {
-                    out.push(1);
-                    out.push(if *b { 1 } else { 0 });
-                }
-                Const::Str(s) => {
-                    out.push(2);
-                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    out.extend_from_slice(s.as_bytes());
-                }
-                Const::Symbol(s) => {
-                    out.push(3);
-                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    out.extend_from_slice(s.as_bytes());
-                }
-            }
+            encode_const(&mut out, c);
         }
     }
     out
@@ -171,6 +240,39 @@ impl<'a> Reader<'a> {
     }
 }
 
+fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
+    if depth > MAX_CONST_NESTING_DEPTH {
+        return Err(BytecodeError::Truncated);
+    }
+    let tag = r.u8()?;
+    Ok(match tag {
+        0 => Const::Int(r.i64()?),
+        1 => Const::Bool(r.u8()? != 0),
+        2 => {
+            let len = r.u32()? as usize;
+            let raw = r.bytes_owned(len)?;
+            Const::Str(String::from_utf8(raw).map_err(|_| BytecodeError::Truncated)?)
+        }
+        3 => {
+            let len = r.u32()? as usize;
+            let raw = r.bytes_owned(len)?;
+            Const::Symbol(String::from_utf8(raw).map_err(|_| BytecodeError::Truncated)?)
+        }
+        4 => {
+            let count = r.u32()?;
+            // Same unchecked-count discipline as fn_count/const_count below:
+            // Vec::new() only grows as far as bytes actually taken from `r`.
+            let mut items = Vec::new();
+            for _ in 0..count {
+                items.push(decode_const(r, depth + 1)?);
+            }
+            Const::List(items)
+        }
+        5 => Const::Unspecified,
+        _ => return Err(BytecodeError::Truncated),
+    })
+}
+
 pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
     let mut r = Reader::new(bytes);
 
@@ -194,30 +296,21 @@ pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
     // bogus count still fails fast on the first out-of-range read.
     let mut functions = Vec::new();
     for _ in 0..fn_count {
+        let arity = r.u32()?;
+        let has_rest = r.u8()? != 0;
         let code_len = r.u32()? as usize;
         let code = r.bytes_owned(code_len)?;
         let const_count = r.u32()?;
         let mut constants = Vec::new();
         for _ in 0..const_count {
-            let tag = r.u8()?;
-            let c = match tag {
-                0 => Const::Int(r.i64()?),
-                1 => Const::Bool(r.u8()? != 0),
-                2 => {
-                    let len = r.u32()? as usize;
-                    let raw = r.bytes_owned(len)?;
-                    Const::Str(String::from_utf8(raw).map_err(|_| BytecodeError::Truncated)?)
-                }
-                3 => {
-                    let len = r.u32()? as usize;
-                    let raw = r.bytes_owned(len)?;
-                    Const::Symbol(String::from_utf8(raw).map_err(|_| BytecodeError::Truncated)?)
-                }
-                _ => return Err(BytecodeError::Truncated),
-            };
-            constants.push(c);
+            constants.push(decode_const(&mut r, 0)?);
         }
-        functions.push(Chunk { code, constants });
+        functions.push(Chunk {
+            code,
+            constants,
+            arity,
+            has_rest,
+        });
     }
 
     if entry_index as usize >= functions.len() {
@@ -244,6 +337,11 @@ mod tests {
         let two = chunk.add_const(Const::Int(2));
         let greeting = chunk.add_const(Const::Str("hi\n".to_string()));
         let flag = chunk.add_const(Const::Bool(true));
+        let list = chunk.add_const(Const::List(vec![
+            Const::Symbol("+".to_string()),
+            Const::Int(1),
+            Const::List(vec![Const::Int(2), Const::Unspecified]),
+        ]));
         chunk.emit_get_global(plus);
         chunk.emit_const(one);
         chunk.emit_const(two);
@@ -252,6 +350,8 @@ mod tests {
         chunk.emit_const(greeting);
         chunk.emit_pop();
         chunk.emit_const(flag);
+        chunk.emit_pop();
+        chunk.emit_const(list);
         chunk.emit_pop();
         chunk.emit_halt();
         Module {
@@ -291,7 +391,7 @@ mod tests {
             decode(&bytes),
             Err(BytecodeError::UnsupportedVersion {
                 major: 99,
-                minor: 0
+                minor: VERSION_MINOR,
             })
         );
     }
@@ -370,5 +470,55 @@ mod tests {
             BytecodeError::OutOfRange("entry_index 5".to_string()).to_string(),
             "MLBC file has an invalid pointer: entry_index 5"
         );
+    }
+
+    fn nested_list_const(depth: usize) -> Const {
+        let mut c = Const::Int(0);
+        for _ in 0..depth {
+            c = Const::List(vec![c]);
+        }
+        c
+    }
+
+    fn module_with_const(c: Const) -> Module {
+        let mut chunk = Chunk::new();
+        let idx = chunk.add_const(c);
+        chunk.emit_const(idx);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        }
+    }
+
+    #[test]
+    fn round_trips_a_constant_list_nested_to_exactly_the_configured_maximum_depth() {
+        let module = module_with_const(nested_list_const(MAX_CONST_NESTING_DEPTH));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Ok(module));
+    }
+
+    #[test]
+    fn rejects_a_constant_list_nested_one_deeper_than_the_configured_maximum() {
+        let module = module_with_const(nested_list_const(MAX_CONST_NESTING_DEPTH + 1));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+    }
+
+    #[test]
+    fn patch_jump_writes_the_current_end_of_code_as_the_absolute_target() {
+        let mut chunk = Chunk::new();
+        chunk.emit_pop(); // 1 byte of unrelated code before the jump
+        let operand_pos = chunk.emit_jump(Op::Jump);
+        chunk.emit_pop();
+        chunk.emit_pop(); // more code after the jump, so target != the placeholder 0
+        chunk.patch_jump(operand_pos);
+
+        let expected_target = chunk.code.len() as u32;
+        let written =
+            u32::from_le_bytes(chunk.code[operand_pos..operand_pos + 4].try_into().unwrap());
+        assert_eq!(written, expected_target);
+        assert_ne!(written, 0, "the placeholder must actually be overwritten");
     }
 }

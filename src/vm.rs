@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use crate::bytecode::{Chunk, Const, Op};
-use crate::value::Value;
+use crate::bytecode::{Chunk, Const, Module, Op};
+use crate::value::{Value, is_truthy};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -23,7 +23,9 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 3] = ["display", "newline", "+"];
+const NATIVE_NAMES: [&str; 10] = [
+    "display", "newline", "+", "-", "*", "=", "<", "<=", ">", ">=",
+];
 
 pub fn default_globals() -> HashMap<String, Value> {
     NATIVE_NAMES
@@ -38,6 +40,8 @@ fn const_to_value(c: &Const) -> Value {
         Const::Bool(b) => Value::Bool(*b),
         Const::Str(s) => Value::Str(s.clone()),
         Const::Symbol(s) => Value::Symbol(s.clone()),
+        Const::List(items) => Value::List(items.iter().map(const_to_value).collect()),
+        Const::Unspecified => Value::Unspecified,
     }
 }
 
@@ -64,69 +68,202 @@ fn constant_at(chunk: &Chunk, idx: u32) -> Result<&Const, RuntimeError> {
         .ok_or_else(|| error(format!("constant index {idx} out of range")))
 }
 
-pub fn run(chunk: &Chunk, out: &mut impl Write) -> Result<(), RuntimeError> {
-    let globals = default_globals();
-    let mut stack: Vec<Value> = Vec::new();
-    let code = &chunk.code;
-    let mut ip = 0usize;
+/// Consumes one unit of step budget, saturating at zero rather than
+/// underflowing, so the budget can only ever shrink toward exhaustion.
+fn consume_step(remaining: usize) -> usize {
+    remaining.saturating_sub(1)
+}
 
-    loop {
-        let opcode = *code
-            .get(ip)
-            .ok_or_else(|| error("ran off the end of the instruction stream without HALT"))?;
-        ip += 1;
+/// The total instruction-step budget for a chunk of `code_len` bytes: every
+/// instruction is at least 1 byte, so no correct program needs more than
+/// `code_len` steps; the `+ 1` is a one-step margin.
+fn step_budget_for(code_len: usize) -> usize {
+    code_len + 1
+}
 
-        match opcode {
-            op if op == Op::Const as u8 => {
-                let idx = read_u32(code, &mut ip)?;
-                let value = const_to_value(constant_at(chunk, idx)?);
-                stack.push(value);
+fn symbol_name(c: &Const) -> Result<String, RuntimeError> {
+    match c {
+        Const::Symbol(s) => Ok(s.clone()),
+        other => Err(error(format!(
+            "expected a symbol constant, found {other:?}"
+        ))),
+    }
+}
+
+struct Vm<'m> {
+    module: &'m Module,
+    globals: HashMap<String, Value>,
+}
+
+impl<'m> Vm<'m> {
+    fn exec(
+        &mut self,
+        chunk: &Chunk,
+        locals: &mut [Value],
+        out: &mut impl Write,
+    ) -> Result<Value, RuntimeError> {
+        let mut stack: Vec<Value> = Vec::new();
+        let code = &chunk.code;
+        let mut ip = 0usize;
+
+        // Every instruction is at least 1 byte and (for this language, which
+        // has no backward jumps yet) ip only ever moves forward within a
+        // single exec() call, so no correct program executes more than
+        // code.len() instructions here. This bounds total loop iterations
+        // independently of ip's own bookkeeping, so a broken operand-advance
+        // can never hang the interpreter — it fails cleanly instead.
+        let mut remaining_steps = step_budget_for(code.len());
+
+        loop {
+            if remaining_steps == 0 {
+                return Err(error(
+                    "exceeded the maximum instruction step budget (possible decoder bug)",
+                ));
             }
-            op if op == Op::GetGlobal as u8 => {
-                let idx = read_u32(code, &mut ip)?;
-                let name = match constant_at(chunk, idx)? {
-                    Const::Symbol(s) => s.clone(),
-                    other => {
-                        return Err(error(format!(
-                            "GET_GLOBAL requires a symbol constant, found {other:?}"
-                        )));
-                    }
-                };
-                let value = globals
-                    .get(&name)
-                    .cloned()
-                    .ok_or_else(|| error(format!("unbound global: {name}")))?;
-                stack.push(value);
-            }
-            op if op == Op::Call as u8 => {
-                let argc = read_u8(code, &mut ip)? as usize;
-                if stack.len() < argc + 1 {
-                    return Err(error("stack underflow during CALL"));
+            remaining_steps = consume_step(remaining_steps);
+
+            let opcode = *code
+                .get(ip)
+                .ok_or_else(|| error("ran off the end of the instruction stream"))?;
+            ip += 1;
+
+            match opcode {
+                op if op == Op::Const as u8 => {
+                    let idx = read_u32(code, &mut ip)?;
+                    stack.push(const_to_value(constant_at(chunk, idx)?));
                 }
-                let args = stack.split_off(stack.len() - argc);
-                let callee = stack.pop().unwrap();
-                let result = call_value(&callee, &args, out)?;
-                stack.push(result);
+                op if op == Op::GetGlobal as u8 => {
+                    let idx = read_u32(code, &mut ip)?;
+                    let name = symbol_name(constant_at(chunk, idx)?)?;
+                    let value = self
+                        .globals
+                        .get(&name)
+                        .cloned()
+                        .ok_or_else(|| error(format!("unbound global: {name}")))?;
+                    stack.push(value);
+                }
+                op if op == Op::DefGlobal as u8 => {
+                    let idx = read_u32(code, &mut ip)?;
+                    let name = symbol_name(constant_at(chunk, idx)?)?;
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during DEF_GLOBAL"))?;
+                    self.globals.insert(name, value);
+                    stack.push(Value::Unspecified);
+                }
+                op if op == Op::GetLocal as u8 => {
+                    let slot = read_u8(code, &mut ip)? as usize;
+                    let value = locals
+                        .get(slot)
+                        .cloned()
+                        .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
+                    stack.push(value);
+                }
+                op if op == Op::MakeFunction as u8 => {
+                    let idx = read_u32(code, &mut ip)?;
+                    if idx as usize >= self.module.functions.len() {
+                        return Err(error(format!("function index {idx} out of range")));
+                    }
+                    stack.push(Value::Function(idx));
+                }
+                op if op == Op::Jump as u8 => {
+                    let target = read_u32(code, &mut ip)? as usize;
+                    ip = target;
+                }
+                op if op == Op::JumpIfFalse as u8 => {
+                    let target = read_u32(code, &mut ip)? as usize;
+                    let cond = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during JUMP_IF_FALSE"))?;
+                    if !is_truthy(&cond) {
+                        ip = target;
+                    }
+                }
+                op if op == Op::Call as u8 => {
+                    let argc = read_u8(code, &mut ip)? as usize;
+                    if stack.len() < argc + 1 {
+                        return Err(error("stack underflow during CALL"));
+                    }
+                    let args = stack.split_off(stack.len() - argc);
+                    let callee = stack.pop().unwrap();
+                    let result = self.call_value(&callee, args, out)?;
+                    stack.push(result);
+                }
+                op if op == Op::Pop as u8 => {
+                    stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during POP"))?;
+                }
+                op if op == Op::Return as u8 => {
+                    return Ok(stack.pop().unwrap_or(Value::Unspecified));
+                }
+                op if op == Op::Halt as u8 => {
+                    out.flush().map_err(|e| error(e.to_string()))?;
+                    return Ok(Value::Unspecified);
+                }
+                other => return Err(error(format!("undefined opcode: {other}"))),
             }
-            op if op == Op::Pop as u8 => {
-                stack
-                    .pop()
-                    .ok_or_else(|| error("stack underflow during POP"))?;
-            }
-            op if op == Op::Halt as u8 => break,
-            other => return Err(error(format!("undefined opcode: {other}"))),
         }
     }
 
-    out.flush().map_err(|e| error(e.to_string()))?;
-    Ok(())
+    fn call_value(
+        &mut self,
+        callee: &Value,
+        args: Vec<Value>,
+        out: &mut impl Write,
+    ) -> Result<Value, RuntimeError> {
+        match callee {
+            Value::Native(name) => call_native(name, &args, out),
+            Value::Function(idx) => {
+                let chunk = self
+                    .module
+                    .functions
+                    .get(*idx as usize)
+                    .ok_or_else(|| error(format!("function index {idx} out of range")))?;
+                let mut locals = bind_arguments(chunk, args)?;
+                self.exec(chunk, &mut locals, out)
+            }
+            other => Err(error(format!("cannot call a non-procedure value: {other}"))),
+        }
+    }
 }
 
-fn call_value(callee: &Value, args: &[Value], out: &mut impl Write) -> Result<Value, RuntimeError> {
-    match callee {
-        Value::Native(name) => call_native(name, args, out),
-        other => Err(error(format!("cannot call a non-procedure value: {other}"))),
+fn bind_arguments(chunk: &Chunk, mut args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
+    let arity = chunk.arity as usize;
+    if chunk.has_rest {
+        if args.len() < arity {
+            return Err(error(format!(
+                "expected at least {arity} argument(s), got {}",
+                args.len()
+            )));
+        }
+        let rest = args.split_off(arity);
+        let mut locals = args;
+        locals.push(Value::List(rest));
+        Ok(locals)
+    } else {
+        if args.len() != arity {
+            return Err(error(format!(
+                "expected exactly {arity} argument(s), got {}",
+                args.len()
+            )));
+        }
+        Ok(args)
     }
+}
+
+pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
+    let mut vm = Vm {
+        module,
+        globals: default_globals(),
+    };
+    let entry = module
+        .functions
+        .get(module.entry_index as usize)
+        .ok_or_else(|| error("entry function index out of range"))?;
+    let mut locals = Vec::new();
+    vm.exec(entry, &mut locals, out)?;
+    Ok(())
 }
 
 fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value, RuntimeError> {
@@ -143,23 +280,67 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
             Ok(Value::Unspecified)
         }
         "+" => native_plus(args),
+        "-" => native_minus(args),
+        "*" => native_times(args),
+        "=" => native_compare("=", args, |a, b| a == b),
+        "<" => native_compare("<", args, |a, b| a < b),
+        "<=" => native_compare("<=", args, |a, b| a <= b),
+        ">" => native_compare(">", args, |a, b| a > b),
+        ">=" => native_compare(">=", args, |a, b| a >= b),
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
 }
 
+fn to_ints(opname: &str, args: &[Value]) -> Result<Vec<i64>, RuntimeError> {
+    args.iter()
+        .map(|v| match v {
+            Value::Int(n) => Ok(*n),
+            other => Err(error(format!(
+                "{opname} expects integer arguments, found {other}"
+            ))),
+        })
+        .collect()
+}
+
 fn native_plus(args: &[Value]) -> Result<Value, RuntimeError> {
-    let mut sum: i64 = 0;
-    for arg in args {
-        match arg {
-            Value::Int(n) => {
-                sum = sum
-                    .checked_add(*n)
-                    .ok_or_else(|| error("+ overflowed a 64-bit integer"))?;
-            }
-            other => return Err(error(format!("+ expects integer arguments, found {other}"))),
-        }
+    let ints = to_ints("+", args)?;
+    Ok(Value::Int(
+        ints.iter().fold(0i64, |acc, n| acc.wrapping_add(*n)),
+    ))
+}
+
+fn native_minus(args: &[Value]) -> Result<Value, RuntimeError> {
+    if args.len() < 2 {
+        return Err(error("- requires at least 2 arguments"));
     }
-    Ok(Value::Int(sum))
+    let ints = to_ints("-", args)?;
+    let (first, rest) = ints.split_first().unwrap();
+    Ok(Value::Int(
+        rest.iter().fold(*first, |acc, n| acc.wrapping_sub(*n)),
+    ))
+}
+
+fn native_times(args: &[Value]) -> Result<Value, RuntimeError> {
+    if args.len() < 2 {
+        return Err(error("* requires at least 2 arguments"));
+    }
+    let ints = to_ints("*", args)?;
+    Ok(Value::Int(
+        ints.iter().fold(1i64, |acc, n| acc.wrapping_mul(*n)),
+    ))
+}
+
+fn native_compare(
+    opname: &str,
+    args: &[Value],
+    holds: fn(i64, i64) -> bool,
+) -> Result<Value, RuntimeError> {
+    if args.len() < 2 {
+        return Err(error(format!("{opname} requires at least 2 arguments")));
+    }
+    let ints = to_ints(opname, args)?;
+    let all_hold = ints.windows(2).all(|pair| holds(pair[0], pair[1]));
+    Ok(Value::Bool(all_hold))
 }
 
 #[cfg(test)]
@@ -168,12 +349,36 @@ mod tests {
     use crate::compiler::compile_program;
     use crate::reader::read_program;
 
+    #[test]
+    fn consume_step_decrements_the_remaining_budget_by_exactly_one() {
+        assert_eq!(consume_step(5), 4);
+        assert_eq!(consume_step(1), 0);
+    }
+
+    #[test]
+    fn consume_step_saturates_at_zero_instead_of_underflowing() {
+        assert_eq!(consume_step(0), 0);
+    }
+
+    #[test]
+    fn step_budget_is_code_length_plus_a_one_step_margin() {
+        assert_eq!(step_budget_for(0), 1);
+        assert_eq!(step_budget_for(10), 11);
+    }
+
     fn eval(src: &str) -> Result<String, RuntimeError> {
         let forms = read_program(src).expect("valid source for this test");
-        let chunk = compile_program(&forms).expect("compilable source for this test");
+        let module = compile_program(&forms).expect("compilable source for this test");
         let mut out = Vec::new();
-        run(&chunk, &mut out)?;
+        run(&module, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn module_of(chunk: Chunk) -> Module {
+        Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        }
     }
 
     #[test]
@@ -211,34 +416,32 @@ mod tests {
     fn calling_a_non_procedure_value_is_a_runtime_error() {
         // 1 is pushed as the callee position via a hand-built chunk below,
         // since the reader/compiler never produce this shape from source text.
-        use crate::bytecode::{Chunk as RawChunk, Const};
-        let mut chunk = RawChunk::new();
+        use crate::bytecode::Const;
+        let mut chunk = Chunk::new();
         let one = chunk.add_const(Const::Int(1));
         chunk.emit_const(one);
         chunk.emit_call(0);
         chunk.emit_pop();
         chunk.emit_halt();
         let mut out = Vec::new();
-        assert!(run(&chunk, &mut out).is_err());
+        assert!(run(&module_of(chunk), &mut out).is_err());
     }
 
     #[test]
     fn an_undefined_opcode_is_a_runtime_error_not_a_panic() {
-        use crate::bytecode::Chunk as RawChunk;
-        let mut chunk = RawChunk::new();
-        chunk.code.push(255); // no opcode is numbered 255
+        let mut chunk = Chunk::new();
+        chunk.code.push(254); // no opcode is numbered 254
         let mut out = Vec::new();
-        assert!(run(&chunk, &mut out).is_err());
+        assert!(run(&module_of(chunk), &mut out).is_err());
     }
 
     #[test]
     fn an_out_of_range_constant_index_is_a_runtime_error_not_a_panic() {
-        use crate::bytecode::{Chunk as RawChunk, Op};
-        let mut chunk = RawChunk::new();
+        let mut chunk = Chunk::new();
         chunk.code.push(Op::Const as u8);
         chunk.code.extend_from_slice(&99u32.to_le_bytes());
         let mut out = Vec::new();
-        assert!(run(&chunk, &mut out).is_err());
+        assert!(run(&module_of(chunk), &mut out).is_err());
     }
 
     #[test]
@@ -262,13 +465,120 @@ mod tests {
         // Stack holds exactly 1 value (meant as the sole argument) with nothing
         // beneath it to serve as the callee: CALL 1 must fail cleanly, not
         // panic trying to pop a callee that isn't there.
-        use crate::bytecode::{Chunk as RawChunk, Const};
-        let mut chunk = RawChunk::new();
+        use crate::bytecode::Const;
+        let mut chunk = Chunk::new();
         let one = chunk.add_const(Const::Int(1));
         chunk.emit_const(one);
         chunk.emit_call(1);
         chunk.emit_halt();
         let mut out = Vec::new();
-        assert!(run(&chunk, &mut out).is_err());
+        assert!(run(&module_of(chunk), &mut out).is_err());
+    }
+
+    #[test]
+    fn minus_with_two_arguments_subtracts() {
+        assert_eq!(eval("(display (- 5 3))").unwrap(), "2");
+    }
+
+    #[test]
+    fn minus_with_more_than_two_arguments_subtracts_cumulatively_left_to_right() {
+        assert_eq!(eval("(display (- 10 1 2 3))").unwrap(), "4");
+    }
+
+    #[test]
+    fn minus_with_fewer_than_two_arguments_is_a_runtime_error() {
+        assert!(eval("(display (- 5))").is_err());
+    }
+
+    #[test]
+    fn times_with_two_arguments_multiplies() {
+        assert_eq!(eval("(display (* 3 4))").unwrap(), "12");
+    }
+
+    #[test]
+    fn times_with_more_than_two_arguments_multiplies_them_all() {
+        assert_eq!(eval("(display (* 1 2 3 4))").unwrap(), "24");
+    }
+
+    #[test]
+    fn times_with_fewer_than_two_arguments_is_a_runtime_error() {
+        assert!(eval("(display (* 5))").is_err());
+    }
+
+    #[test]
+    fn less_than_is_true_for_a_strictly_increasing_chain() {
+        assert_eq!(eval("(display (< 1 2 3))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn less_than_is_false_when_only_the_endpoints_would_satisfy_it() {
+        // A naive endpoints-only check (1 < 2) would wrongly say true;
+        // the middle pair (3, 2) breaks the chain.
+        assert_eq!(eval("(display (< 1 3 2))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn comparisons_require_at_least_two_arguments() {
+        assert!(eval("(display (< 1))").is_err());
+        assert!(eval("(display (= 1))").is_err());
+    }
+
+    #[test]
+    fn equals_checks_the_whole_chain_not_just_adjacent_pairs() {
+        assert_eq!(eval("(display (= 2 2 2))").unwrap(), "#t");
+        assert_eq!(eval("(display (= 2 2 3))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn plus_wraps_on_overflow_instead_of_erroring() {
+        assert_eq!(
+            eval(&format!("(display (+ {} 1))", i64::MAX)).unwrap(),
+            i64::MAX.wrapping_add(1).to_string()
+        );
+    }
+
+    #[test]
+    fn times_wraps_on_overflow_instead_of_erroring() {
+        assert_eq!(
+            eval(&format!("(display (* {} 2))", i64::MAX)).unwrap(),
+            i64::MAX.wrapping_mul(2).to_string()
+        );
+    }
+
+    #[test]
+    fn less_than_or_equal_holds_for_equal_and_increasing_values() {
+        assert_eq!(eval("(display (<= 1 1 2))").unwrap(), "#t");
+        assert_eq!(eval("(display (<= 2 1))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn greater_than_holds_for_a_strictly_decreasing_chain() {
+        assert_eq!(eval("(display (> 3 2 1))").unwrap(), "#t");
+        assert_eq!(eval("(display (> 1 2))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn greater_than_is_strict_and_rejects_equal_values() {
+        // Distinguishes > from >=: equal adjacent values must not satisfy >.
+        assert_eq!(eval("(display (> 2 2))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn greater_than_or_equal_holds_for_equal_and_decreasing_values() {
+        assert_eq!(eval("(display (>= 2 2 1))").unwrap(), "#t");
+        assert_eq!(eval("(display (>= 1 2))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn a_fixed_plus_rest_function_called_with_exactly_the_fixed_count_gets_an_empty_rest_list() {
+        assert_eq!(
+            eval("(define (f a b . rest) rest) (display (f 1 2))").unwrap(),
+            "()"
+        );
+    }
+
+    #[test]
+    fn a_fixed_plus_rest_function_called_with_fewer_than_the_fixed_count_is_a_runtime_error() {
+        assert!(eval("(define (f a b . rest) rest) (display (f 1))").is_err());
     }
 }

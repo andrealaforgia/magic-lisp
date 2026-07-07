@@ -77,7 +77,7 @@ pub fn execute(
     }
 }
 
-fn compile_source(src: &str) -> Result<bytecode::Chunk, String> {
+fn compile_source(src: &str) -> Result<bytecode::Module, String> {
     let forms = reader::read_program(src).map_err(|e| e.to_string())?;
     compiler::compile_program(&forms).map_err(|e| e.to_string())
 }
@@ -90,14 +90,14 @@ fn run_eval(path: &Path, out: &mut impl Write, err: &mut impl Write) -> i32 {
             return exitcode::SOURCE_ERROR;
         }
     };
-    let chunk = match compile_source(&src) {
-        Ok(c) => c,
+    let module = match compile_source(&src) {
+        Ok(m) => m,
         Err(message) => {
             let _ = writeln!(err, "error: {message}");
             return exitcode::SOURCE_ERROR;
         }
     };
-    match vm::run(&chunk, out) {
+    match vm::run(&module, out) {
         Ok(()) => exitcode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
@@ -114,16 +114,12 @@ fn run_compile(input: &Path, output: &Path, err: &mut impl Write) -> i32 {
             return exitcode::SOURCE_ERROR;
         }
     };
-    let chunk = match compile_source(&src) {
-        Ok(c) => c,
+    let module = match compile_source(&src) {
+        Ok(m) => m,
         Err(message) => {
             let _ = writeln!(err, "error: {message}");
             return exitcode::SOURCE_ERROR;
         }
-    };
-    let module = bytecode::Module {
-        entry_index: 0,
-        functions: vec![chunk],
     };
     match std::fs::write(output, bytecode::encode(&module)) {
         Ok(()) => exitcode::SUCCESS,
@@ -150,8 +146,7 @@ fn run_run(artifact: &Path, out: &mut impl Write, err: &mut impl Write) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
-    let chunk = &module.functions[module.entry_index as usize];
-    match vm::run(chunk, out) {
+    match vm::run(&module, out) {
         Ok(()) => exitcode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
@@ -165,8 +160,7 @@ fn run_disasm(artifact: &Path, out: &mut impl Write, err: &mut impl Write) -> i3
         Ok(m) => m,
         Err(code) => return code,
     };
-    let chunk = &module.functions[module.entry_index as usize];
-    let _ = write!(out, "{}", disasm::disassemble(chunk));
+    let _ = write!(out, "{}", disasm::disassemble(&module));
     exitcode::SUCCESS
 }
 

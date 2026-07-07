@@ -7,6 +7,9 @@ pub enum Sexpr {
     Str(String),
     Symbol(String),
     List(Vec<Sexpr>),
+    /// `(a b . rest)` — an improper list with a fixed head and a non-list
+    /// tail. Used exclusively for parameter-list syntax in this language.
+    DottedList(Vec<Sexpr>, Box<Sexpr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,7 +65,18 @@ impl<'a> Scanner<'a> {
     }
 
     fn is_delimiter(c: char) -> bool {
-        c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';'
+        c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';' || c == '\''
+    }
+
+    fn peek_is_lone_dot(&self) -> bool {
+        let mut lookahead = self.chars.clone();
+        if lookahead.next() != Some('.') {
+            return false;
+        }
+        match lookahead.peek() {
+            None => true,
+            Some(&c) => Self::is_delimiter(c),
+        }
     }
 
     fn read_form(&mut self) -> Result<Option<Sexpr>, ReadError> {
@@ -75,6 +89,16 @@ impl<'a> Scanner<'a> {
             }
             Some(')') => Err(err("unexpected ')' with no matching '('")),
             Some('"') => self.read_string().map(Some),
+            Some('\'') => {
+                self.chars.next();
+                let datum = self
+                    .read_form()?
+                    .ok_or_else(|| err("expected a datum after '\''"))?;
+                Ok(Some(Sexpr::List(vec![
+                    Sexpr::Symbol("quote".to_string()),
+                    datum,
+                ])))
+            }
             Some(_) => self.read_atom().map(Some),
         }
     }
@@ -99,6 +123,20 @@ impl<'a> Scanner<'a> {
             if let Some(')') = self.chars.peek() {
                 self.chars.next();
                 return Ok(Sexpr::List(items));
+            }
+            if self.peek_is_lone_dot() {
+                self.chars.next(); // consume '.'
+                self.skip_atmosphere();
+                let tail = self
+                    .read_form()?
+                    .ok_or_else(|| err("expected a datum after '.' in a dotted list"))?;
+                self.skip_atmosphere();
+                return match self.chars.next() {
+                    Some(')') => Ok(Sexpr::DottedList(items, Box::new(tail))),
+                    _ => Err(err(
+                        "expected ')' immediately after the tail of a dotted list",
+                    )),
+                };
             }
             let form = self
                 .read_form()?
@@ -153,8 +191,8 @@ impl<'a> Scanner<'a> {
 
 fn atom_from_text(text: &str) -> Sexpr {
     match text {
-        "true" => Sexpr::Bool(true),
-        "false" => Sexpr::Bool(false),
+        "true" | "#t" => Sexpr::Bool(true),
+        "false" | "#f" => Sexpr::Bool(false),
         _ => match text.parse::<i64>() {
             Ok(n) => Sexpr::Int(n),
             Err(_) => Sexpr::Symbol(text.to_string()),
@@ -431,5 +469,97 @@ mod tests {
         let one_sibling = format!("{}1{}", "(".repeat(300), ")".repeat(300));
         let src = format!("{one_sibling} {one_sibling}");
         assert!(read_program(&src).is_ok());
+    }
+
+    #[test]
+    fn reads_quote_shorthand_on_a_symbol_as_a_quote_form() {
+        assert_eq!(
+            read_program("'x").unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("quote".to_string()),
+                Sexpr::Symbol("x".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn reads_quote_shorthand_around_a_list() {
+        assert_eq!(
+            read_program("'(+ 1 2)").unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("quote".to_string()),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("+".to_string()),
+                    Sexpr::Int(1),
+                    Sexpr::Int(2),
+                ]),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_quote_character_ends_a_preceding_atom_without_whitespace() {
+        assert_eq!(
+            read_program("a'b").unwrap(),
+            vec![
+                Sexpr::Symbol("a".to_string()),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("quote".to_string()),
+                    Sexpr::Symbol("b".to_string()),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_hash_t_and_hash_f_as_booleans() {
+        assert_eq!(
+            read_program("#t #f").unwrap(),
+            vec![Sexpr::Bool(true), Sexpr::Bool(false)]
+        );
+    }
+
+    #[test]
+    fn reads_a_dotted_pair_with_a_single_fixed_head_item() {
+        assert_eq!(
+            read_program("(a . b)").unwrap(),
+            vec![Sexpr::DottedList(
+                vec![Sexpr::Symbol("a".to_string())],
+                Box::new(Sexpr::Symbol("b".to_string())),
+            )]
+        );
+    }
+
+    #[test]
+    fn reads_a_dotted_list_with_multiple_fixed_head_items() {
+        assert_eq!(
+            read_program("(a b . c)").unwrap(),
+            vec![Sexpr::DottedList(
+                vec![
+                    Sexpr::Symbol("a".to_string()),
+                    Sexpr::Symbol("b".to_string())
+                ],
+                Box::new(Sexpr::Symbol("c".to_string())),
+            )]
+        );
+    }
+
+    #[test]
+    fn rejects_a_dotted_list_missing_a_tail_datum() {
+        assert!(read_program("(a . )").is_err());
+    }
+
+    #[test]
+    fn rejects_a_dotted_list_with_extra_items_after_the_tail() {
+        assert!(read_program("(a . b c)").is_err());
+    }
+
+    #[test]
+    fn a_lone_dot_symbol_outside_a_list_is_still_read_as_a_symbol() {
+        // The dotted-pair marker is only special inside a list body.
+        assert_eq!(
+            read_program(".").unwrap(),
+            vec![Sexpr::Symbol(".".to_string())]
+        );
     }
 }
