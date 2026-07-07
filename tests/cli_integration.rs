@@ -353,3 +353,39 @@ fn e10_full_pipeline_round_trips_across_process_boundaries() {
     let eval_output = run(&["eval", source_file.to_str().unwrap()]);
     assert_eq!(stdout_of(&eval_output), stdout_of(&run_output));
 }
+
+// E11: compiling the same source text twice, in two separate process
+// invocations, produces byte-identical artifact files — no incidental
+// nondeterminism (timestamps, ids, unordered iteration) leaks into MLBC.
+#[test]
+fn e11_compiling_the_same_source_twice_produces_byte_identical_artifacts() {
+    let source = write_source(
+        "e11.ml",
+        "(display (+ 1 2)) (newline) (display \"hi\") (display true) (display false)",
+    );
+    let artifact_a = temp_path("e11-a.mlbc");
+    let artifact_b = temp_path("e11-b.mlbc");
+
+    let out_a = run(&[
+        "compile",
+        source.to_str().unwrap(),
+        "-o",
+        artifact_a.to_str().unwrap(),
+    ]);
+    assert_eq!(out_a.status.code(), Some(SUCCESS));
+
+    let out_b = run(&[
+        "compile",
+        source.to_str().unwrap(),
+        "-o",
+        artifact_b.to_str().unwrap(),
+    ]);
+    assert_eq!(out_b.status.code(), Some(SUCCESS));
+
+    let bytes_a = std::fs::read(&artifact_a).unwrap();
+    let bytes_b = std::fs::read(&artifact_b).unwrap();
+    assert_eq!(
+        bytes_a, bytes_b,
+        "two compiles of the same source must be byte-identical"
+    );
+}
