@@ -79,41 +79,49 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Reads one datum, if any remain. Every recursive descent into this
+    /// function increments `self.depth` for the duration of the call (and
+    /// restores it on return), so the depth limit applies uniformly to
+    /// *any* recursive construct — list nesting, quote shorthand, and
+    /// anything added later — by construction, rather than requiring each
+    /// new caller to separately opt in (a prior version only checked depth
+    /// inside list-reading, so quote-shorthand nesting bypassed it entirely
+    /// — a security-review finding on B2).
     fn read_form(&mut self) -> Result<Option<Sexpr>, ReadError> {
         self.skip_atmosphere();
-        match self.chars.peek() {
-            None => Ok(None),
-            Some('(') => {
-                self.chars.next();
-                self.read_list().map(Some)
-            }
-            Some(')') => Err(err("unexpected ')' with no matching '('")),
-            Some('"') => self.read_string().map(Some),
-            Some('\'') => {
-                self.chars.next();
-                let datum = self
-                    .read_form()?
-                    .ok_or_else(|| err("expected a datum after '\''"))?;
-                Ok(Some(Sexpr::List(vec![
-                    Sexpr::Symbol("quote".to_string()),
-                    datum,
-                ])))
-            }
-            Some(_) => self.read_atom().map(Some),
+        if self.chars.peek().is_none() {
+            return Ok(None);
         }
-    }
-
-    fn read_list(&mut self) -> Result<Sexpr, ReadError> {
         self.depth += 1;
         let result = if self.depth > MAX_NESTING_DEPTH {
             Err(err(format!(
                 "list nesting exceeds the maximum supported depth ({MAX_NESTING_DEPTH})"
             )))
         } else {
-            self.read_list_body()
+            self.read_form_body().map(Some)
         };
         self.depth -= 1;
         result
+    }
+
+    fn read_form_body(&mut self) -> Result<Sexpr, ReadError> {
+        match self.chars.peek() {
+            None => unreachable!("read_form already checked for end of input"),
+            Some('(') => {
+                self.chars.next();
+                self.read_list_body()
+            }
+            Some(')') => Err(err("unexpected ')' with no matching '('")),
+            Some('"') => self.read_string(),
+            Some('\'') => {
+                self.chars.next();
+                let datum = self
+                    .read_form()?
+                    .ok_or_else(|| err("expected a datum after '\''"))?;
+                Ok(Sexpr::List(vec![Sexpr::Symbol("quote".to_string()), datum]))
+            }
+            Some(_) => self.read_atom(),
+        }
     }
 
     fn read_list_body(&mut self) -> Result<Sexpr, ReadError> {
@@ -435,10 +443,14 @@ mod tests {
 
     #[test]
     fn accepts_nesting_of_exactly_the_configured_maximum_depth() {
+        // MAX_NESTING_DEPTH - 1 opens, not MAX_NESTING_DEPTH: since depth is
+        // now incremented once per read_form call (see its doc comment),
+        // the innermost atom itself consumes one unit of budget too, so
+        // MAX_NESTING_DEPTH levels of '(' would land one over the limit.
         let src = format!(
             "{}1{}",
-            "(".repeat(MAX_NESTING_DEPTH),
-            ")".repeat(MAX_NESTING_DEPTH)
+            "(".repeat(MAX_NESTING_DEPTH - 1),
+            ")".repeat(MAX_NESTING_DEPTH - 1)
         );
         assert!(read_program(&src).is_ok());
     }
@@ -560,6 +572,30 @@ mod tests {
         assert_eq!(
             read_program(".").unwrap(),
             vec![Sexpr::Symbol(".".to_string())]
+        );
+    }
+
+    #[test]
+    fn quote_shorthand_nesting_up_to_the_configured_maximum_still_succeeds() {
+        // MAX_NESTING_DEPTH - 1, matching the analogous list-nesting boundary
+        // test above (the trailing atom also consumes one unit of budget).
+        let src = format!("{}x", "'".repeat(MAX_NESTING_DEPTH - 1));
+        assert!(read_program(&src).is_ok());
+    }
+
+    #[test]
+    fn quote_shorthand_nesting_is_bounded_by_the_same_depth_limit_as_lists() {
+        // A security-review finding on B2: the quote-shorthand ('x) parsing
+        // recursed into read_form with no depth accounting at all, bypassing
+        // the guard that already protected '('-nesting — a source file of
+        // repeated quote characters could abort the process via native stack
+        // overflow before this guard was consulted.
+        let src = format!("{}x", "'".repeat(MAX_NESTING_DEPTH + 1));
+        let err = read_program(&src).unwrap_err();
+        assert!(
+            err.message.contains("nesting") && err.message.contains("depth"),
+            "expected a nesting-depth error, got: {}",
+            err.message
         );
     }
 }

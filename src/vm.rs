@@ -90,9 +90,29 @@ fn symbol_name(c: &Const) -> Result<String, RuntimeError> {
     }
 }
 
+/// Caps native-Rust recursion depth across MagicLisp function calls (this
+/// language has no tail-call elimination yet, and every call is a real Rust
+/// stack frame — Value::Function calling into Vm::exec calling back into
+/// Vm::call_value). Without this, ordinary, non-malicious recursive code
+/// (idiomatic recursion is B3's headline feature) can abort the whole
+/// process via native stack overflow — an unrecoverable, uncatchable crash,
+/// unlike every other error path here — instead of returning a clean
+/// RuntimeError (a security-review finding on B3).
+///
+/// 128 was chosen empirically, not guessed: a debug build recursing with no
+/// depth guard at all natively overflows a default-sized (2 MiB) thread
+/// stack at a call depth of roughly 250-260 (measured by bisection), which
+/// is comfortably *below* the 512 this constant used to be set to — so the
+/// old value let the native stack overflow before the guard ever tripped.
+/// 128 keeps a ~2x safety margin under that measured worst case, so the
+/// guard actually fires before the process can crash, including when this
+/// interpreter is embedded and driven from a thread with a modest stack.
+const MAX_CALL_DEPTH: usize = 128;
+
 struct Vm<'m> {
     module: &'m Module,
     globals: HashMap<String, Value>,
+    call_depth: usize,
 }
 
 impl<'m> Vm<'m> {
@@ -267,13 +287,21 @@ impl<'m> Vm<'m> {
         match callee {
             Value::Native(name) => call_native(name, &args, out),
             Value::Function(idx) => {
+                if self.call_depth >= MAX_CALL_DEPTH {
+                    return Err(error(format!(
+                        "maximum call depth exceeded ({MAX_CALL_DEPTH}) — possible infinite or too-deep recursion"
+                    )));
+                }
                 let chunk = self
                     .module
                     .functions
                     .get(*idx as usize)
                     .ok_or_else(|| error(format!("function index {idx} out of range")))?;
                 let mut locals = bind_arguments(chunk, args)?;
-                self.exec(chunk, &mut locals, out)
+                self.call_depth += 1;
+                let result = self.exec(chunk, &mut locals, out);
+                self.call_depth -= 1;
+                result
             }
             other => Err(error(format!("cannot call a non-procedure value: {other}"))),
         }
@@ -308,6 +336,7 @@ pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
     let mut vm = Vm {
         module,
         globals: default_globals(),
+        call_depth: 0,
     };
     let entry = module
         .functions
@@ -477,6 +506,57 @@ mod tests {
         chunk.emit_halt();
         let mut out = Vec::new();
         assert!(run(&module_of(chunk), &mut out).is_err());
+    }
+
+    #[test]
+    fn recursion_up_to_the_call_depth_limit_still_succeeds() {
+        // MAX_CALL_DEPTH - 1 recursive steps plus the initial call is
+        // exactly MAX_CALL_DEPTH nested Value::Function calls, the last
+        // one landing on call_depth == MAX_CALL_DEPTH - 1 (checked against
+        // the limit *before* incrementing), so this is the deepest
+        // recursion the guard is supposed to still allow.
+        let src = format!(
+            "(define (count-down n) (if (= n 0) 0 (count-down (- n 1)))) \
+             (display (count-down {}))",
+            MAX_CALL_DEPTH - 1
+        );
+        assert_eq!(eval(&src).unwrap(), "0");
+    }
+
+    #[test]
+    fn recursion_beyond_the_call_depth_limit_is_a_clean_runtime_error_not_a_crash() {
+        // One recursive step deeper than the previous test's boundary is
+        // enough to push the (MAX_CALL_DEPTH + 1)-th nested call past the
+        // limit. Without the call_depth guard this input would abort the
+        // whole test process via native stack overflow instead of failing
+        // a single test (a security-review finding on B3).
+        let src = format!(
+            "(define (count-down n) (if (= n 0) 0 (count-down (- n 1)))) \
+             (display (count-down {}))",
+            MAX_CALL_DEPTH
+        );
+        let err = eval(&src).unwrap_err();
+        assert!(
+            err.message.contains("call depth"),
+            "expected a call-depth error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn call_depth_is_restored_after_a_call_returns_so_sequential_calls_each_get_a_fresh_budget() {
+        // If call_depth were incremented (instead of decremented) as calls
+        // return, the counter would leak upward across independent calls
+        // instead of being restored. Each of these two calls is safely
+        // shallow on its own (well under MAX_CALL_DEPTH), so this only
+        // passes if the first call's depth accounting is fully unwound
+        // before the second one starts.
+        let src = format!(
+            "(define (count-down n) (if (= n 0) 0 (count-down (- n 1)))) \
+             (display (count-down {n})) (display (count-down {n}))",
+            n = MAX_CALL_DEPTH - 10
+        );
+        assert_eq!(eval(&src).unwrap(), "00");
     }
 
     #[test]
