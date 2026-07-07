@@ -1,5 +1,8 @@
 //! Compiles reader output into bytecode.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use crate::bytecode::{Chunk, Const, Module, Op};
 use crate::reader::Sexpr;
 
@@ -78,7 +81,18 @@ struct Ctx {
     // finishes compiling — so a scope boundary marker would never actually
     // be consulted. Simpler to just track (name, slot) pairs directly.
     locals: Vec<(String, u8)>,
-    next_slot: u8,
+    // Shared (not per-clone) on purpose: at runtime, PUSH_LOCAL only ever
+    // grows one flat per-frame Vec<Value> and nothing ever pops from it, so
+    // two `let`s in the same function — nested OR sequential siblings —
+    // must never be allocated the same slot number, even though each one's
+    // own extended Ctx clone is discarded once that form finishes
+    // compiling. A plain `u8` here would let sibling `let`s each start
+    // counting from the same inherited value and collide on one runtime
+    // slot; sharing the counter via Rc<Cell<_>> keeps allocation
+    // monotonic across every clone descended from the same function-level
+    // Ctx, while `locals` itself stays independently cloned so name
+    // visibility/shadowing is still scoped correctly.
+    next_slot: Rc<Cell<u8>>,
     aliases: Vec<(String, String)>,
 }
 
@@ -86,7 +100,7 @@ impl Ctx {
     fn top_level() -> Self {
         Ctx {
             locals: Vec::new(),
-            next_slot: 0,
+            next_slot: Rc::new(Cell::new(0)),
             aliases: Vec::new(),
         }
     }
@@ -97,7 +111,7 @@ impl Ctx {
     ) -> Result<Self, CompileError> {
         let mut ctx = Ctx {
             locals: Vec::new(),
-            next_slot: 0,
+            next_slot: Rc::new(Cell::new(0)),
             aliases,
         };
         for p in params {
@@ -111,14 +125,14 @@ impl Ctx {
     /// representable number of locals across its parameters and any nested
     /// `let`/`let*` bindings.
     fn declare(&mut self, name: String) -> Result<u8, CompileError> {
-        if self.next_slot == u8::MAX {
+        let slot = self.next_slot.get();
+        if slot == u8::MAX {
             return Err(err(format!(
                 "too many local bindings in one function (maximum {})",
                 u8::MAX
             )));
         }
-        let slot = self.next_slot;
-        self.next_slot += 1;
+        self.next_slot.set(slot + 1);
         self.locals.push((name, slot));
         Ok(slot)
     }

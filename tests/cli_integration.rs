@@ -865,6 +865,74 @@ fn b3_e6b_mutating_an_undefined_name_is_a_runtime_failure_with_the_runtime_error
     assert!(!stderr_of(&output).is_empty());
 }
 
+// A test-design review (qa msg #49) flagged that let/let*/letrec/named-let/
+// set! only had happy-path coverage, with none of the scope-edge cases
+// below actually exercised -- exactly where binding-form bugs live. Adding
+// tests for them surfaced a genuine, previously-unknown bug (below), fixed
+// in Ctx::next_slot (src/compiler.rs).
+
+#[test]
+fn b3_scope_nested_let_shadows_outer_then_outer_resumes_after_inner_closes() {
+    let out = eval_ok(
+        "b3-scope-shadow.ml",
+        "(display (let ((x 1)) (let ((x 2)) (display x)) (newline) x))",
+    );
+    assert_eq!(out, "2\n1");
+}
+
+#[test]
+fn b3_scope_set_bang_on_an_outer_let_local_from_a_nested_scope_mutates_it() {
+    let out = eval_ok(
+        "b3-scope-nested-set.ml",
+        "(display (let ((x 1)) (let ((y 2)) (set! x 99)) x))",
+    );
+    assert_eq!(out, "99");
+}
+
+#[test]
+fn b3_scope_letrec_referencing_a_not_yet_initialized_binding_is_a_clean_runtime_error() {
+    let file = write_source(
+        "b3-scope-letrec-uninit.ml",
+        "(display (letrec ((a b) (b 1)) a))",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(RUNTIME_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
+fn b3_scope_lambda_body_cannot_see_an_enclosing_lets_locals() {
+    // Documented in compile_lambda's own comment: a lambda compiles to a
+    // separate chunk with no access to the enclosing frame's locals, so a
+    // free reference to an enclosing let's binding falls back to (and
+    // fails as) an unbound global, rather than resolving lexically.
+    let file = write_source(
+        "b3-scope-lambda-no-enclosing.ml",
+        "(display (let ((x 5)) ((lambda () x))))",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(RUNTIME_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
+fn b3_scope_sequential_sibling_lets_do_not_collide_on_the_same_runtime_slot() {
+    // Regression test for a genuine bug found while adding this coverage:
+    // Ctx::next_slot was a plain u8, copied (not shared) whenever Ctx was
+    // cloned for a new `let`'s extended scope. Two *sequential* (sibling,
+    // not nested) lets in the same body each cloned from the same
+    // original next_slot and so were assigned the identical slot number
+    // at compile time -- but at runtime PUSH_LOCAL only ever grows one
+    // flat, never-popped Vec<Value>, so the second let's binding actually
+    // landed one slot further along than the compiled GET_LOCAL expected,
+    // silently reading the first let's stale value instead of its own.
+    let out = eval_ok(
+        "b3-scope-sequential-lets.ml",
+        "(define (f) (let ((a 1)) (display a)) (newline) (let ((b 2)) (display b))) (f)",
+    );
+    assert_eq!(out, "1\n2");
+}
+
 #[test]
 fn b3_e7a_cond_checks_tests_in_order_and_falls_back_to_else() {
     assert_eq!(
