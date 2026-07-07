@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn each_delimiter_character_ends_a_preceding_atom_without_whitespace() {
+    fn an_open_paren_ends_a_preceding_atom_without_whitespace() {
         assert_eq!(
             read_program("a(b)").unwrap(),
             vec![
@@ -314,6 +314,10 @@ mod tests {
                 Sexpr::List(vec![Sexpr::Symbol("b".to_string())]),
             ]
         );
+    }
+
+    #[test]
+    fn a_close_paren_ends_a_preceding_atom_without_whitespace() {
         assert_eq!(
             read_program("(a)b").unwrap(),
             vec![
@@ -321,6 +325,10 @@ mod tests {
                 Sexpr::Symbol("b".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_semicolon_ends_a_preceding_atom_without_whitespace() {
         assert_eq!(
             read_program("a;comment\nb").unwrap(),
             vec![
@@ -328,6 +336,10 @@ mod tests {
                 Sexpr::Symbol("b".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn a_double_quote_ends_a_preceding_atom_without_whitespace() {
         assert_eq!(
             read_program("a\"str\"").unwrap(),
             vec![

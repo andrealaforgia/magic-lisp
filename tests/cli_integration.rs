@@ -224,17 +224,28 @@ fn e4_unknown_verb_fails_cleanly_with_a_usage_error_instead_of_hanging_or_crashi
     assert_eq!(out.status.code(), Some(USAGE_ERROR));
 }
 
-// E5: reader accepts numbers, symbols, escaped strings, booleans, nested lists, comments, whitespace.
+// E5: reader accepts numbers, symbols, escaped strings, booleans, nested lists, comments,
+// whitespace. One test per construct, plus one proving they compose in a single file.
+
 #[test]
-fn e5_reads_a_source_file_exercising_every_supported_construct_together() {
-    let src = r#"
-        ; a leading comment
-        (display "line one\nline two\ttabbed\r\"quoted\"\\backslash") (newline)
-        (display (+ 42 (+ 1 2))) (newline)
-        (display true) (newline)
-        (display false) (newline)
-    "#;
-    let file = write_source("e5.ml", src);
+fn e5_reads_a_leading_comment_line() {
+    let file = write_source("e5-comment.ml", "; a leading comment\n(display 1)");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(stdout_of(&output), "1");
+}
+
+#[test]
+fn e5_reads_a_string_literal_with_every_supported_escape() {
+    let file = write_source(
+        "e5-escapes.ml",
+        r#"(display "line one\nline two\ttabbed\r\"quoted\"\\backslash")"#,
+    );
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(
         output.status.code(),
@@ -244,7 +255,55 @@ fn e5_reads_a_source_file_exercising_every_supported_construct_together() {
     );
     assert_eq!(
         stdout_of(&output),
-        "line one\nline two\ttabbed\r\"quoted\"\\backslash\n45\ntrue\nfalse\n"
+        "line one\nline two\ttabbed\r\"quoted\"\\backslash"
+    );
+}
+
+#[test]
+fn e5_reads_and_evaluates_a_nested_arithmetic_expression() {
+    let file = write_source("e5-nested.ml", "(display (+ 42 (+ 1 2)))");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(stdout_of(&output), "45");
+}
+
+#[test]
+fn e5_reads_boolean_literals() {
+    let file = write_source("e5-bools.ml", "(display true) (newline) (display false)");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(stdout_of(&output), "true\nfalse");
+}
+
+#[test]
+fn e5_reads_a_source_file_exercising_every_supported_construct_together() {
+    // The tests above prove each construct is read correctly in isolation;
+    // this proves they also compose without interference when combined in a
+    // single file, per E5's "read together" requirement.
+    let src = r#"
+        ; a leading comment
+        (display "line one\nline two\ttabbed\r\"quoted\"\\backslash") (newline)
+        (display (+ 42 (+ 1 2))) (newline)
+        (display true) (newline)
+        (display false) (newline)
+    "#;
+    let file = write_source("e5-combined.ml", src);
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "stderr: {}",
+        stderr_of(&output)
     );
 }
 
@@ -330,17 +389,49 @@ fn e8_runtime_error_exit_code_for_an_undefined_global() {
 }
 
 // E9: display/newline/+ (0, 1, 2, >2 args) all work; output is ordered and flushed.
+// One test per arg-count case, plus one dedicated to ordering/flushing.
+
 #[test]
-fn e9_builtins_behave_correctly_and_output_is_ordered_and_flushed() {
-    let src = "\
-        (display (+)) (newline) \
-        (display (+ 5)) (newline) \
-        (display (+ 1 2)) (newline) \
-        (display (+ 1 2 3 4)) (newline)";
-    let file = write_source("e9.ml", src);
+fn e9_plus_with_zero_arguments_is_zero() {
+    let file = write_source("e9-zero.ml", "(display (+))");
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(SUCCESS));
-    assert_eq!(stdout_of(&output), "0\n5\n3\n10\n");
+    assert_eq!(stdout_of(&output), "0");
+}
+
+#[test]
+fn e9_plus_with_one_argument_is_that_argument() {
+    let file = write_source("e9-one.ml", "(display (+ 5))");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SUCCESS));
+    assert_eq!(stdout_of(&output), "5");
+}
+
+#[test]
+fn e9_plus_with_two_arguments_sums_them() {
+    let file = write_source("e9-two.ml", "(display (+ 1 2))");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SUCCESS));
+    assert_eq!(stdout_of(&output), "3");
+}
+
+#[test]
+fn e9_plus_with_more_than_two_arguments_sums_them_all() {
+    let file = write_source("e9-many.ml", "(display (+ 1 2 3 4))");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SUCCESS));
+    assert_eq!(stdout_of(&output), "10");
+}
+
+#[test]
+fn e9_multiple_displays_and_newlines_appear_in_order_and_are_fully_flushed() {
+    let file = write_source(
+        "e9-order.ml",
+        "(display 1) (newline) (display 2) (newline) (display 3) (newline)",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SUCCESS));
+    assert_eq!(stdout_of(&output), "1\n2\n3\n");
 }
 
 // E10 (integration): source on disk -> compile -> save -> (new process) load -> run,
