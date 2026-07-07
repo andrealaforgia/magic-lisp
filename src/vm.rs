@@ -764,8 +764,12 @@ mod tests {
     }
 
     #[test]
-    fn equals_checks_the_whole_chain_not_just_adjacent_pairs() {
+    fn equals_is_true_for_a_chain_of_equal_values() {
         assert_eq!(eval("(display (= 2 2 2))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn equals_checks_the_whole_chain_not_just_adjacent_pairs() {
         assert_eq!(eval("(display (= 2 2 3))").unwrap(), "#f");
     }
 
@@ -788,12 +792,20 @@ mod tests {
     #[test]
     fn less_than_or_equal_holds_for_equal_and_increasing_values() {
         assert_eq!(eval("(display (<= 1 1 2))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn less_than_or_equal_is_false_when_the_chain_decreases() {
         assert_eq!(eval("(display (<= 2 1))").unwrap(), "#f");
     }
 
     #[test]
     fn greater_than_holds_for_a_strictly_decreasing_chain() {
         assert_eq!(eval("(display (> 3 2 1))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn greater_than_is_false_when_the_chain_increases() {
         assert_eq!(eval("(display (> 1 2))").unwrap(), "#f");
     }
 
@@ -806,6 +818,10 @@ mod tests {
     #[test]
     fn greater_than_or_equal_holds_for_equal_and_decreasing_values() {
         assert_eq!(eval("(display (>= 2 2 1))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn greater_than_or_equal_is_false_when_the_chain_increases() {
         assert_eq!(eval("(display (>= 1 2))").unwrap(), "#f");
     }
 

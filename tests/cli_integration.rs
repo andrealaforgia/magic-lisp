@@ -690,17 +690,25 @@ fn b2_e9_the_empty_list_is_truthy_in_a_conditional() {
 }
 
 #[test]
-fn b2_e10_minus_and_times_accept_two_arguments() {
+fn b2_e10_minus_accepts_two_arguments() {
     assert_eq!(eval_ok("b2-e10-minus2.ml", "(display (- 10 3))"), "7");
+}
+
+#[test]
+fn b2_e10_times_accepts_two_arguments() {
     assert_eq!(eval_ok("b2-e10-times2.ml", "(display (* 3 4))"), "12");
 }
 
 #[test]
-fn b2_e10_minus_and_times_accept_four_or_more_arguments() {
+fn b2_e10_minus_accepts_four_or_more_arguments() {
     assert_eq!(
         eval_ok("b2-e10-minus4.ml", "(display (- 20 1 2 3 4))"),
         "10"
     );
+}
+
+#[test]
+fn b2_e10_times_accepts_four_or_more_arguments() {
     assert_eq!(eval_ok("b2-e10-times4.ml", "(display (* 1 2 3 4))"), "24");
 }
 
@@ -916,7 +924,13 @@ fn b3_e10a_or_returns_the_first_truthy_value() {
 
 #[test]
 fn b3_e10b_or_all_falsy_returns_the_last_value() {
-    assert_eq!(eval_ok("b3-e10b.ml", "(display (or #f #f 3))"), "3");
+    // (or #f #f 3) would pass even under a naive "first truthy" rule (3 is
+    // truthy), so it can't distinguish "returns 3 because nothing else was
+    // truthy" from "returns 3 because it's the first/only truthy value it
+    // hit" -- an examiner review on B3 (msg #48) flagged exactly this. Since
+    // #f is the only falsy value in this language (per B2), a genuinely
+    // all-falsy call needs every argument to be #f.
+    assert_eq!(eval_ok("b3-e10b.ml", "(display (or #f #f #f))"), "#f");
 }
 
 #[test]
