@@ -94,20 +94,19 @@ fn symbol_name(c: &Const) -> Result<String, RuntimeError> {
 /// language has no tail-call elimination yet, and every call is a real Rust
 /// stack frame — Value::Function calling into Vm::exec calling back into
 /// Vm::call_value). Without this, ordinary, non-malicious recursive code
-/// (idiomatic recursion is B3's headline feature) can abort the whole
-/// process via native stack overflow — an unrecoverable, uncatchable crash,
-/// unlike every other error path here — instead of returning a clean
-/// RuntimeError (a security-review finding on B3).
+/// (idiomatic recursion — including named-`let` iteration, B3's headline
+/// feature — can abort the whole process via native stack overflow instead
+/// of returning a clean RuntimeError (a security-review finding on B3).
 ///
-/// 128 was chosen empirically, not guessed: a debug build recursing with no
-/// depth guard at all natively overflows a default-sized (2 MiB) thread
-/// stack at a call depth of roughly 250-260 (measured by bisection), which
-/// is comfortably *below* the 512 this constant used to be set to — so the
-/// old value let the native stack overflow before the guard ever tripped.
-/// 128 keeps a ~2x safety margin under that measured worst case, so the
-/// guard actually fires before the process can crash, including when this
-/// interpreter is embedded and driven from a thread with a modest stack.
-const MAX_CALL_DEPTH: usize = 128;
+/// Sized empirically, not guessed, against `run`'s dedicated `VM_STACK_SIZE`
+/// thread (see below): a debug build recursing with no depth guard at all
+/// natively overflows that 64 MiB stack at a call depth of roughly
+/// 7000-8000 (measured by bisection). 4000 keeps a healthy safety margin
+/// under that measured worst case while still giving ordinary recursive
+/// programs real headroom — e.g. a named-`let` loop summing 1..=1000 (which
+/// used to fail outright against this crate's old 512/128 limits, before
+/// `run` gave the VM its own generous stack) comfortably succeeds.
+const MAX_CALL_DEPTH: usize = 4000;
 
 struct Vm<'m> {
     module: &'m Module,
@@ -332,7 +331,45 @@ fn bind_arguments(chunk: &Chunk, mut args: Vec<Value>) -> Result<Vec<Value>, Run
     }
 }
 
+/// The VM always executes on a dedicated thread with this much native stack,
+/// rather than whatever stack the caller happens to be running on (which
+/// might be a constrained default, e.g. 2 MiB on a spawned thread). This
+/// makes MAX_CALL_DEPTH's safety margin a property of the interpreter
+/// itself instead of an accident of the caller's environment, and gives
+/// ordinary non-tail-recursive MagicLisp programs (this language has no
+/// TCO yet, so idiomatic recursion — including named-`let` iteration,
+/// B3's headline feature — burns one native frame per call) real, usable
+/// headroom instead of failing on loops of only a few hundred iterations.
+const VM_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Runs `module` to completion on a dedicated `VM_STACK_SIZE` thread.
+///
+/// If VM execution panics for any reason (a genuine internal bug, since
+/// every intentional failure path already returns `Err(RuntimeError)`
+/// rather than panicking), that panic is caught at the thread join below
+/// and converted into a generic `RuntimeError` instead of unwinding into
+/// the caller — so a caller-visible crash always means a real native stack
+/// overflow, never an ordinary bug. This is deliberate defense in depth,
+/// not a substitute for the guarded error paths elsewhere in this file.
 pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
+    // `out` (e.g. a locked stdout handle) isn't necessarily Send, so it
+    // can't be captured directly by the spawned thread's closure below.
+    // Buffering into a plain (Send) Vec<u8> on that thread and flushing it
+    // to the real `out` here, after the thread has been joined, sidesteps
+    // that without requiring every caller's writer to be Send.
+    let mut buffer = Vec::new();
+    let result = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(VM_STACK_SIZE)
+            .spawn_scoped(scope, || run_on_this_thread(module, &mut buffer))
+            .expect("failed to spawn VM thread")
+            .join()
+    });
+    let _ = out.write_all(&buffer);
+    result.unwrap_or_else(|_| Err(error("internal error: VM thread panicked")))
+}
+
+fn run_on_this_thread(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
     let mut vm = Vm {
         module,
         globals: default_globals(),
@@ -560,6 +597,63 @@ mod tests {
     }
 
     #[test]
+    fn call_depth_is_restored_after_a_call_errors_out_from_exceeding_the_limit() {
+        // MagicLisp has no exception handling, so a program-level error
+        // always terminates the whole `run()` — there's no way to observe
+        // depth restoration-after-error through source text alone. This is
+        // a white-box test on a single, shared Vm instance instead: every
+        // level of the recursive chain that triggered the depth error must
+        // still unwind and decrement call_depth on the way back up (the
+        // decrement isn't skipped just because the call ultimately
+        // failed), or a subsequent, independent, safely-shallow call on
+        // that same Vm would incorrectly start from leftover depth and
+        // fail too.
+        //
+        // Driving MAX_CALL_DEPTH's worth of real native recursion needs the
+        // same generous stack `run()` normally provides; calling straight
+        // into call_value here bypasses that wrapper, so this test spawns
+        // its own equivalently-sized thread rather than relying on the
+        // ambient (possibly much smaller) test-thread stack.
+        let forms =
+            read_program("(define (count-down n) (if (= n 0) 0 (count-down (- n 1))))").unwrap();
+        let module = compile_program(&forms).unwrap();
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(VM_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    let mut vm = Vm {
+                        module: &module,
+                        globals: default_globals(),
+                        call_depth: 0,
+                    };
+                    let mut out = Vec::new();
+                    let entry = &module.functions[module.entry_index as usize];
+                    vm.exec(entry, &mut Vec::new(), &mut out).unwrap();
+                    let count_down = vm.globals.get("count-down").cloned().unwrap();
+
+                    let over_limit = vm.call_value(
+                        &count_down,
+                        vec![Value::Int(MAX_CALL_DEPTH as i64)],
+                        &mut out,
+                    );
+                    assert!(over_limit.is_err());
+                    assert_eq!(
+                        vm.call_depth, 0,
+                        "call_depth must be fully unwound after an error, not leaked"
+                    );
+
+                    let still_works = vm
+                        .call_value(&count_down, vec![Value::Int(5)], &mut out)
+                        .unwrap();
+                    assert_eq!(still_works, Value::Int(0));
+                })
+                .expect("failed to spawn test thread")
+                .join()
+                .expect("test thread panicked");
+        });
+    }
+
+    #[test]
     fn an_undefined_opcode_is_a_runtime_error_not_a_panic() {
         let mut chunk = Chunk::new();
         chunk.code.push(254); // no opcode is numbered 254
@@ -597,6 +691,15 @@ mod tests {
         // Stack holds exactly 1 value (meant as the sole argument) with nothing
         // beneath it to serve as the callee: CALL 1 must fail cleanly, not
         // panic trying to pop a callee that isn't there.
+        //
+        // The assertion checks the exact message, not just is_err(): `run`
+        // executes on a spawned thread and converts an escaping panic into
+        // a generic RuntimeError too (see run's doc comment), so a bare
+        // is_err() can't tell "the underflow guard did its job" apart from
+        // "the guard was silently broken and something downstream panicked
+        // instead" — both would look identical to the caller. This is what
+        // caught a real `stack.len() < argc + 1` -> `argc * 1` mutant that
+        // a plain is_err() assertion missed.
         use crate::bytecode::Const;
         let mut chunk = Chunk::new();
         let one = chunk.add_const(Const::Int(1));
@@ -604,7 +707,12 @@ mod tests {
         chunk.emit_call(1);
         chunk.emit_halt();
         let mut out = Vec::new();
-        assert!(run(&module_of(chunk), &mut out).is_err());
+        let err = run(&module_of(chunk), &mut out).unwrap_err();
+        assert!(
+            err.message.contains("stack underflow during CALL"),
+            "expected a stack-underflow error, got: {}",
+            err.message
+        );
     }
 
     #[test]

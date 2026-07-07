@@ -811,6 +811,22 @@ fn b3_e4_named_let_sums_one_to_one_hundred() {
 }
 
 #[test]
+fn b3_e4b_named_let_iterates_well_beyond_one_hundred_without_hitting_the_call_depth_ceiling() {
+    // named-let compiles to real (non-tail-call-optimized) recursive calls,
+    // so it shares Vm::call_value's MAX_CALL_DEPTH ceiling — a security
+    // review found that an ordinary loop summing 1..=1000 failed outright
+    // against this crate's original 512/128 call-depth limits, since every
+    // iteration burns a native stack frame. The VM now runs on its own
+    // large dedicated stack, giving this headline iteration idiom real
+    // headroom instead of silently capping it at a few hundred iterations.
+    let out = eval_ok(
+        "b3-e4b.ml",
+        "(display (let loop ((i 1) (sum 0)) (if (> i 1000) sum (loop (+ i 1) (+ sum i)))))",
+    );
+    assert_eq!(out, "500500");
+}
+
+#[test]
 fn b3_e5_internal_definitions_are_mutually_visible_regardless_of_order() {
     // six-times references triple, which is DEFINED AFTER it in the body.
     let out = eval_ok(
