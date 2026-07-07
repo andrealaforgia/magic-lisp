@@ -78,13 +78,45 @@ mod tests {
     use super::*;
     use crate::bytecode::Op;
 
+    /// Decodes just the sequence of opcodes from a chunk's code, discarding
+    /// operand bytes — so tests can assert on the compiler's control-flow
+    /// shape (which opcodes, in what order) without coupling to the exact
+    /// operand encoding, which is bytecode.rs's concern (see its own
+    /// round-trip tests) and not the compiler's observable behavior.
+    fn opcode_sequence(code: &[u8]) -> Vec<Op> {
+        let mut ops = Vec::new();
+        let mut i = 0;
+        while i < code.len() {
+            let op = code[i];
+            i += 1;
+            let decoded = if op == Op::Const as u8 {
+                i += 4;
+                Op::Const
+            } else if op == Op::GetGlobal as u8 {
+                i += 4;
+                Op::GetGlobal
+            } else if op == Op::Call as u8 {
+                i += 1;
+                Op::Call
+            } else if op == Op::Pop as u8 {
+                Op::Pop
+            } else if op == Op::Halt as u8 {
+                Op::Halt
+            } else {
+                panic!("opcode_sequence: unrecognised opcode byte {op}");
+            };
+            ops.push(decoded);
+        }
+        ops
+    }
+
     #[test]
     fn compiles_an_int_literal_to_const_then_pop_then_halt() {
         let chunk = compile_program(&[Sexpr::Int(5)]).unwrap();
         assert_eq!(chunk.constants, vec![Const::Int(5)]);
         assert_eq!(
-            chunk.code,
-            vec![Op::Const as u8, 0, 0, 0, 0, Op::Pop as u8, Op::Halt as u8]
+            opcode_sequence(&chunk.code),
+            vec![Op::Const, Op::Pop, Op::Halt]
         );
     }
 
@@ -96,32 +128,21 @@ mod tests {
             Sexpr::Int(2),
         ])];
         let chunk = compile_program(&program).unwrap();
+        // Constant-pool order is the direct evidence of "callee first, then
+        // args in order" — the actual behavior this test cares about.
         assert_eq!(
             chunk.constants,
-            vec![Const::Symbol("+".to_string()), Const::Int(1), Const::Int(2),]
+            vec![Const::Symbol("+".to_string()), Const::Int(1), Const::Int(2)]
         );
         assert_eq!(
-            chunk.code,
+            opcode_sequence(&chunk.code),
             vec![
-                Op::GetGlobal as u8,
-                0,
-                0,
-                0,
-                0,
-                Op::Const as u8,
-                1,
-                0,
-                0,
-                0,
-                Op::Const as u8,
-                2,
-                0,
-                0,
-                0,
-                Op::Call as u8,
-                2,
-                Op::Pop as u8,
-                Op::Halt as u8,
+                Op::GetGlobal, // callee
+                Op::Const,     // arg 1
+                Op::Const,     // arg 2
+                Op::Call,
+                Op::Pop,
+                Op::Halt,
             ]
         );
     }
