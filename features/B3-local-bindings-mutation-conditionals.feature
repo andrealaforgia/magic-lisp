@@ -120,3 +120,15 @@ Feature: B3 — Local bindings, mutation, and the full family of conditional/seq
     #   7. (define v 0) (set! v 1) (display v) (newline) -> 1
     #   8. (define (f) (define (double x) (* x 2)) (define (six-times x) (double (triple x)))
     #        (define (triple x) (* x 3)) (six-times 5)) (display (f)) (newline) -> 30
+
+  Scenario: E13 — two sequential sibling let/let* blocks in one body don't alias each other's slot
+    Given a function body containing two independent, non-nested let blocks one after another
+    When the function is called
+    Then each let's binding is evaluated correctly, with neither overwritten by or aliased to the other's runtime slot
+    # Retroactive addition: disclosed by the Builder as a real, previously-unknown bug found
+    # while adding unrelated test coverage (commit 05855e1) — the compiler's local-slot
+    # counter was copied instead of shared when cloning scope context, so two sequential
+    # sibling lets in the same body were assigned the same physical runtime slot.
+    # Evidence: (define (f) (let ((a 1)) (display a)) (newline) (let ((b 2)) (display b))) (f)
+    #   pre-fix:  "1\n1" (wrong — second let silently returned the first let's stale value)
+    #   post-fix: "1\n2" (correct)
