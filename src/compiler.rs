@@ -31,22 +31,118 @@ fn too_deep() -> CompileError {
     ))
 }
 
-/// Local variable names in scope for the function body currently being
-/// compiled (its formal parameters, in slot order). Empty at the top level:
-/// this language has no closures over enclosing lambdas yet, so every
-/// function body sees only its own parameters as locals; any other free
-/// symbol resolves as a (possibly not-yet-defined) global.
+/// Threads the module being built and a counter for generating unique
+/// internal names — see [`Ctx::aliases`].
+struct Compilation {
+    module: Module,
+    gensym_counter: u32,
+}
+
+impl Compilation {
+    fn new() -> Self {
+        Compilation {
+            module: Module::default(),
+            gensym_counter: 0,
+        }
+    }
+
+    fn gensym(&mut self, hint: &str) -> String {
+        self.gensym_counter += 1;
+        format!("%%{hint}%{}", self.gensym_counter)
+    }
+}
+
+/// Lexical scope for the function body currently being compiled.
+///
+/// `scopes` holds true local variable slots (function parameters and
+/// let/let*-bound names), searched innermost-first; a name found here
+/// compiles to GET_LOCAL/SET_LOCAL. Slot indices are never reused within one
+/// function, even after a scope is dropped — simpler than slot-packing, at
+/// the cost of a few unused runtime slots.
+///
+/// `aliases` maps a name to a compiler-generated *global* name it should
+/// resolve through instead. This is how letrec, named let, and internal
+/// (mutually recursive) definitions work without real closures: a lambda
+/// body compiles as a separate chunk with no access to the enclosing scope's
+/// locals, so a self- or mutually-referencing local function is instead
+/// bound under a unique global name — exactly like top-level `define`,
+/// which already supports self-recursion via late-bound global lookup.
+/// Unlike `scopes`, `aliases` IS inherited into nested function compiles,
+/// since it only redirects which global name a GET_GLOBAL resolves through;
+/// it needs no real stack-frame access.
+#[derive(Clone)]
 struct Ctx {
-    locals: Vec<String>,
+    // Flat, not nested: resolution always searches innermost-declared-first
+    // regardless of which lexical block a name came from, and a `let`'s
+    // extended `Ctx` is a clone that is simply discarded once that form
+    // finishes compiling — so a scope boundary marker would never actually
+    // be consulted. Simpler to just track (name, slot) pairs directly.
+    locals: Vec<(String, u8)>,
+    next_slot: u8,
+    aliases: Vec<(String, String)>,
 }
 
 impl Ctx {
     fn top_level() -> Self {
-        Ctx { locals: Vec::new() }
+        Ctx {
+            locals: Vec::new(),
+            next_slot: 0,
+            aliases: Vec::new(),
+        }
+    }
+
+    fn for_function(
+        params: Vec<String>,
+        aliases: Vec<(String, String)>,
+    ) -> Result<Self, CompileError> {
+        let mut ctx = Ctx {
+            locals: Vec::new(),
+            next_slot: 0,
+            aliases,
+        };
+        for p in params {
+            ctx.declare(p)?;
+        }
+        Ok(ctx)
+    }
+
+    /// Declares a new local slot, failing cleanly (rather than overflowing
+    /// `next_slot: u8`) once a function has accumulated the maximum
+    /// representable number of locals across its parameters and any nested
+    /// `let`/`let*` bindings.
+    fn declare(&mut self, name: String) -> Result<u8, CompileError> {
+        if self.next_slot == u8::MAX {
+            return Err(err(format!(
+                "too many local bindings in one function (maximum {})",
+                u8::MAX
+            )));
+        }
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        self.locals.push((name, slot));
+        Ok(slot)
     }
 
     fn resolve_local(&self, name: &str) -> Option<u8> {
-        self.locals.iter().position(|n| n == name).map(|i| i as u8)
+        self.locals
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, slot)| *slot)
+    }
+
+    fn resolve_alias(&self, name: &str) -> Option<&str> {
+        self.aliases
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, a)| a.as_str())
+    }
+
+    fn with_alias(&self, name: String, alias: String) -> Ctx {
+        let mut ctx = self.clone();
+        ctx.aliases.push((name, alias));
+        ctx
     }
 }
 
@@ -103,28 +199,46 @@ fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
     })
 }
 
+fn expect_bindings_list(sexpr: &Sexpr) -> Result<Vec<(String, Sexpr)>, CompileError> {
+    match sexpr {
+        Sexpr::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Sexpr::List(pair) if pair.len() == 2 => {
+                    let name = expect_symbol_name(&pair[0])?;
+                    Ok((name, pair[1].clone()))
+                }
+                other => Err(err(format!(
+                    "expected a (name init) binding, found {other:?}"
+                ))),
+            })
+            .collect(),
+        other => Err(err(format!("expected a list of bindings, found {other:?}"))),
+    }
+}
+
 pub fn compile_program(forms: &[Sexpr]) -> Result<Module, CompileError> {
-    let mut module = Module::default();
+    let mut comp = Compilation::new();
     let mut entry = Chunk::new();
     let ctx = Ctx::top_level();
     for form in forms {
-        compile_expr(form, &ctx, &mut entry, &mut module, 0)?;
+        compile_expr(form, &ctx, &mut entry, &mut comp, 0)?;
         entry.emit_pop();
     }
     entry.emit_halt();
-    module.entry_index = module.functions.len() as u32;
-    module.functions.push(entry);
-    Ok(module)
+    comp.module.entry_index = comp.module.functions.len() as u32;
+    comp.module.functions.push(entry);
+    Ok(comp.module)
 }
 
 /// Compiles a body of expressions where all but the last are evaluated for
 /// effect and discarded, and the last one's value is left on the stack.
-/// Shared by `begin` and function/lambda bodies.
+/// Used for `begin` and, via [`compile_body`], for function/let bodies.
 fn compile_sequence(
     exprs: &[Sexpr],
     ctx: &Ctx,
     chunk: &mut Chunk,
-    module: &mut Module,
+    comp: &mut Compilation,
     depth: usize,
 ) -> Result<(), CompileError> {
     let Some((last, rest)) = exprs.split_last() else {
@@ -133,26 +247,112 @@ fn compile_sequence(
         return Ok(());
     };
     for e in rest {
-        compile_expr(e, ctx, chunk, module, depth)?;
+        compile_expr(e, ctx, chunk, comp, depth)?;
         chunk.emit_pop();
     }
-    compile_expr(last, ctx, chunk, module, depth)
+    compile_expr(last, ctx, chunk, comp, depth)
 }
 
-/// Compiles `formals body...` into a new function chunk appended to
-/// `module`'s function table, returning its index. Shared by `lambda` and
-/// `define`'s function-definition sugar.
+fn is_define_form(expr: &Sexpr) -> bool {
+    matches!(expr, Sexpr::List(items) if matches!(items.first(), Some(Sexpr::Symbol(s)) if s == "define"))
+}
+
+/// Extracts `(name, value-expr)` from a `(define name expr)` or
+/// `(define (name . formals) body...)` form, desugaring the function-sugar
+/// shape into an equivalent `(lambda formals body...)` value expression,
+/// without emitting any bytecode yet.
+fn extract_define_binding(items: &[Sexpr]) -> Result<(String, Sexpr), CompileError> {
+    let head = items
+        .get(1)
+        .ok_or_else(|| err("define requires a name or a (name . formals) head"))?;
+    match head {
+        Sexpr::Symbol(name) => {
+            if items.len() != 3 {
+                return Err(err(
+                    "define with a plain name takes exactly one value expression",
+                ));
+            }
+            Ok((name.clone(), items[2].clone()))
+        }
+        Sexpr::List(head_items) => {
+            let (name_sexpr, formal_items) = head_items
+                .split_first()
+                .ok_or_else(|| err("define's function head cannot be empty"))?;
+            let name = expect_symbol_name(name_sexpr)?;
+            let formals = Sexpr::List(formal_items.to_vec());
+            let mut lambda = vec![Sexpr::Symbol("lambda".to_string()), formals];
+            lambda.extend(items[2..].iter().cloned());
+            Ok((name, Sexpr::List(lambda)))
+        }
+        Sexpr::DottedList(head_items, tail) => {
+            let (name_sexpr, formal_items) = head_items
+                .split_first()
+                .ok_or_else(|| err("define's function head cannot be empty"))?;
+            let name = expect_symbol_name(name_sexpr)?;
+            let formals = if formal_items.is_empty() {
+                (**tail).clone()
+            } else {
+                Sexpr::DottedList(formal_items.to_vec(), tail.clone())
+            };
+            let mut lambda = vec![Sexpr::Symbol("lambda".to_string()), formals];
+            lambda.extend(items[2..].iter().cloned());
+            Ok((name, Sexpr::List(lambda)))
+        }
+        other => Err(err(format!("invalid define head: {other:?}"))),
+    }
+}
+
+/// Compiles a function/let-family body: a leading run of `(define ...)`
+/// forms is treated as one mutually-visible group (every name sees every
+/// other, including itself, regardless of declaration order — like
+/// `letrec`), followed by the remaining expressions as an ordinary
+/// sequence.
+fn compile_body(
+    exprs: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let split = exprs.iter().take_while(|e| is_define_form(e)).count();
+    let (defines, rest) = exprs.split_at(split);
+
+    if defines.is_empty() {
+        return compile_sequence(rest, ctx, chunk, comp, depth);
+    }
+
+    let mut extended = ctx.clone();
+    let mut bindings = Vec::with_capacity(defines.len());
+    for d in defines {
+        let Sexpr::List(items) = d else {
+            unreachable!("is_define_form guarantees a list")
+        };
+        let (name, init) = extract_define_binding(items)?;
+        let alias = comp.gensym(&name);
+        extended = extended.with_alias(name, alias.clone());
+        bindings.push((alias, init));
+    }
+    for (alias, init) in &bindings {
+        compile_expr(init, &extended, chunk, comp, depth + 1)?;
+        let idx = chunk.add_const(Const::Symbol(alias.clone()));
+        chunk.emit_def_global(idx);
+        chunk.emit_pop();
+    }
+    compile_sequence(rest, &extended, chunk, comp, depth)
+}
+
+/// Compiles `formals body...` into a new function chunk appended to the
+/// module's function table, returning its index. Shared by `lambda`,
+/// `define`'s function-definition sugar, and named `let`.
 fn compile_function(
     formals_sexpr: &Sexpr,
     body: &[Sexpr],
-    module: &mut Module,
+    comp: &mut Compilation,
     depth: usize,
+    enclosing_ctx: &Ctx,
 ) -> Result<u32, CompileError> {
-    // No separate depth check here: every caller reaches this function only
-    // through compile_expr's own check at this same `depth` value first, so
-    // a second check here would be unreachable dead code.
     let formals = parse_formals(formals_sexpr)?;
-    let (locals, arity, has_rest) = match formals {
+    let (params, arity, has_rest) = match formals {
         Formals::Fixed(names) => {
             let arity = names.len() as u32;
             (names, arity, false)
@@ -165,15 +365,15 @@ fn compile_function(
         Formals::AllRest(rest) => (vec![rest], 0, true),
     };
 
-    let ctx = Ctx { locals };
+    let ctx = Ctx::for_function(params, enclosing_ctx.aliases.clone())?;
     let mut fn_chunk = Chunk::new();
     fn_chunk.arity = arity;
     fn_chunk.has_rest = has_rest;
-    compile_sequence(body, &ctx, &mut fn_chunk, module, depth + 1)?;
+    compile_body(body, &ctx, &mut fn_chunk, comp, depth + 1)?;
     fn_chunk.emit_return();
 
-    let index = module.functions.len() as u32;
-    module.functions.push(fn_chunk);
+    let index = comp.module.functions.len() as u32;
+    comp.module.functions.push(fn_chunk);
     Ok(index)
 }
 
@@ -191,7 +391,7 @@ fn compile_if(
     items: &[Sexpr],
     ctx: &Ctx,
     chunk: &mut Chunk,
-    module: &mut Module,
+    comp: &mut Compilation,
     depth: usize,
 ) -> Result<(), CompileError> {
     if items.len() < 3 || items.len() > 4 {
@@ -203,14 +403,14 @@ fn compile_if(
     let then_branch = &items[2];
     let else_branch = items.get(3);
 
-    compile_expr(condition, ctx, chunk, module, depth + 1)?;
+    compile_expr(condition, ctx, chunk, comp, depth + 1)?;
     let else_jump = chunk.emit_jump(Op::JumpIfFalse);
-    compile_expr(then_branch, ctx, chunk, module, depth + 1)?;
+    compile_expr(then_branch, ctx, chunk, comp, depth + 1)?;
     let end_jump = chunk.emit_jump(Op::Jump);
 
     chunk.patch_jump(else_jump);
     match else_branch {
-        Some(else_expr) => compile_expr(else_expr, ctx, chunk, module, depth + 1)?,
+        Some(else_expr) => compile_expr(else_expr, ctx, chunk, comp, depth + 1)?,
         None => {
             let idx = chunk.add_const(Const::Unspecified);
             chunk.emit_const(idx);
@@ -224,68 +424,445 @@ fn compile_define(
     items: &[Sexpr],
     ctx: &Ctx,
     chunk: &mut Chunk,
-    module: &mut Module,
+    comp: &mut Compilation,
     depth: usize,
 ) -> Result<(), CompileError> {
-    let head = items
-        .get(1)
-        .ok_or_else(|| err("define requires a name or a (name . formals) head"))?;
-
-    match head {
-        Sexpr::Symbol(name) => {
-            if items.len() != 3 {
-                return Err(err(
-                    "define with a plain name takes exactly one value expression",
-                ));
-            }
-            compile_expr(&items[2], ctx, chunk, module, depth + 1)?;
-            let idx = chunk.add_const(Const::Symbol(name.clone()));
-            chunk.emit_def_global(idx);
-            Ok(())
-        }
-        Sexpr::List(head_items) => {
-            let (name_sexpr, formal_items) = head_items
-                .split_first()
-                .ok_or_else(|| err("define's function head cannot be empty"))?;
-            let name = expect_symbol_name(name_sexpr)?;
-            let formals_sexpr = Sexpr::List(formal_items.to_vec());
-            let fn_index = compile_function(&formals_sexpr, &items[2..], module, depth)?;
-            chunk.emit_make_function(fn_index);
-            let idx = chunk.add_const(Const::Symbol(name));
-            chunk.emit_def_global(idx);
-            Ok(())
-        }
-        Sexpr::DottedList(head_items, tail) => {
-            let (name_sexpr, formal_items) = head_items
-                .split_first()
-                .ok_or_else(|| err("define's function head cannot be empty"))?;
-            let name = expect_symbol_name(name_sexpr)?;
-            let formals_sexpr = if formal_items.is_empty() {
-                (**tail).clone()
-            } else {
-                Sexpr::DottedList(formal_items.to_vec(), tail.clone())
-            };
-            let fn_index = compile_function(&formals_sexpr, &items[2..], module, depth)?;
-            chunk.emit_make_function(fn_index);
-            let idx = chunk.add_const(Const::Symbol(name));
-            chunk.emit_def_global(idx);
-            Ok(())
-        }
-        other => Err(err(format!("invalid define head: {other:?}"))),
-    }
+    // A define reached here (top-level, or one that isn't part of a leading
+    // run at the start of a body — compile_body handles that case) binds a
+    // real global under its own literal name.
+    let (name, value_expr) = extract_define_binding(items)?;
+    compile_expr(&value_expr, ctx, chunk, comp, depth + 1)?;
+    let idx = chunk.add_const(Const::Symbol(name));
+    chunk.emit_def_global(idx);
+    Ok(())
 }
 
 fn compile_lambda(
     items: &[Sexpr],
+    ctx: &Ctx,
     chunk: &mut Chunk,
-    module: &mut Module,
+    comp: &mut Compilation,
     depth: usize,
 ) -> Result<(), CompileError> {
     let formals_sexpr = items
         .get(1)
         .ok_or_else(|| err("lambda requires a parameter list"))?;
-    let fn_index = compile_function(formals_sexpr, &items[2..], module, depth)?;
+    let fn_index = compile_function(formals_sexpr, &items[2..], comp, depth, ctx)?;
     chunk.emit_make_function(fn_index);
+    Ok(())
+}
+
+/// `let`: all binding expressions see only the enclosing scope (not each
+/// other) — evaluated first against the outer `ctx`, then declared as new
+/// locals only afterward. Also dispatches to [`compile_named_let`] when the
+/// `(let name ((...)) ...)` shape is used.
+fn compile_let(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    if let Some(Sexpr::Symbol(_)) = items.get(1) {
+        return compile_named_let(items, ctx, chunk, comp, depth);
+    }
+    let bindings_sexpr = items
+        .get(1)
+        .ok_or_else(|| err("let requires a bindings list"))?;
+    let bindings = expect_bindings_list(bindings_sexpr)?;
+    let body = &items[2..];
+
+    let mut extended = ctx.clone();
+    for (name, init) in &bindings {
+        compile_expr(init, ctx, chunk, comp, depth + 1)?;
+        chunk.emit_push_local();
+        extended.declare(name.clone())?;
+    }
+    compile_body(body, &extended, chunk, comp, depth + 1)
+}
+
+/// `let*`: each binding expression sees every binding introduced before it
+/// in the same group (sequential visibility).
+fn compile_let_star(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let bindings_sexpr = items
+        .get(1)
+        .ok_or_else(|| err("let* requires a bindings list"))?;
+    let bindings = expect_bindings_list(bindings_sexpr)?;
+    let body = &items[2..];
+
+    let mut extended = ctx.clone();
+    for (name, init) in &bindings {
+        compile_expr(init, &extended, chunk, comp, depth + 1)?;
+        chunk.emit_push_local();
+        extended.declare(name.clone())?;
+    }
+    compile_body(body, &extended, chunk, comp, depth + 1)
+}
+
+/// `letrec`: every binding sees every other binding, including itself —
+/// enabling (mutual) self-reference. Implemented via [`Ctx::aliases`] (see
+/// its doc comment) rather than real local slots, since the bound values are
+/// typically lambdas that need to reference their siblings from within a
+/// separately-compiled function body.
+fn compile_letrec(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let bindings_sexpr = items
+        .get(1)
+        .ok_or_else(|| err("letrec requires a bindings list"))?;
+    let bindings = expect_bindings_list(bindings_sexpr)?;
+    let body = &items[2..];
+
+    let mut extended = ctx.clone();
+    let mut aliased = Vec::with_capacity(bindings.len());
+    for (name, init) in &bindings {
+        let alias = comp.gensym(name);
+        extended = extended.with_alias(name.clone(), alias.clone());
+        aliased.push((alias, init.clone()));
+    }
+    for (alias, init) in &aliased {
+        compile_expr(init, &extended, chunk, comp, depth + 1)?;
+        let idx = chunk.add_const(Const::Symbol(alias.clone()));
+        chunk.emit_def_global(idx);
+        chunk.emit_pop();
+    }
+    compile_body(body, &extended, chunk, comp, depth + 1)
+}
+
+/// Named `let`: `(let loop ((v init) ...) body...)` desugars to a
+/// `letrec`-bound self-recursive function immediately called with the
+/// initial values, giving iteration without a separate top-level `define`.
+fn compile_named_let(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let name = expect_symbol_name(&items[1])?;
+    let bindings_sexpr = items
+        .get(2)
+        .ok_or_else(|| err("named let requires a bindings list"))?;
+    let bindings = expect_bindings_list(bindings_sexpr)?;
+    let body = &items[3..];
+
+    let alias = comp.gensym(&name);
+    let ctx_with_alias = ctx.with_alias(name, alias.clone());
+
+    let formals_sexpr = Sexpr::List(
+        bindings
+            .iter()
+            .map(|(n, _)| Sexpr::Symbol(n.clone()))
+            .collect(),
+    );
+    let fn_index = compile_function(&formals_sexpr, body, comp, depth, &ctx_with_alias)?;
+    chunk.emit_make_function(fn_index);
+    let def_idx = chunk.add_const(Const::Symbol(alias.clone()));
+    chunk.emit_def_global(def_idx);
+    chunk.emit_pop();
+
+    let callee_idx = chunk.add_const(Const::Symbol(alias));
+    chunk.emit_get_global(callee_idx);
+    for (_, init) in &bindings {
+        compile_expr(init, ctx, chunk, comp, depth + 1)?;
+    }
+    if bindings.len() > u8::MAX as usize {
+        return Err(err(format!(
+            "too many bindings in named let: {}",
+            bindings.len()
+        )));
+    }
+    chunk.emit_call(bindings.len() as u8);
+    Ok(())
+}
+
+/// `set!`: mutates an existing binding in place. Resolves the target the
+/// same way a read would (local slot, then alias, then plain global);
+/// mutating a name that turns out not to exist as a global is a runtime
+/// error (checked by the VM, since a not-yet-defined global is not
+/// distinguishable from "will be defined later" at compile time).
+fn compile_set(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    if items.len() != 3 {
+        return Err(err("set! requires exactly a name and a value expression"));
+    }
+    let name = expect_symbol_name(&items[1])?;
+    compile_expr(&items[2], ctx, chunk, comp, depth + 1)?;
+    if let Some(slot) = ctx.resolve_local(&name) {
+        chunk.emit_set_local(slot);
+    } else if let Some(alias) = ctx.resolve_alias(&name) {
+        let idx = chunk.add_const(Const::Symbol(alias.to_string()));
+        chunk.emit_set_global(idx);
+    } else {
+        let idx = chunk.add_const(Const::Symbol(name));
+        chunk.emit_set_global(idx);
+    }
+    Ok(())
+}
+
+/// Short-circuiting `and`: evaluates left to right, stopping at (and
+/// returning) the first falsy value; returns the last value if all are
+/// truthy. `(and)` with no operands is `#t`.
+fn compile_and(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let exprs = &items[1..];
+    let Some((last, rest)) = exprs.split_last() else {
+        let idx = chunk.add_const(Const::Bool(true));
+        chunk.emit_const(idx);
+        return Ok(());
+    };
+    let mut end_jumps = Vec::new();
+    for e in rest {
+        compile_expr(e, ctx, chunk, comp, depth + 1)?;
+        chunk.emit_dup();
+        end_jumps.push(chunk.emit_jump(Op::JumpIfFalse));
+        chunk.emit_pop();
+    }
+    compile_expr(last, ctx, chunk, comp, depth + 1)?;
+    for j in end_jumps {
+        chunk.patch_jump(j);
+    }
+    Ok(())
+}
+
+/// Short-circuiting `or`: evaluates left to right, stopping at (and
+/// returning) the first truthy value; returns the last value if all are
+/// falsy. `(or)` with no operands is `#f`.
+fn compile_or(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let exprs = &items[1..];
+    let Some((last, rest)) = exprs.split_last() else {
+        let idx = chunk.add_const(Const::Bool(false));
+        chunk.emit_const(idx);
+        return Ok(());
+    };
+    let mut end_jumps = Vec::new();
+    for e in rest {
+        compile_expr(e, ctx, chunk, comp, depth + 1)?;
+        chunk.emit_dup();
+        let falsy = chunk.emit_jump(Op::JumpIfFalse);
+        end_jumps.push(chunk.emit_jump(Op::Jump));
+        chunk.patch_jump(falsy);
+        chunk.emit_pop();
+    }
+    compile_expr(last, ctx, chunk, comp, depth + 1)?;
+    for j in end_jumps {
+        chunk.patch_jump(j);
+    }
+    Ok(())
+}
+
+/// `when`: runs its body (as an implicit `begin`) only if the condition is
+/// truthy; produces the unspecified value with no visible effect otherwise.
+fn compile_when(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let condition = items
+        .get(1)
+        .ok_or_else(|| err("when requires a condition"))?;
+    let body = &items[2..];
+    compile_expr(condition, ctx, chunk, comp, depth + 1)?;
+    let else_jump = chunk.emit_jump(Op::JumpIfFalse);
+    compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+    let end_jump = chunk.emit_jump(Op::Jump);
+    chunk.patch_jump(else_jump);
+    let idx = chunk.add_const(Const::Unspecified);
+    chunk.emit_const(idx);
+    chunk.patch_jump(end_jump);
+    Ok(())
+}
+
+/// `unless`: runs its body only if the condition is falsy; unspecified with
+/// no visible effect otherwise.
+fn compile_unless(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let condition = items
+        .get(1)
+        .ok_or_else(|| err("unless requires a condition"))?;
+    let body = &items[2..];
+    compile_expr(condition, ctx, chunk, comp, depth + 1)?;
+    let run_jump = chunk.emit_jump(Op::JumpIfFalse);
+    let idx = chunk.add_const(Const::Unspecified);
+    chunk.emit_const(idx);
+    let end_jump = chunk.emit_jump(Op::Jump);
+    chunk.patch_jump(run_jump);
+    compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+    chunk.patch_jump(end_jump);
+    Ok(())
+}
+
+/// `cond`: tests are checked in order; the first truthy one's body runs
+/// (falling back to `else` if present, otherwise unspecified). A clause of
+/// the form `(test => func)` applies `func` to the test's own value instead
+/// of running a separate body.
+fn compile_cond(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let clauses = &items[1..];
+    let mut end_jumps = Vec::new();
+
+    for (i, clause) in clauses.iter().enumerate() {
+        let Sexpr::List(clause_items) = clause else {
+            return Err(err(format!("cond clause must be a list, found {clause:?}")));
+        };
+        let (test, rest) = clause_items
+            .split_first()
+            .ok_or_else(|| err("cond clause cannot be empty"))?;
+
+        let is_else = i == clauses.len() - 1 && matches!(test, Sexpr::Symbol(s) if s == "else");
+        if is_else {
+            compile_sequence(rest, ctx, chunk, comp, depth + 1)?;
+            end_jumps.push(chunk.emit_jump(Op::Jump));
+            continue;
+        }
+
+        let is_arrow = rest.len() == 2 && matches!(&rest[0], Sexpr::Symbol(s) if s == "=>");
+        if is_arrow {
+            let func = &rest[1];
+            compile_expr(test, ctx, chunk, comp, depth + 1)?; // [t]
+            chunk.emit_dup(); // [t, t]
+            let skip = chunk.emit_jump(Op::JumpIfFalse); // pops one; falsy -> skip, leaves [t]
+            compile_expr(func, ctx, chunk, comp, depth + 1)?; // [t, f]
+            chunk.emit_swap(); // [f, t]
+            chunk.emit_call(1); // [result]
+            end_jumps.push(chunk.emit_jump(Op::Jump));
+            chunk.patch_jump(skip);
+            chunk.emit_pop(); // discard leftover t on the falsy path
+            continue;
+        }
+
+        compile_expr(test, ctx, chunk, comp, depth + 1)?;
+        let skip = chunk.emit_jump(Op::JumpIfFalse);
+        compile_sequence(rest, ctx, chunk, comp, depth + 1)?;
+        end_jumps.push(chunk.emit_jump(Op::Jump));
+        chunk.patch_jump(skip);
+    }
+
+    let idx = chunk.add_const(Const::Unspecified);
+    chunk.emit_const(idx);
+    for j in end_jumps {
+        chunk.patch_jump(j);
+    }
+    Ok(())
+}
+
+/// `case`: evaluates the key expression once, then compares it (by value
+/// equivalence, not by re-evaluating candidates as code) against each
+/// clause's literal candidate list, running the first matching clause's
+/// body, falling back to `else` if present, otherwise unspecified.
+fn compile_case(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let key_expr = items
+        .get(1)
+        .ok_or_else(|| err("case requires a key expression"))?;
+    let clauses = &items[2..];
+
+    compile_expr(key_expr, ctx, chunk, comp, depth + 1)?; // [k], kept live across every clause check
+
+    let mut end_jumps = Vec::new();
+    let mut pending_next_clause: Vec<usize> = Vec::new();
+
+    for (i, clause) in clauses.iter().enumerate() {
+        for j in pending_next_clause.drain(..) {
+            chunk.patch_jump(j);
+        }
+        let Sexpr::List(clause_items) = clause else {
+            return Err(err(format!("case clause must be a list, found {clause:?}")));
+        };
+        let (selector, body) = clause_items
+            .split_first()
+            .ok_or_else(|| err("case clause cannot be empty"))?;
+
+        let is_else = i == clauses.len() - 1 && matches!(selector, Sexpr::Symbol(s) if s == "else");
+        if is_else {
+            chunk.emit_pop(); // discard k, unused in the else body
+            compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+            end_jumps.push(chunk.emit_jump(Op::Jump));
+            continue;
+        }
+
+        let Sexpr::List(candidates) = selector else {
+            return Err(err(format!(
+                "case clause selector must be a list of candidate values, found {selector:?}"
+            )));
+        };
+
+        let mut found_jumps = Vec::new();
+        for candidate in candidates {
+            let candidate_const = sexpr_to_const(candidate)?;
+            chunk.emit_dup(); // [k, k]
+            let cidx = chunk.add_const(candidate_const);
+            chunk.emit_const(cidx); // [k, k, c]
+            chunk.emit_eqv(); // [k, bool]
+            let try_next = chunk.emit_jump(Op::JumpIfFalse); // falsy -> next candidate, leaves [k]
+            found_jumps.push(chunk.emit_jump(Op::Jump)); // matched -> run this clause's body, leaves [k]
+            chunk.patch_jump(try_next);
+        }
+        // No candidate in this clause matched: move on to the next clause,
+        // carrying k forward for its checks.
+        pending_next_clause.push(chunk.emit_jump(Op::Jump));
+
+        for j in found_jumps {
+            chunk.patch_jump(j);
+        }
+        chunk.emit_pop(); // discard k, unused in the body
+        compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+        end_jumps.push(chunk.emit_jump(Op::Jump));
+    }
+
+    for j in pending_next_clause.drain(..) {
+        chunk.patch_jump(j);
+    }
+    chunk.emit_pop(); // no clause matched and there was no else: discard k
+    let idx = chunk.add_const(Const::Unspecified);
+    chunk.emit_const(idx);
+
+    for j in end_jumps {
+        chunk.patch_jump(j);
+    }
     Ok(())
 }
 
@@ -293,7 +870,7 @@ fn compile_expr(
     expr: &Sexpr,
     ctx: &Ctx,
     chunk: &mut Chunk,
-    module: &mut Module,
+    comp: &mut Compilation,
     depth: usize,
 ) -> Result<(), CompileError> {
     if depth > MAX_NESTING_DEPTH {
@@ -315,6 +892,9 @@ fn compile_expr(
         Sexpr::Symbol(s) => {
             if let Some(slot) = ctx.resolve_local(s) {
                 chunk.emit_get_local(slot);
+            } else if let Some(alias) = ctx.resolve_alias(s) {
+                let idx = chunk.add_const(Const::Symbol(alias.to_string()));
+                chunk.emit_get_global(idx);
             } else {
                 let idx = chunk.add_const(Const::Symbol(s.clone()));
                 chunk.emit_get_global(idx);
@@ -327,19 +907,29 @@ fn compile_expr(
             if let Some(Sexpr::Symbol(op)) = items.first() {
                 match op.as_str() {
                     "quote" => return compile_quote(items, chunk),
-                    "if" => return compile_if(items, ctx, chunk, module, depth),
-                    "define" => return compile_define(items, ctx, chunk, module, depth),
-                    "lambda" => return compile_lambda(items, chunk, module, depth),
-                    "begin" => return compile_sequence(&items[1..], ctx, chunk, module, depth + 1),
+                    "if" => return compile_if(items, ctx, chunk, comp, depth),
+                    "define" => return compile_define(items, ctx, chunk, comp, depth),
+                    "lambda" => return compile_lambda(items, ctx, chunk, comp, depth),
+                    "begin" => return compile_sequence(&items[1..], ctx, chunk, comp, depth + 1),
+                    "let" => return compile_let(items, ctx, chunk, comp, depth),
+                    "let*" => return compile_let_star(items, ctx, chunk, comp, depth),
+                    "letrec" => return compile_letrec(items, ctx, chunk, comp, depth),
+                    "set!" => return compile_set(items, ctx, chunk, comp, depth),
+                    "and" => return compile_and(items, ctx, chunk, comp, depth),
+                    "or" => return compile_or(items, ctx, chunk, comp, depth),
+                    "when" => return compile_when(items, ctx, chunk, comp, depth),
+                    "unless" => return compile_unless(items, ctx, chunk, comp, depth),
+                    "cond" => return compile_cond(items, ctx, chunk, comp, depth),
+                    "case" => return compile_case(items, ctx, chunk, comp, depth),
                     _ => {}
                 }
             }
             let (callee, args) = items
                 .split_first()
                 .ok_or_else(|| err("cannot call the empty list ()"))?;
-            compile_expr(callee, ctx, chunk, module, depth + 1)?;
+            compile_expr(callee, ctx, chunk, comp, depth + 1)?;
             for arg in args {
-                compile_expr(arg, ctx, chunk, module, depth + 1)?;
+                compile_expr(arg, ctx, chunk, comp, depth + 1)?;
             }
             if args.len() > u8::MAX as usize {
                 return Err(err(format!("too many arguments in call: {}", args.len())));
@@ -377,6 +967,20 @@ mod tests {
             } else if op == Op::GetLocal as u8 {
                 i += 1;
                 Op::GetLocal
+            } else if op == Op::SetLocal as u8 {
+                i += 1;
+                Op::SetLocal
+            } else if op == Op::SetGlobal as u8 {
+                i += 4;
+                Op::SetGlobal
+            } else if op == Op::PushLocal as u8 {
+                Op::PushLocal
+            } else if op == Op::Dup as u8 {
+                Op::Dup
+            } else if op == Op::Swap as u8 {
+                Op::Swap
+            } else if op == Op::Eqv as u8 {
+                Op::Eqv
             } else if op == Op::MakeFunction as u8 {
                 i += 4;
                 Op::MakeFunction
@@ -411,10 +1015,14 @@ mod tests {
         Sexpr::List(items)
     }
 
+    fn entry_of(module: &Module) -> &Chunk {
+        &module.functions[module.entry_index as usize]
+    }
+
     #[test]
     fn compiles_an_int_literal_to_const_then_pop_then_halt() {
         let module = compile_program(&[Sexpr::Int(5)]).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(entry.constants, vec![Const::Int(5)]);
         assert_eq!(
             opcode_sequence(&entry.code),
@@ -426,7 +1034,7 @@ mod tests {
     fn compiles_a_call_expression_as_callee_then_args_then_call() {
         let program = [list(vec![sym("+"), Sexpr::Int(1), Sexpr::Int(2)])];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(
             entry.constants,
             vec![Const::Symbol("+".to_string()), Const::Int(1), Const::Int(2)]
@@ -451,7 +1059,7 @@ mod tests {
             list(vec![sym("+"), Sexpr::Int(1), Sexpr::Int(2)]),
         ])];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(entry.constants.len(), 4);
         assert!(entry.code.contains(&(Op::Call as u8)));
     }
@@ -460,7 +1068,7 @@ mod tests {
     fn compiles_each_top_level_form_followed_by_its_own_pop() {
         let program = [Sexpr::Int(1), Sexpr::Int(2)];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         let pop_count = entry.code.iter().filter(|&&b| b == Op::Pop as u8).count();
         assert_eq!(pop_count, 2);
         assert_eq!(*entry.code.last().unwrap(), Op::Halt as u8);
@@ -469,7 +1077,7 @@ mod tests {
     #[test]
     fn compiles_a_bare_symbol_as_a_global_lookup() {
         let module = compile_program(&[sym("display")]).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(entry.constants, vec![Const::Symbol("display".to_string())]);
         assert_eq!(entry.code[0], Op::GetGlobal as u8);
     }
@@ -478,7 +1086,7 @@ mod tests {
     fn compiles_string_and_bool_literals_as_constants() {
         let program = [Sexpr::Str("hi".to_string()), Sexpr::Bool(true)];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(
             entry.constants,
             vec![Const::Str("hi".to_string()), Const::Bool(true)]
@@ -526,6 +1134,19 @@ mod tests {
             expr = list(vec![sym("+"), expr]);
         }
         expr
+    }
+
+    /// Builds a program by substituting a maximally-deep nested expression
+    /// into the position `build` chooses, and asserts that compiling it
+    /// fails — proving the nesting-depth limit is enforced at that specific
+    /// position (i.e. that position's `depth + 1` really propagates instead
+    /// of silently resetting to 0).
+    fn assert_propagates_depth(build: impl FnOnce(Sexpr) -> Sexpr) {
+        let program = [build(nested_call(MAX_NESTING_DEPTH))];
+        assert!(
+            compile_program(&program).is_err(),
+            "expected the nesting-depth limit to propagate through this position"
+        );
     }
 
     #[test]
@@ -584,9 +1205,6 @@ mod tests {
 
     #[test]
     fn nesting_depth_inside_a_function_body_starts_one_deeper_than_top_level() {
-        // The lambda itself is one level of nesting: a body expression that
-        // would exactly reach the top-level limit on its own is now one over,
-        // and must error, proving the body is compiled at depth+1, not depth.
         let body = nested_call(MAX_NESTING_DEPTH);
         let program = [list(vec![sym("lambda"), list(vec![]), body])];
         assert!(compile_program(&program).is_err());
@@ -650,7 +1268,7 @@ mod tests {
             list(vec![sym("+"), Sexpr::Int(1), Sexpr::Int(2)]),
         ])];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(
             opcode_sequence(&entry.code),
             vec![Op::Const, Op::Pop, Op::Halt]
@@ -674,7 +1292,7 @@ mod tests {
             Sexpr::Int(2),
         ])];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(
             opcode_sequence(&entry.code),
             vec![
@@ -693,7 +1311,7 @@ mod tests {
     fn compiles_if_without_else_to_push_unspecified_on_the_false_path() {
         let program = [list(vec![sym("if"), Sexpr::Bool(false), Sexpr::Int(1)])];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert!(entry.constants.contains(&Const::Unspecified));
     }
 
@@ -719,7 +1337,7 @@ mod tests {
     fn compiles_a_plain_define_as_value_then_def_global() {
         let program = [list(vec![sym("define"), sym("x"), Sexpr::Int(42)])];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         assert_eq!(
             opcode_sequence(&entry.code),
             vec![Op::Const, Op::DefGlobal, Op::Pop, Op::Halt]
@@ -736,12 +1354,10 @@ mod tests {
             list(vec![sym("+"), sym("a"), sym("b")]),
         ])];
         let module = compile_program(&program).unwrap();
-        // module.functions: [add's body chunk, entry chunk]
         assert_eq!(module.functions.len(), 2);
         let fn_chunk = &module.functions[0];
         assert_eq!(fn_chunk.arity, 2);
         assert!(!fn_chunk.has_rest);
-        // both locals resolved via GET_LOCAL, not GET_GLOBAL
         assert_eq!(
             opcode_sequence(&fn_chunk.code),
             vec![
@@ -794,8 +1410,8 @@ mod tests {
             list(vec![sym("+"), sym("x"), Sexpr::Int(1)]),
         ])];
         let module = compile_program(&program).unwrap();
-        assert_eq!(module.functions.len(), 2); // lambda body + entry
-        let entry = &module.functions[module.entry_index as usize];
+        assert_eq!(module.functions.len(), 2);
+        let entry = entry_of(&module);
         assert_eq!(
             opcode_sequence(&entry.code),
             vec![Op::MakeFunction, Op::Pop, Op::Halt]
@@ -811,19 +1427,14 @@ mod tests {
             Sexpr::Int(3),
         ])];
         let module = compile_program(&program).unwrap();
-        let entry = &module.functions[module.entry_index as usize];
+        let entry = entry_of(&module);
         let pop_count = entry.code.iter().filter(|&&b| b == Op::Pop as u8).count();
-        // 2 pops inside begin (for 1 and 2) + 1 pop for the top-level form's own result
         assert_eq!(pop_count, 3);
     }
 
     #[test]
     fn rejects_a_lambda_with_a_malformed_parameter_list() {
-        let program = [list(vec![
-            sym("lambda"),
-            Sexpr::Int(5), // not a symbol, list, or dotted list
-            Sexpr::Int(1),
-        ])];
+        let program = [list(vec![sym("lambda"), Sexpr::Int(5), Sexpr::Int(1)])];
         assert!(compile_program(&program).is_err());
     }
 
@@ -840,5 +1451,656 @@ mod tests {
             Sexpr::DottedList(vec![sym("a")], Box::new(sym("b"))),
         ])];
         assert!(compile_program(&program).is_err());
+    }
+
+    // --- B3: local bindings, mutation, conditional/sequencing forms ---
+
+    fn binding(name: &str, init: Sexpr) -> Sexpr {
+        list(vec![sym(name), init])
+    }
+
+    #[test]
+    fn compiles_let_bindings_evaluated_against_the_outer_scope_then_pushed_as_locals() {
+        // (let ((x 1) (y 2)) (+ x y))
+        let program = [list(vec![
+            sym("let"),
+            list(vec![
+                binding("x", Sexpr::Int(1)),
+                binding("y", Sexpr::Int(2)),
+            ]),
+            list(vec![sym("+"), sym("x"), sym("y")]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![
+                Op::Const,     // 1
+                Op::PushLocal, // x
+                Op::Const,     // 2
+                Op::PushLocal, // y
+                Op::GetGlobal, // +
+                Op::GetLocal,  // x
+                Op::GetLocal,  // y
+                Op::Call,
+                Op::Pop,
+                Op::Halt,
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_let_star_seeing_earlier_bindings_via_get_local() {
+        // (let* ((x 1) (y (+ x 1))) y)
+        let program = [list(vec![
+            sym("let*"),
+            list(vec![
+                binding("x", Sexpr::Int(1)),
+                binding("y", list(vec![sym("+"), sym("x"), Sexpr::Int(1)])),
+            ]),
+            sym("y"),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        // y's init `(+ x 1)` must reference x via GET_LOCAL, not GET_GLOBAL.
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![
+                Op::Const,     // 1
+                Op::PushLocal, // x
+                Op::GetGlobal, // +
+                Op::GetLocal,  // x
+                Op::Const,     // 1
+                Op::Call,
+                Op::PushLocal, // y
+                Op::GetLocal,  // y (the body)
+                Op::Pop,
+                Op::Halt,
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_letrec_binding_via_a_global_alias_not_a_local_slot() {
+        // (letrec ((f (lambda (n) (f n)))) f) — f's own body must reference
+        // itself via GET_GLOBAL(alias), since it's a separate chunk with no
+        // access to the letrec's locals.
+        let program = [list(vec![
+            sym("letrec"),
+            list(vec![binding(
+                "f",
+                list(vec![
+                    sym("lambda"),
+                    list(vec![sym("n")]),
+                    list(vec![sym("f"), sym("n")]),
+                ]),
+            )]),
+            sym("f"),
+        ])];
+        let module = compile_program(&program).unwrap();
+        assert_eq!(module.functions.len(), 2); // f's lambda body + entry
+        let f_chunk = &module.functions[0];
+        // f's body calls itself: GET_GLOBAL(alias), GET_LOCAL(n), CALL, RETURN
+        assert_eq!(
+            opcode_sequence(&f_chunk.code),
+            vec![Op::GetGlobal, Op::GetLocal, Op::Call, Op::Return]
+        );
+        let entry = entry_of(&module);
+        // the letrec body references f via the SAME alias (GET_GLOBAL, not GET_LOCAL)
+        assert!(opcode_sequence(&entry.code).contains(&Op::GetGlobal));
+        assert!(!opcode_sequence(&entry.code).contains(&Op::GetLocal));
+    }
+
+    #[test]
+    fn compiles_named_let_as_a_letrec_bound_function_called_immediately() {
+        // (let loop ((i 0)) i)
+        let program = [list(vec![
+            sym("let"),
+            sym("loop"),
+            list(vec![binding("i", Sexpr::Int(0))]),
+            sym("i"),
+        ])];
+        let module = compile_program(&program).unwrap();
+        assert_eq!(module.functions.len(), 2); // loop's body + entry
+        let entry = entry_of(&module);
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![
+                Op::MakeFunction,
+                Op::DefGlobal,
+                Op::Pop,
+                Op::GetGlobal, // the immediate call to loop
+                Op::Const,     // initial value 0
+                Op::Call,
+                Op::Pop,
+                Op::Halt,
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_internal_defines_at_the_start_of_a_body_as_a_letrec_group() {
+        // (lambda () (define (a) 1) (define (b) (a)) (b))
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![]),
+            list(vec![sym("define"), list(vec![sym("a")]), Sexpr::Int(1)]),
+            list(vec![
+                sym("define"),
+                list(vec![sym("b")]),
+                list(vec![sym("a")]),
+            ]),
+            list(vec![sym("b")]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        // a's chunk, b's chunk, the lambda's own chunk, entry = 4 functions
+        assert_eq!(module.functions.len(), 4);
+    }
+
+    #[test]
+    fn compiles_set_on_a_local_to_set_local() {
+        // (lambda (x) (set! x 2))
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("x")]),
+            list(vec![sym("set!"), sym("x"), Sexpr::Int(2)]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        assert_eq!(
+            opcode_sequence(&fn_chunk.code),
+            vec![Op::Const, Op::SetLocal, Op::Return]
+        );
+    }
+
+    #[test]
+    fn compiles_set_on_a_global_to_set_global() {
+        let program = [list(vec![sym("set!"), sym("x"), Sexpr::Int(2)])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![Op::Const, Op::SetGlobal, Op::Pop, Op::Halt]
+        );
+    }
+
+    #[test]
+    fn rejects_set_with_the_wrong_number_of_arguments() {
+        let program = [list(vec![sym("set!"), sym("x")])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn compiles_and_with_a_dup_and_conditional_jump_per_non_last_operand() {
+        let program = [list(vec![
+            sym("and"),
+            Sexpr::Int(1),
+            Sexpr::Int(2),
+            Sexpr::Int(3),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![
+                Op::Const,
+                Op::Dup,
+                Op::JumpIfFalse,
+                Op::Pop,
+                Op::Const,
+                Op::Dup,
+                Op::JumpIfFalse,
+                Op::Pop,
+                Op::Const,
+                Op::Pop,
+                Op::Halt,
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_and_is_true() {
+        let program = [list(vec![sym("and")])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert_eq!(entry.constants, vec![Const::Bool(true)]);
+    }
+
+    #[test]
+    fn empty_or_is_false() {
+        let program = [list(vec![sym("or")])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert_eq!(entry.constants, vec![Const::Bool(false)]);
+    }
+
+    #[test]
+    fn compiles_when_as_a_conditional_with_unspecified_on_the_false_path() {
+        let program = [list(vec![sym("when"), Sexpr::Bool(true), Sexpr::Int(1)])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert!(entry.constants.contains(&Const::Unspecified));
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![
+                Op::Const,
+                Op::JumpIfFalse,
+                Op::Const,
+                Op::Jump,
+                Op::Const,
+                Op::Pop,
+                Op::Halt,
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_unless_as_a_conditional_with_unspecified_on_the_true_path() {
+        let program = [list(vec![sym("unless"), Sexpr::Bool(false), Sexpr::Int(1)])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert!(entry.constants.contains(&Const::Unspecified));
+    }
+
+    #[test]
+    fn compiles_cond_with_an_else_fallback() {
+        let program = [list(vec![
+            sym("cond"),
+            list(vec![Sexpr::Bool(false), Sexpr::Int(1)]),
+            list(vec![sym("else"), Sexpr::Int(2)]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        assert!(compile_program(&[Sexpr::Int(0)]).is_ok()); // sanity: unrelated program still fine
+        let entry = entry_of(&module);
+        assert!(opcode_sequence(&entry.code).contains(&Op::JumpIfFalse));
+    }
+
+    #[test]
+    fn compiles_cond_arrow_variant_with_dup_swap_and_call() {
+        let program = [list(vec![
+            sym("cond"),
+            list(vec![Sexpr::Int(5), sym("=>"), sym("display")]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        let ops = opcode_sequence(&entry.code);
+        assert!(ops.contains(&Op::Dup));
+        assert!(ops.contains(&Op::Swap));
+        assert!(ops.contains(&Op::Call));
+    }
+
+    #[test]
+    fn rejects_a_cond_clause_that_is_not_a_list() {
+        let program = [list(vec![sym("cond"), Sexpr::Int(1)])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn compiles_case_comparing_the_key_against_candidate_groups() {
+        let program = [list(vec![
+            sym("case"),
+            Sexpr::Int(2),
+            list(vec![
+                list(vec![Sexpr::Int(1), Sexpr::Int(2)]),
+                sym("true-branch"),
+            ]),
+            list(vec![sym("else"), sym("else-branch")]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        let ops = opcode_sequence(&entry.code);
+        assert!(ops.contains(&Op::Eqv));
+        assert!(ops.contains(&Op::Dup));
+    }
+
+    #[test]
+    fn rejects_a_case_clause_selector_that_is_not_a_list() {
+        let program = [list(vec![
+            sym("case"),
+            Sexpr::Int(1),
+            list(vec![Sexpr::Int(1), sym("body")]),
+        ])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn rejects_a_malformed_let_binding() {
+        let program = [list(vec![
+            sym("let"),
+            list(vec![Sexpr::Int(1)]),
+            Sexpr::Int(1),
+        ])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn rejects_a_let_binding_list_with_the_wrong_number_of_elements() {
+        // (x) has only a name, no init expression.
+        let program = [list(vec![
+            sym("let"),
+            list(vec![list(vec![sym("x")])]),
+            Sexpr::Int(1),
+        ])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn gensym_produces_distinct_names_across_calls_even_with_the_same_hint() {
+        let mut comp = Compilation::new();
+        let a = comp.gensym("x");
+        let b = comp.gensym("x");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn two_sibling_internal_definitions_with_distinct_names_do_not_collide() {
+        // If gensym ever produced the same alias for both, six's DEF_GLOBAL
+        // would clobber double's, and (+ (double 5) (six 5)) would use the
+        // same underlying function for both calls (10 + 10 = 20, not 40).
+        let src = "(define (f) \
+                     (define (double x) (* x 2)) \
+                     (define (six x) (* x 6)) \
+                     (+ (double 5) (six 5))) \
+                   (display (f))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "40");
+    }
+
+    #[test]
+    fn an_else_symbol_is_only_special_as_the_last_cond_clause() {
+        // "else" appearing in a NON-last clause must be compiled as an
+        // ordinary (here: unbound) test expression, not recognised as the
+        // else-fallback — proven by it failing at runtime instead of always
+        // matching.
+        let program = [list(vec![
+            sym("cond"),
+            list(vec![sym("else"), Sexpr::Int(1)]),
+            list(vec![Sexpr::Bool(true), Sexpr::Int(2)]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let mut out = Vec::new();
+        assert!(crate::vm::run(&module, &mut out).is_err());
+    }
+
+    #[test]
+    fn an_else_symbol_is_only_special_as_the_last_case_clause() {
+        let program = [list(vec![
+            sym("case"),
+            Sexpr::Int(1),
+            list(vec![sym("else"), Sexpr::Int(1)]),
+            list(vec![list(vec![Sexpr::Int(1)]), Sexpr::Int(2)]),
+        ])];
+        // "else" as a selector in a non-last position must be parsed as a
+        // (malformed) candidate list, not the else-fallback.
+        assert!(compile_program(&program).is_err());
+    }
+
+    fn named_let_with_n_bindings(n: usize) -> Sexpr {
+        let bindings = list(
+            (0..n)
+                .map(|i| binding(&format!("v{i}"), Sexpr::Int(0)))
+                .collect(),
+        );
+        list(vec![sym("let"), sym("loop"), bindings, Sexpr::Int(0)])
+    }
+
+    #[test]
+    fn accepts_a_named_let_with_exactly_the_maximum_representable_binding_count() {
+        assert!(compile_program(&[named_let_with_n_bindings(u8::MAX as usize)]).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_named_let_with_one_more_than_the_maximum_representable_binding_count() {
+        assert!(compile_program(&[named_let_with_n_bindings(u8::MAX as usize + 1)]).is_err());
+    }
+
+    #[test]
+    fn internal_define_init_position_propagates_nesting_depth() {
+        // Calibrated, not just MAX_NESTING_DEPTH: this position is already
+        // 2 levels deep from top level by the time it's reached (lambda's
+        // own +1, then compile_body's own +1 for the define's init), so a
+        // generically-deep nested_call would exceed the limit either way and
+        // fail to discriminate a missing +1 here from a correct one. Using
+        // MAX_NESTING_DEPTH - 1 means: correct code (starts at depth 2)
+        // reaches MAX_NESTING_DEPTH + 1 and errors; code missing this one
+        // +1 (starts at depth 1) reaches exactly MAX_NESTING_DEPTH and
+        // succeeds — so only the correct code errors here.
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![]),
+            list(vec![
+                sym("define"),
+                sym("x"),
+                nested_call(MAX_NESTING_DEPTH - 1),
+            ]),
+            sym("x"),
+        ])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn internal_defines_do_not_leak_into_the_outer_global_namespace() {
+        // If internal defines were bound under their literal names instead
+        // of a gensym'd alias, f's internal "helper" would permanently
+        // overwrite the OUTER global "helper" (999) with its own function
+        // value once f is called.
+        let src = "(define helper 999) \
+                   (define (f) (define (helper) 1) (helper)) \
+                   (display (f)) (newline) (display helper)";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "1\n999");
+    }
+
+    #[test]
+    fn a_two_expression_cond_body_is_not_mistaken_for_the_arrow_variant() {
+        // A regular clause `(test body1 body2)` also happens to have
+        // rest.len() == 2, same as the `=>` shape `(test => func)` — the
+        // arrow detection must also check that rest[0] is literally `=>`,
+        // not just that there are two trailing elements.
+        let src = "(display (cond (#t 1 2)))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "2");
+    }
+
+    #[test]
+    fn let_binding_init_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("let"),
+                list(vec![binding("x", deep)]),
+                Sexpr::Int(1),
+            ])
+        });
+    }
+
+    #[test]
+    fn let_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("let"),
+                list(vec![binding("x", Sexpr::Int(1))]),
+                deep,
+            ])
+        });
+    }
+
+    #[test]
+    fn let_star_binding_init_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("let*"),
+                list(vec![binding("x", deep)]),
+                Sexpr::Int(1),
+            ])
+        });
+    }
+
+    #[test]
+    fn let_star_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("let*"),
+                list(vec![binding("x", Sexpr::Int(1))]),
+                deep,
+            ])
+        });
+    }
+
+    #[test]
+    fn letrec_binding_init_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("letrec"),
+                list(vec![binding("x", deep)]),
+                Sexpr::Int(1),
+            ])
+        });
+    }
+
+    #[test]
+    fn letrec_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("letrec"),
+                list(vec![binding("x", Sexpr::Int(1))]),
+                deep,
+            ])
+        });
+    }
+
+    #[test]
+    fn named_let_binding_init_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("let"),
+                sym("loop"),
+                list(vec![binding("x", deep)]),
+                sym("x"),
+            ])
+        });
+    }
+
+    #[test]
+    fn set_value_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("set!"), sym("x"), deep]));
+    }
+
+    #[test]
+    fn and_non_last_operand_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("and"), deep, Sexpr::Int(1)]));
+    }
+
+    #[test]
+    fn and_last_operand_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("and"), Sexpr::Int(1), deep]));
+    }
+
+    #[test]
+    fn or_non_last_operand_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("or"), deep, Sexpr::Int(1)]));
+    }
+
+    #[test]
+    fn or_last_operand_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("or"), Sexpr::Int(1), deep]));
+    }
+
+    #[test]
+    fn when_condition_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("when"), deep, Sexpr::Int(1)]));
+    }
+
+    #[test]
+    fn when_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("when"), Sexpr::Bool(true), deep]));
+    }
+
+    #[test]
+    fn unless_condition_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("unless"), deep, Sexpr::Int(1)]));
+    }
+
+    #[test]
+    fn unless_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("unless"), Sexpr::Bool(false), deep]));
+    }
+
+    #[test]
+    fn cond_else_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("cond"), list(vec![sym("else"), deep])]));
+    }
+
+    #[test]
+    fn cond_arrow_test_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("cond"),
+                list(vec![deep, sym("=>"), sym("display")]),
+            ])
+        });
+    }
+
+    #[test]
+    fn cond_arrow_func_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("cond"),
+                list(vec![Sexpr::Bool(true), sym("=>"), deep]),
+            ])
+        });
+    }
+
+    #[test]
+    fn cond_regular_test_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| list(vec![sym("cond"), list(vec![deep, Sexpr::Int(1)])]));
+    }
+
+    #[test]
+    fn cond_regular_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![sym("cond"), list(vec![Sexpr::Bool(true), deep])])
+        });
+    }
+
+    #[test]
+    fn case_key_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("case"),
+                deep,
+                list(vec![list(vec![Sexpr::Int(1)]), Sexpr::Int(1)]),
+            ])
+        });
+    }
+
+    #[test]
+    fn case_clause_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("case"),
+                Sexpr::Int(1),
+                list(vec![list(vec![Sexpr::Int(1)]), deep]),
+            ])
+        });
+    }
+
+    #[test]
+    fn case_else_body_position_propagates_nesting_depth() {
+        assert_propagates_depth(|deep| {
+            list(vec![
+                sym("case"),
+                Sexpr::Int(1),
+                list(vec![sym("else"), deep]),
+            ])
+        });
     }
 }

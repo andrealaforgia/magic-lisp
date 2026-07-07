@@ -116,6 +116,32 @@ pub fn disassemble_chunk(chunk: &Chunk) -> String {
                     line
                 }
             },
+            op if op == Op::SetLocal as u8 => match code.get(ip) {
+                Some(&slot) => {
+                    ip += 1;
+                    format!("SET_LOCAL     {slot}")
+                }
+                None => {
+                    let line = "SET_LOCAL     <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::SetGlobal as u8 => match read_u32(code, ip) {
+                Some(idx) => {
+                    ip += 4;
+                    format!("SET_GLOBAL    {idx:<6} ; {}", describe_const(chunk, idx))
+                }
+                None => {
+                    let line = "SET_GLOBAL    <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::PushLocal as u8 => "PUSH_LOCAL".to_string(),
+            op if op == Op::Dup as u8 => "DUP".to_string(),
+            op if op == Op::Swap as u8 => "SWAP".to_string(),
+            op if op == Op::Eqv as u8 => "EQV".to_string(),
             op if op == Op::MakeFunction as u8 => match read_u32(code, ip) {
                 Some(idx) => {
                     ip += 4;
@@ -364,6 +390,35 @@ mod tests {
     }
 
     #[test]
+    fn advances_past_get_locals_operand_to_the_correct_next_instruction() {
+        // (define (f x) x) — f's body is GET_LOCAL then RETURN.
+        let module = module_for("(define (f x) x)");
+        let listing = disassemble_chunk(&module.functions[0]);
+        assert_eq!(listing.matches("RETURN").count(), 1, "{listing}");
+        assert!(!listing.contains("unknown opcode"), "{listing}");
+    }
+
+    #[test]
+    fn advances_past_set_locals_operand_to_the_correct_next_instruction() {
+        // (lambda (x) (set! x 1) x) — SET_LOCAL, then POP, GET_LOCAL, RETURN.
+        let module = module_for("(lambda (x) (set! x 1) x)");
+        let listing = disassemble_chunk(&module.functions[0]);
+        assert_eq!(listing.matches("POP").count(), 1, "{listing}");
+        assert_eq!(listing.matches("RETURN").count(), 1, "{listing}");
+        assert!(!listing.contains("unknown opcode"), "{listing}");
+    }
+
+    #[test]
+    fn advances_past_set_globals_operand_to_the_correct_next_instruction() {
+        // (define x 1) (set! x 2) — CONST, DEF_GLOBAL, POP, CONST,
+        // SET_GLOBAL, POP, HALT at the entry level.
+        let listing = disassemble_chunk(&entry_chunk_for("(define x 1) (set! x 2)"));
+        assert_eq!(listing.matches("POP").count(), 2, "{listing}");
+        assert_eq!(listing.matches("HALT").count(), 1, "{listing}");
+        assert!(!listing.contains("unknown opcode"), "{listing}");
+    }
+
+    #[test]
     fn marks_only_the_actual_entry_function_not_the_others() {
         let module = module_for("(define (f x) x)");
         let listing = disassemble(&module);
@@ -379,5 +434,49 @@ mod tests {
                 assert!(!header.contains("(entry)"), "{header}");
             }
         }
+    }
+
+    #[test]
+    fn names_the_b3_local_binding_and_stack_opcodes() {
+        // (let ((x 1)) (set! x 2)) exercises PUSH_LOCAL and SET_LOCAL.
+        let listing = disassemble(&module_for("(let ((x 1)) (set! x 2))"));
+        assert!(listing.contains("PUSH_LOCAL"), "{listing}");
+        assert!(listing.contains("SET_LOCAL"), "{listing}");
+    }
+
+    #[test]
+    fn names_set_global() {
+        let listing = disassemble(&module_for("(define x 1) (set! x 2)"));
+        assert!(listing.contains("SET_GLOBAL"), "{listing}");
+    }
+
+    #[test]
+    fn names_dup_and_eqv_from_a_case_expression() {
+        let listing = disassemble(&module_for("(case 1 ((1) 'a) (else 'b))"));
+        assert!(listing.contains("DUP"), "{listing}");
+        assert!(listing.contains("EQV"), "{listing}");
+    }
+
+    #[test]
+    fn names_swap_from_a_cond_arrow_clause() {
+        let listing = disassemble(&module_for("(cond (5 => display))"));
+        assert!(listing.contains("SWAP"), "{listing}");
+    }
+
+    #[test]
+    fn does_not_panic_on_a_chunk_with_a_truncated_set_local_operand() {
+        let mut chunk = Chunk::new();
+        chunk.code.push(Op::SetLocal as u8);
+        let listing = disassemble_chunk(&chunk);
+        assert!(!listing.is_empty());
+    }
+
+    #[test]
+    fn does_not_panic_on_a_chunk_with_a_truncated_set_global_operand() {
+        let mut chunk = Chunk::new();
+        chunk.code.push(Op::SetGlobal as u8);
+        chunk.code.push(0);
+        let listing = disassemble_chunk(&chunk);
+        assert!(!listing.is_empty());
     }
 }

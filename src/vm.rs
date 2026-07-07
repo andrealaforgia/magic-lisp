@@ -99,7 +99,7 @@ impl<'m> Vm<'m> {
     fn exec(
         &mut self,
         chunk: &Chunk,
-        locals: &mut [Value],
+        locals: &mut Vec<Value>,
         out: &mut impl Write,
     ) -> Result<Value, RuntimeError> {
         let mut stack: Vec<Value> = Vec::new();
@@ -158,6 +158,58 @@ impl<'m> Vm<'m> {
                         .cloned()
                         .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
                     stack.push(value);
+                }
+                op if op == Op::SetLocal as u8 => {
+                    let slot = read_u8(code, &mut ip)? as usize;
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during SET_LOCAL"))?;
+                    let target = locals
+                        .get_mut(slot)
+                        .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
+                    *target = value;
+                    stack.push(Value::Unspecified);
+                }
+                op if op == Op::SetGlobal as u8 => {
+                    let idx = read_u32(code, &mut ip)?;
+                    let name = symbol_name(constant_at(chunk, idx)?)?;
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during SET_GLOBAL"))?;
+                    if !self.globals.contains_key(&name) {
+                        return Err(error(format!("cannot set! undefined variable: {name}")));
+                    }
+                    self.globals.insert(name, value);
+                    stack.push(Value::Unspecified);
+                }
+                op if op == Op::PushLocal as u8 => {
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during PUSH_LOCAL"))?;
+                    locals.push(value);
+                }
+                op if op == Op::Dup as u8 => {
+                    let value = stack
+                        .last()
+                        .cloned()
+                        .ok_or_else(|| error("stack underflow during DUP"))?;
+                    stack.push(value);
+                }
+                op if op == Op::Swap as u8 => {
+                    let len = stack.len();
+                    if len < 2 {
+                        return Err(error("stack underflow during SWAP"));
+                    }
+                    stack.swap(len - 1, len - 2);
+                }
+                op if op == Op::Eqv as u8 => {
+                    let b = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during EQV"))?;
+                    let a = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during EQV"))?;
+                    stack.push(Value::Bool(a == b));
                 }
                 op if op == Op::MakeFunction as u8 => {
                     let idx = read_u32(code, &mut ip)?;
@@ -580,5 +632,172 @@ mod tests {
     #[test]
     fn a_fixed_plus_rest_function_called_with_fewer_than_the_fixed_count_is_a_runtime_error() {
         assert!(eval("(define (f a b . rest) rest) (display (f 1))").is_err());
+    }
+
+    fn run_to_string(chunk: Chunk) -> Result<String, RuntimeError> {
+        let mut out = Vec::new();
+        run(&module_of(chunk), &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn push_local_appends_a_new_local_slot_readable_via_get_local() {
+        let mut chunk = Chunk::new();
+        let five = chunk.add_const(Const::Int(5));
+        let display_sym = chunk.add_const(Const::Symbol("display".to_string()));
+        chunk.emit_const(five);
+        chunk.emit_push_local();
+        chunk.emit_get_global(display_sym);
+        chunk.emit_get_local(0);
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert_eq!(run_to_string(chunk).unwrap(), "5");
+    }
+
+    #[test]
+    fn set_local_overwrites_an_existing_local_slot() {
+        let mut chunk = Chunk::new();
+        let one = chunk.add_const(Const::Int(1));
+        let two = chunk.add_const(Const::Int(2));
+        let display_sym = chunk.add_const(Const::Symbol("display".to_string()));
+        chunk.emit_const(one);
+        chunk.emit_push_local();
+        chunk.emit_const(two);
+        chunk.emit_set_local(0);
+        chunk.emit_pop(); // discard set!'s Unspecified result
+        chunk.emit_get_global(display_sym);
+        chunk.emit_get_local(0);
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert_eq!(run_to_string(chunk).unwrap(), "2");
+    }
+
+    #[test]
+    fn set_global_on_an_undefined_name_is_a_runtime_error() {
+        let mut chunk = Chunk::new();
+        let one = chunk.add_const(Const::Int(1));
+        let name = chunk.add_const(Const::Symbol("never-defined".to_string()));
+        chunk.emit_const(one);
+        chunk.emit_set_global(name);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert!(run_to_string(chunk).is_err());
+    }
+
+    #[test]
+    fn set_global_on_a_defined_name_updates_it() {
+        let mut chunk = Chunk::new();
+        let zero = chunk.add_const(Const::Int(0));
+        let one = chunk.add_const(Const::Int(1));
+        let x = chunk.add_const(Const::Symbol("x".to_string()));
+        let display_sym = chunk.add_const(Const::Symbol("display".to_string()));
+        chunk.emit_const(zero);
+        chunk.emit_def_global(x);
+        chunk.emit_pop();
+        chunk.emit_const(one);
+        chunk.emit_set_global(x);
+        chunk.emit_pop();
+        chunk.emit_get_global(display_sym);
+        chunk.emit_get_global(x);
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert_eq!(run_to_string(chunk).unwrap(), "1");
+    }
+
+    #[test]
+    fn dup_duplicates_the_top_of_stack() {
+        let mut chunk = Chunk::new();
+        let seven = chunk.add_const(Const::Int(7));
+        let plus = chunk.add_const(Const::Symbol("+".to_string()));
+        let display_sym = chunk.add_const(Const::Symbol("display".to_string()));
+        chunk.emit_get_global(display_sym);
+        chunk.emit_get_global(plus);
+        chunk.emit_const(seven);
+        chunk.emit_dup();
+        chunk.emit_call(2);
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert_eq!(run_to_string(chunk).unwrap(), "14");
+    }
+
+    #[test]
+    fn swap_exchanges_the_top_two_stack_values() {
+        // A distractor is pushed first so the stack holds 5 items at the
+        // point of the swap (not 4): at 4 items, `len - 2` and `len / 2`
+        // both happen to equal 2, so a mutation of one into the other would
+        // go undetected. At 5, they diverge (3 vs 2), and — since a wrong
+        // index there would swap the callee itself out of position — a
+        // mutant makes this whole program fail to run rather than just
+        // computing the wrong number.
+        let mut chunk = Chunk::new();
+        let distractor = chunk.add_const(Const::Int(999));
+        let minus = chunk.add_const(Const::Symbol("-".to_string()));
+        let display_sym = chunk.add_const(Const::Symbol("display".to_string()));
+        let one = chunk.add_const(Const::Int(1));
+        let ten = chunk.add_const(Const::Int(10));
+        chunk.emit_const(distractor);
+        chunk.emit_get_global(display_sym);
+        chunk.emit_get_global(minus);
+        chunk.emit_const(one);
+        chunk.emit_const(ten);
+        chunk.emit_swap(); // stack: [999, display, minus, 10, 1] -> (- 10 1)
+        chunk.emit_call(2);
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_pop(); // discard the distractor
+        chunk.emit_halt();
+        assert_eq!(run_to_string(chunk).unwrap(), "9");
+    }
+
+    #[test]
+    fn swap_with_exactly_two_stack_values_succeeds() {
+        let mut chunk = Chunk::new();
+        let one = chunk.add_const(Const::Int(1));
+        let two = chunk.add_const(Const::Int(2));
+        chunk.emit_const(one);
+        chunk.emit_const(two);
+        chunk.emit_swap();
+        chunk.emit_pop();
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert!(run_to_string(chunk).is_ok());
+    }
+
+    #[test]
+    fn swap_with_fewer_than_two_stack_values_is_a_runtime_error_not_a_panic() {
+        let mut chunk = Chunk::new();
+        let one = chunk.add_const(Const::Int(1));
+        chunk.emit_const(one);
+        chunk.emit_swap();
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert!(run_to_string(chunk).is_err());
+    }
+
+    #[test]
+    fn eqv_compares_values_structurally() {
+        let mut chunk = Chunk::new();
+        let a = chunk.add_const(Const::Int(3));
+        let b = chunk.add_const(Const::Int(3));
+        let c = chunk.add_const(Const::Int(4));
+        let display_sym = chunk.add_const(Const::Symbol("display".to_string()));
+        chunk.emit_get_global(display_sym);
+        chunk.emit_const(a);
+        chunk.emit_const(b);
+        chunk.emit_eqv();
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_get_global(display_sym);
+        chunk.emit_const(a);
+        chunk.emit_const(c);
+        chunk.emit_eqv();
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert_eq!(run_to_string(chunk).unwrap(), "#t#f");
     }
 }

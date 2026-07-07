@@ -23,6 +23,12 @@ pub enum Op {
     JumpIfFalse = 8,
     Return = 9,
     MakeFunction = 10,
+    PushLocal = 11,
+    SetLocal = 12,
+    SetGlobal = 13,
+    Dup = 14,
+    Swap = 15,
+    Eqv = 16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +80,32 @@ impl Chunk {
     pub fn emit_get_local(&mut self, slot: u8) {
         self.code.push(Op::GetLocal as u8);
         self.code.push(slot);
+    }
+
+    pub fn emit_set_local(&mut self, slot: u8) {
+        self.code.push(Op::SetLocal as u8);
+        self.code.push(slot);
+    }
+
+    pub fn emit_set_global(&mut self, idx: u32) {
+        self.code.push(Op::SetGlobal as u8);
+        self.code.extend_from_slice(&idx.to_le_bytes());
+    }
+
+    pub fn emit_push_local(&mut self) {
+        self.code.push(Op::PushLocal as u8);
+    }
+
+    pub fn emit_dup(&mut self) {
+        self.code.push(Op::Dup as u8);
+    }
+
+    pub fn emit_swap(&mut self) {
+        self.code.push(Op::Swap as u8);
+    }
+
+    pub fn emit_eqv(&mut self) {
+        self.code.push(Op::Eqv as u8);
     }
 
     pub fn emit_make_function(&mut self, fn_index: u32) {
