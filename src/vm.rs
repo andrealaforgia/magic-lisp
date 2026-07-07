@@ -358,15 +358,30 @@ pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
     // to the real `out` here, after the thread has been joined, sidesteps
     // that without requiring every caller's writer to be Send.
     let mut buffer = Vec::new();
-    let result = std::thread::scope(|scope| {
-        std::thread::Builder::new()
+    let vm_result: Result<(), RuntimeError> = std::thread::scope(|scope| {
+        // An OS-level spawn failure (e.g. thread/memory exhaustion) is rare
+        // but, like a joined-out panic, must still surface as a clean
+        // RuntimeError rather than a caller-visible panic — the doc comment
+        // above promises no crash except a genuine native stack overflow.
+        let handle = std::thread::Builder::new()
             .stack_size(VM_STACK_SIZE)
             .spawn_scoped(scope, || run_on_this_thread(module, &mut buffer))
-            .expect("failed to spawn VM thread")
+            .map_err(|e| error(format!("failed to spawn VM thread: {e}")))?;
+        handle
             .join()
+            .unwrap_or_else(|_| Err(error("internal error: VM thread panicked")))
     });
-    let _ = out.write_all(&buffer);
-    result.unwrap_or_else(|_| Err(error("internal error: VM thread panicked")))
+    // The final write can fail too (broken pipe, full disk) — discarding
+    // that error would silently report success (exit 0) despite some or
+    // all of the program's output never reaching its destination (a
+    // security-review finding: this used to propagate correctly when
+    // display/newline wrote directly to `out`, before buffering was
+    // introduced). VM failure takes priority when both occur, since it
+    // happened first.
+    let flush_result = out
+        .write_all(&buffer)
+        .map_err(|e| error(format!("failed to write output: {e}")));
+    vm_result.and(flush_result)
 }
 
 fn run_on_this_thread(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
@@ -466,6 +481,31 @@ mod tests {
     use super::*;
     use crate::compiler::compile_program;
     use crate::reader::read_program;
+
+    /// A writer that always fails, simulating a broken pipe or full disk —
+    /// used to prove the final flush's error isn't silently discarded.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated broken pipe"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_final_flush_is_reported_as_a_runtime_error_not_silently_ignored() {
+        // A security-review finding: run() buffers all VM output into a
+        // Vec<u8> (needed since `out` isn't necessarily Send) and only
+        // writes it to the real `out` once, at the end — discarding that
+        // write's Result would silently report success even if none of the
+        // program's output actually reached its destination.
+        let forms = read_program("(display 1)").unwrap();
+        let module = compile_program(&forms).unwrap();
+        assert!(run(&module, &mut FailingWriter).is_err());
+    }
 
     #[test]
     fn consume_step_decrements_the_remaining_budget_by_exactly_one() {
