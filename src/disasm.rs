@@ -128,6 +128,28 @@ pub fn disassemble_chunk(chunk: &Chunk) -> String {
                     line
                 }
             },
+            op if op == Op::GetUpvalue as u8 => match (code.get(ip), code.get(ip + 1)) {
+                (Some(&depth), Some(&slot)) => {
+                    ip += 2;
+                    format!("GET_UPVALUE   depth={depth} slot={slot}")
+                }
+                _ => {
+                    let line = "GET_UPVALUE   <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
+            op if op == Op::SetUpvalue as u8 => match (code.get(ip), code.get(ip + 1)) {
+                (Some(&depth), Some(&slot)) => {
+                    ip += 2;
+                    format!("SET_UPVALUE   depth={depth} slot={slot}")
+                }
+                _ => {
+                    let line = "SET_UPVALUE   <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
             op if op == Op::SetGlobal as u8 => match read_u32(code, ip) {
                 Some(idx) => {
                     ip += 4;
@@ -404,6 +426,78 @@ mod tests {
         // (lambda (x) (set! x 1) x) — SET_LOCAL, then POP, GET_LOCAL, RETURN.
         let module = module_for("(lambda (x) (set! x 1) x)");
         let listing = disassemble_chunk(&module.functions[0]);
+        assert_eq!(listing.matches("POP").count(), 1, "{listing}");
+        assert_eq!(listing.matches("RETURN").count(), 1, "{listing}");
+        assert!(!listing.contains("unknown opcode"), "{listing}");
+    }
+
+    #[test]
+    fn names_get_upvalue_for_a_nested_lambda_reading_an_enclosing_local() {
+        // (lambda (x) (lambda () x)) — the inner lambda's body reads x as
+        // an upvalue, since x is the outer lambda's own parameter.
+        let module = module_for("(lambda (x) (lambda () x))");
+        let inner = &module.functions[0];
+        let listing = disassemble_chunk(inner);
+        assert!(listing.contains("GET_UPVALUE"), "{listing}");
+    }
+
+    #[test]
+    fn names_set_upvalue_for_a_nested_lambda_mutating_an_enclosing_local() {
+        let module = module_for("(lambda (x) (lambda () (set! x 1)))");
+        let inner = &module.functions[0];
+        let listing = disassemble_chunk(inner);
+        assert!(listing.contains("SET_UPVALUE"), "{listing}");
+    }
+
+    #[test]
+    fn get_upvalue_reports_the_exact_depth_and_slot_it_decoded() {
+        // Distinct, non-zero, non-equal depth and slot (2 and 1): swapping
+        // which operand byte is read for which field, or misreading either
+        // by one position, would show up as a wrong value here even though
+        // the mnemonic itself and the total bytes consumed stay unchanged.
+        // b is the outermost function's *second* parameter (slot 1),
+        // captured through two levels of nesting (depth 2).
+        let module = module_for("(lambda (a b) (lambda () (lambda () b)))");
+        let innermost = &module.functions[0];
+        let listing = disassemble_chunk(innermost);
+        // A trailing newline anchors the match to the end of the field, so
+        // "slot=1" can't be satisfied by a wrong value like "slot=17" that
+        // merely starts with the same digit.
+        assert!(
+            listing.contains("GET_UPVALUE   depth=2 slot=1\n"),
+            "{listing}"
+        );
+    }
+
+    #[test]
+    fn set_upvalue_reports_the_exact_depth_and_slot_it_decoded() {
+        let module = module_for("(lambda (a b) (lambda () (lambda () (set! b 1))))");
+        let innermost = &module.functions[0];
+        let listing = disassemble_chunk(innermost);
+        assert!(
+            listing.contains("SET_UPVALUE   depth=2 slot=1\n"),
+            "{listing}"
+        );
+    }
+
+    #[test]
+    fn advances_past_get_upvalues_operand_to_the_correct_next_instruction() {
+        // (lambda (x) (lambda () x)) — the inner lambda's body is exactly
+        // GET_UPVALUE then RETURN; if the operand advance under-consumed
+        // (or the guard/match arm were broken), decoding would either drift
+        // into RETURN's own byte as a bogus opcode or read past the end.
+        let module = module_for("(lambda (x) (lambda () x))");
+        let inner = &module.functions[0];
+        let listing = disassemble_chunk(inner);
+        assert_eq!(listing.matches("RETURN").count(), 1, "{listing}");
+        assert!(!listing.contains("unknown opcode"), "{listing}");
+    }
+
+    #[test]
+    fn advances_past_set_upvalues_operand_to_the_correct_next_instruction() {
+        let module = module_for("(lambda (x) (lambda () (set! x 1) x))");
+        let inner = &module.functions[0];
+        let listing = disassemble_chunk(inner);
         assert_eq!(listing.matches("POP").count(), 1, "{listing}");
         assert_eq!(listing.matches("RETURN").count(), 1, "{listing}");
         assert!(!listing.contains("unknown opcode"), "{listing}");

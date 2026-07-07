@@ -1,10 +1,12 @@
 //! Bytecode virtual machine.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
+use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Const, Module, Op};
-use crate::value::{Value, is_truthy};
+use crate::value::{Env, Value, is_truthy};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -23,8 +25,8 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 11] = [
-    "display", "newline", "+", "-", "*", "/", "=", "<", "<=", ">", ">=",
+const NATIVE_NAMES: [&str; 14] = [
+    "display", "newline", "+", "-", "*", "/", "=", "<", "<=", ">", ">=", "cons", "car", "cdr",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -93,7 +95,7 @@ fn symbol_name(c: &Const) -> Result<String, RuntimeError> {
 
 /// Caps native-Rust recursion depth across MagicLisp function calls (this
 /// language has no tail-call elimination yet, and every call is a real Rust
-/// stack frame — Value::Function calling into Vm::exec calling back into
+/// stack frame — Value::Closure calling into Vm::exec calling back into
 /// Vm::call_value). Without this, ordinary, non-malicious recursive code
 /// (idiomatic recursion — including named-`let` iteration, B3's headline
 /// feature — can abort the whole process via native stack overflow instead
@@ -115,11 +117,40 @@ struct Vm<'m> {
     call_depth: usize,
 }
 
+/// Walks `depth - 1` parent links from `env` (depth 1 = `env` itself, the
+/// immediately enclosing frame's captured locals; depth 2 = its parent;
+/// etc.), matching how `Ctx::resolve_upvalue` counts levels at compile time.
+fn resolve_env(env: &Env, depth: u8) -> Result<&Env, RuntimeError> {
+    let mut current = env;
+    for _ in 1..depth {
+        current = current
+            .parent
+            .as_deref()
+            .ok_or_else(|| error("upvalue depth exceeds the captured environment chain"))?;
+    }
+    Ok(current)
+}
+
+fn upvalue_cell(
+    env: Option<&Rc<Env>>,
+    depth: u8,
+    slot: u8,
+) -> Result<Rc<RefCell<Value>>, RuntimeError> {
+    let env = env.ok_or_else(|| error("no captured environment to resolve an upvalue from"))?;
+    let target = resolve_env(env, depth)?;
+    target
+        .locals
+        .get(slot as usize)
+        .cloned()
+        .ok_or_else(|| error(format!("upvalue slot {slot} out of range")))
+}
+
 impl<'m> Vm<'m> {
     fn exec(
         &mut self,
         chunk: &Chunk,
-        locals: &mut Vec<Value>,
+        locals: &mut Vec<Rc<RefCell<Value>>>,
+        env: Option<&Rc<Env>>,
         out: &mut impl Write,
     ) -> Result<Value, RuntimeError> {
         let mut stack: Vec<Value> = Vec::new();
@@ -173,21 +204,37 @@ impl<'m> Vm<'m> {
                 }
                 op if op == Op::GetLocal as u8 => {
                     let slot = read_u8(code, &mut ip)? as usize;
-                    let value = locals
+                    let cell = locals
                         .get(slot)
-                        .cloned()
                         .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
-                    stack.push(value);
+                    stack.push(cell.borrow().clone());
                 }
                 op if op == Op::SetLocal as u8 => {
                     let slot = read_u8(code, &mut ip)? as usize;
                     let value = stack
                         .pop()
                         .ok_or_else(|| error("stack underflow during SET_LOCAL"))?;
-                    let target = locals
-                        .get_mut(slot)
+                    let cell = locals
+                        .get(slot)
                         .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
-                    *target = value;
+                    *cell.borrow_mut() = value;
+                    stack.push(Value::Unspecified);
+                }
+                op if op == Op::GetUpvalue as u8 => {
+                    let depth = read_u8(code, &mut ip)?;
+                    let slot = read_u8(code, &mut ip)?;
+                    let cell = upvalue_cell(env, depth, slot)?;
+                    let value = cell.borrow().clone();
+                    stack.push(value);
+                }
+                op if op == Op::SetUpvalue as u8 => {
+                    let depth = read_u8(code, &mut ip)?;
+                    let slot = read_u8(code, &mut ip)?;
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| error("stack underflow during SET_UPVALUE"))?;
+                    let cell = upvalue_cell(env, depth, slot)?;
+                    *cell.borrow_mut() = value;
                     stack.push(Value::Unspecified);
                 }
                 op if op == Op::SetGlobal as u8 => {
@@ -206,7 +253,7 @@ impl<'m> Vm<'m> {
                     let value = stack
                         .pop()
                         .ok_or_else(|| error("stack underflow during PUSH_LOCAL"))?;
-                    locals.push(value);
+                    locals.push(Rc::new(RefCell::new(value)));
                 }
                 op if op == Op::Dup as u8 => {
                     let value = stack
@@ -236,7 +283,20 @@ impl<'m> Vm<'m> {
                     if idx as usize >= self.module.functions.len() {
                         return Err(error(format!("function index {idx} out of range")));
                     }
-                    stack.push(Value::Function(idx));
+                    // Every function value closes over whatever this frame
+                    // currently has: its own locals (shared cells, not
+                    // copies — mutations after this point are still visible
+                    // through the closure) and whatever this frame itself
+                    // closed over, so nesting captures transitively. A
+                    // top-level define captures an empty, parentless
+                    // environment, which is indistinguishable from "no
+                    // captures" since nothing can ever resolve an upvalue
+                    // into it.
+                    let captured = Rc::new(Env {
+                        locals: locals.clone(),
+                        parent: env.cloned(),
+                    });
+                    stack.push(Value::Closure(idx, captured));
                 }
                 op if op == Op::Jump as u8 => {
                     let target = read_u32(code, &mut ip)? as usize;
@@ -286,7 +346,7 @@ impl<'m> Vm<'m> {
     ) -> Result<Value, RuntimeError> {
         match callee {
             Value::Native(name) => call_native(name, &args, out),
-            Value::Function(idx) => {
+            Value::Closure(idx, closure_env) => {
                 if self.call_depth >= MAX_CALL_DEPTH {
                     return Err(error(format!(
                         "maximum call depth exceeded ({MAX_CALL_DEPTH}) — possible infinite or too-deep recursion"
@@ -299,7 +359,7 @@ impl<'m> Vm<'m> {
                     .ok_or_else(|| error(format!("function index {idx} out of range")))?;
                 let mut locals = bind_arguments(chunk, args)?;
                 self.call_depth += 1;
-                let result = self.exec(chunk, &mut locals, out);
+                let result = self.exec(chunk, &mut locals, Some(closure_env), out);
                 self.call_depth -= 1;
                 result
             }
@@ -308,8 +368,17 @@ impl<'m> Vm<'m> {
     }
 }
 
-fn bind_arguments(chunk: &Chunk, mut args: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
+fn bind_arguments(
+    chunk: &Chunk,
+    mut args: Vec<Value>,
+) -> Result<Vec<Rc<RefCell<Value>>>, RuntimeError> {
     let arity = chunk.arity as usize;
+    let to_cells = |values: Vec<Value>| -> Vec<Rc<RefCell<Value>>> {
+        values
+            .into_iter()
+            .map(|v| Rc::new(RefCell::new(v)))
+            .collect()
+    };
     if chunk.has_rest {
         if args.len() < arity {
             return Err(error(format!(
@@ -318,8 +387,8 @@ fn bind_arguments(chunk: &Chunk, mut args: Vec<Value>) -> Result<Vec<Value>, Run
             )));
         }
         let rest = args.split_off(arity);
-        let mut locals = args;
-        locals.push(Value::List(rest));
+        let mut locals = to_cells(args);
+        locals.push(Rc::new(RefCell::new(Value::List(rest))));
         Ok(locals)
     } else {
         if args.len() != arity {
@@ -328,7 +397,7 @@ fn bind_arguments(chunk: &Chunk, mut args: Vec<Value>) -> Result<Vec<Value>, Run
                 args.len()
             )));
         }
-        Ok(args)
+        Ok(to_cells(args))
     }
 }
 
@@ -396,7 +465,7 @@ fn run_on_this_thread(module: &Module, out: &mut impl Write) -> Result<(), Runti
         .get(module.entry_index as usize)
         .ok_or_else(|| error("entry function index out of range"))?;
     let mut locals = Vec::new();
-    vm.exec(entry, &mut locals, out)?;
+    vm.exec(entry, &mut locals, None, out)?;
     Ok(())
 }
 
@@ -422,6 +491,31 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
         "<=" => native_compare("<=", args, |a, b| a <= b),
         ">" => native_compare(">", args, |a, b| a > b),
         ">=" => native_compare(">=", args, |a, b| a >= b),
+        "cons" => {
+            let [a, b] = args else {
+                return Err(error(format!(
+                    "cons expects exactly 2 arguments, got {}",
+                    args.len()
+                )));
+            };
+            Ok(Value::Pair(Box::new(a.clone()), Box::new(b.clone())))
+        }
+        "car" => match args {
+            [Value::Pair(a, _)] => Ok((**a).clone()),
+            [other] => Err(error(format!("car expects a pair, found {other}"))),
+            _ => Err(error(format!(
+                "car expects exactly 1 argument, got {}",
+                args.len()
+            ))),
+        },
+        "cdr" => match args {
+            [Value::Pair(_, b)] => Ok((**b).clone()),
+            [other] => Err(error(format!("cdr expects a pair, found {other}"))),
+            _ => Err(error(format!(
+                "cdr expects exactly 1 argument, got {}",
+                args.len()
+            ))),
+        },
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
 }
@@ -665,6 +759,100 @@ mod tests {
         assert!(eval("(this-is-not-defined 1 2)").is_err());
     }
 
+    // --- B5: closures and pairs ---
+
+    #[test]
+    fn a_closure_captures_an_outer_local_usable_after_the_creator_returns() {
+        let out = eval("(define (make-adder n) (lambda (x) (+ x n))) (display ((make-adder 3) 4))")
+            .unwrap();
+        assert_eq!(out, "7");
+    }
+
+    #[test]
+    fn two_closures_from_the_same_call_share_one_mutable_cell() {
+        let out = eval(
+            "(define (pairf) (let ((x 0)) (cons (lambda () x) (lambda (v) (set! x v))))) \
+             (define p (pairf)) \
+             ((cdr p) 10) \
+             (display ((car p)))",
+        )
+        .unwrap();
+        assert_eq!(out, "10");
+    }
+
+    #[test]
+    fn two_separate_calls_to_the_same_factory_produce_independent_cells() {
+        let out = eval(
+            "(define (counter) (let ((n 0)) (lambda () (set! n (+ n 1)) n))) \
+             (define a (counter)) (define b (counter)) \
+             (display (a)) (newline) (display (a)) (newline) (display (b))",
+        )
+        .unwrap();
+        assert_eq!(out, "1\n2\n1");
+    }
+
+    #[test]
+    fn cons_constructs_a_pair_retrievable_via_car_and_cdr() {
+        assert_eq!(
+            eval("(display (car (cons 1 2))) (display (cdr (cons 1 2)))").unwrap(),
+            "12"
+        );
+    }
+
+    #[test]
+    fn car_on_a_non_pair_is_a_runtime_error() {
+        // Checks the specific message, not just is_err(): a wrong-type
+        // single argument and a wrong argument *count* both return some
+        // Err, so a bare is_err() can't tell "correctly rejected as not a
+        // pair" apart from "fell through to the argument-count arm" --
+        // both would look identical to the caller.
+        let err = eval("(display (car 5))").unwrap_err();
+        assert!(
+            err.message.contains("expects a pair"),
+            "expected a not-a-pair error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn cdr_on_a_non_pair_is_a_runtime_error() {
+        let err = eval("(display (cdr 5))").unwrap_err();
+        assert!(
+            err.message.contains("expects a pair"),
+            "expected a not-a-pair error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn cons_requires_exactly_two_arguments() {
+        assert!(eval("(display (cons 1))").is_err());
+        assert!(eval("(display (cons 1 2 3))").is_err());
+    }
+
+    #[test]
+    fn a_doubly_nested_closure_captures_a_grandparent_local_via_a_two_level_upvalue() {
+        // Beyond both required demos (which only nest one level deep): the
+        // innermost lambda's free variable resolves as depth=2, walking
+        // through the middle lambda's own (empty, for this variable)
+        // environment to reach the outermost frame's local.
+        let out =
+            eval("(define (outer x) (lambda () (lambda () x))) (display (((outer 42))))").unwrap();
+        assert_eq!(out, "42");
+    }
+
+    #[test]
+    fn mutating_a_captured_variable_before_the_closure_is_ever_called_is_still_observed() {
+        // Proves the shared cell reflects whatever set! last wrote,
+        // independent of when the closure itself happens to be invoked --
+        // not a value snapshotted at closure-creation time.
+        let out = eval(
+            "(define (f) (let ((x 1)) (define g (lambda () x)) (set! x 99) (g))) (display (f))",
+        )
+        .unwrap();
+        assert_eq!(out, "99");
+    }
+
     #[test]
     fn calling_a_non_procedure_value_is_a_runtime_error() {
         // 1 is pushed as the callee position via a hand-built chunk below,
@@ -683,7 +871,7 @@ mod tests {
     #[test]
     fn recursion_up_to_the_call_depth_limit_still_succeeds() {
         // MAX_CALL_DEPTH - 1 recursive steps plus the initial call is
-        // exactly MAX_CALL_DEPTH nested Value::Function calls, the last
+        // exactly MAX_CALL_DEPTH nested Value::Closure calls, the last
         // one landing on call_depth == MAX_CALL_DEPTH - 1 (checked against
         // the limit *before* incrementing), so this is the deepest
         // recursion the guard is supposed to still allow.
@@ -763,7 +951,7 @@ mod tests {
                     };
                     let mut out = Vec::new();
                     let entry = &module.functions[module.entry_index as usize];
-                    vm.exec(entry, &mut Vec::new(), &mut out).unwrap();
+                    vm.exec(entry, &mut Vec::new(), None, &mut out).unwrap();
                     let count_down = vm.globals.get("count-down").cloned().unwrap();
 
                     let over_limit = vm.call_value(

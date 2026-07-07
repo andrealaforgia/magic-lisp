@@ -122,18 +122,17 @@ fn b3_scope_letrec_referencing_a_not_yet_initialized_binding_is_a_clean_runtime_
 }
 
 #[test]
-fn b3_scope_lambda_body_cannot_see_an_enclosing_lets_locals() {
-    // Documented in compile_lambda's own comment: a lambda compiles to a
-    // separate chunk with no access to the enclosing frame's locals, so a
-    // free reference to an enclosing let's binding falls back to (and
-    // fails as) an unbound global, rather than resolving lexically.
-    let file = write_source(
-        "b3-scope-lambda-no-enclosing.ml",
+fn b3_scope_lambda_body_now_correctly_captures_an_enclosing_lets_local() {
+    // Superseded by B5 (real closures): a lambda referencing an enclosing
+    // let's binding used to fail with "unbound global" -- lambdas compiled
+    // as separate chunks with no access to the enclosing frame's locals at
+    // all, a documented B3-era limitation. B5 gave lambdas real upvalue
+    // capture, so this now correctly resolves lexically instead of failing.
+    let out = eval_ok(
+        "b3-scope-lambda-now-sees-enclosing.ml",
         "(display (let ((x 5)) ((lambda () x))))",
     );
-    let output = run(&["eval", file.to_str().unwrap()]);
-    assert_eq!(output.status.code(), Some(RUNTIME_ERROR));
-    assert!(!stderr_of(&output).is_empty());
+    assert_eq!(out, "5");
 }
 
 #[test]

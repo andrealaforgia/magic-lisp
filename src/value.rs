@@ -1,6 +1,19 @@
 //! Runtime values.
 
+use std::cell::RefCell;
 use std::fmt;
+use std::rc::Rc;
+
+/// The chain of captured local-variable cells a closure closes over: this
+/// frame's own locals (shared, not copied, with whatever call created them —
+/// still live and mutable even after that call has returned), plus a link
+/// to whatever the CREATING frame had itself captured, so a closure nested
+/// more than one level deep can still reach an outer ancestor's variables.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Env {
+    pub locals: Vec<Rc<RefCell<Value>>>,
+    pub parent: Option<Rc<Env>>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -10,8 +23,14 @@ pub enum Value {
     Str(String),
     Symbol(String),
     Native(String),
-    /// A user-defined function: an index into the module's function table.
-    Function(u32),
+    /// A user-defined function: an index into the module's function table,
+    /// plus the environment it closed over at creation time (empty/parentless
+    /// for a top-level definition, which has no enclosing locals to capture).
+    Closure(u32, Rc<Env>),
+    /// A minimal cons cell — just enough to construct a pair and retrieve
+    /// each half back out; the broader pair/list operation library is a
+    /// later behaviour, so this deliberately isn't unified with `List`.
+    Pair(Box<Value>, Box<Value>),
     List(Vec<Value>),
     Unspecified,
 }
@@ -65,7 +84,8 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "{s}"),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Native(name) => write!(f, "#<procedure:{name}>"),
-            Value::Function(idx) => write!(f, "#<procedure:{idx}>"),
+            Value::Closure(idx, _) => write!(f, "#<procedure:{idx}>"),
+            Value::Pair(a, b) => write!(f, "({a} . {b})"),
             Value::List(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {

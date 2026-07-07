@@ -65,14 +65,20 @@ impl Compilation {
 ///
 /// `aliases` maps a name to a compiler-generated *global* name it should
 /// resolve through instead. This is how letrec, named let, and internal
-/// (mutually recursive) definitions work without real closures: a lambda
-/// body compiles as a separate chunk with no access to the enclosing scope's
-/// locals, so a self- or mutually-referencing local function is instead
-/// bound under a unique global name — exactly like top-level `define`,
-/// which already supports self-recursion via late-bound global lookup.
-/// Unlike `scopes`, `aliases` IS inherited into nested function compiles,
-/// since it only redirects which global name a GET_GLOBAL resolves through;
-/// it needs no real stack-frame access.
+/// (mutually recursive) definitions self- or mutually-reference each other:
+/// bound under a unique global name — exactly like top-level `define`, which
+/// already supports self-recursion via late-bound global lookup — rather
+/// than via real upvalue capture, since none of those bindings need to
+/// outlive the function that introduced them the way a captured closure
+/// variable does. Unlike `locals`, `aliases` IS inherited into nested
+/// function compiles, since it only redirects which global name a
+/// GET_GLOBAL resolves through; it needs no real stack-frame access.
+///
+/// `parent` links to the `Ctx` that was active at the point a nested
+/// function (lambda, `define`-sugar, or named-`let`) was compiled, so a free
+/// variable inside it can resolve as an upvalue into an enclosing function's
+/// real locals (GET_UPVALUE/SET_UPVALUE) instead of only ever falling back
+/// to a global lookup — this is what makes real closures (B5) work.
 #[derive(Clone)]
 struct Ctx {
     // Flat, not nested: resolution always searches innermost-declared-first
@@ -94,6 +100,7 @@ struct Ctx {
     // visibility/shadowing is still scoped correctly.
     next_slot: Rc<Cell<u8>>,
     aliases: Vec<(String, String)>,
+    parent: Option<Rc<Ctx>>,
 }
 
 impl Ctx {
@@ -102,17 +109,20 @@ impl Ctx {
             locals: Vec::new(),
             next_slot: Rc::new(Cell::new(0)),
             aliases: Vec::new(),
+            parent: None,
         }
     }
 
     fn for_function(
         params: Vec<String>,
         aliases: Vec<(String, String)>,
+        parent: Option<Rc<Ctx>>,
     ) -> Result<Self, CompileError> {
         let mut ctx = Ctx {
             locals: Vec::new(),
             next_slot: Rc::new(Cell::new(0)),
             aliases,
+            parent,
         };
         for p in params {
             ctx.declare(p)?;
@@ -151,6 +161,25 @@ impl Ctx {
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, a)| a.as_str())
+    }
+
+    /// Resolves `name` as an upvalue by walking the `parent` chain outward:
+    /// depth 1 is the immediately enclosing function's own locals, depth 2
+    /// its parent's, and so on — matching how `Vm::resolve_env` counts
+    /// levels at runtime. Only ever consults each ancestor's `locals`
+    /// (never its `aliases` or globals), since an alias resolves through a
+    /// global regardless of nesting and needs no upvalue at all.
+    fn resolve_upvalue(&self, name: &str) -> Option<(u8, u8)> {
+        let mut depth: u8 = 1;
+        let mut current = self.parent.as_deref();
+        while let Some(ctx) = current {
+            if let Some(slot) = ctx.resolve_local(name) {
+                return Some((depth, slot));
+            }
+            current = ctx.parent.as_deref();
+            depth = depth.checked_add(1)?;
+        }
+        None
     }
 
     fn with_alias(&self, name: String, alias: String) -> Ctx {
@@ -407,7 +436,11 @@ fn compile_function(
         Formals::AllRest(rest) => (vec![rest], 0, true),
     };
 
-    let ctx = Ctx::for_function(params, enclosing_ctx.aliases.clone())?;
+    let ctx = Ctx::for_function(
+        params,
+        enclosing_ctx.aliases.clone(),
+        Some(Rc::new(enclosing_ctx.clone())),
+    )?;
     let mut fn_chunk = Chunk::new();
     fn_chunk.arity = arity;
     fn_chunk.has_rest = has_rest;
@@ -724,6 +757,8 @@ fn compile_set(
     } else if let Some(alias) = ctx.resolve_alias(&name) {
         let idx = chunk.add_const(Const::Symbol(alias.to_string()));
         chunk.emit_set_global(idx);
+    } else if let Some((depth, slot)) = ctx.resolve_upvalue(&name) {
+        chunk.emit_set_upvalue(depth, slot);
     } else {
         let idx = chunk.add_const(Const::Symbol(name));
         chunk.emit_set_global(idx);
@@ -1015,6 +1050,8 @@ fn compile_expr(
             } else if let Some(alias) = ctx.resolve_alias(s) {
                 let idx = chunk.add_const(Const::Symbol(alias.to_string()));
                 chunk.emit_get_global(idx);
+            } else if let Some((depth, slot)) = ctx.resolve_upvalue(s) {
+                chunk.emit_get_upvalue(depth, slot);
             } else {
                 let idx = chunk.add_const(Const::Symbol(s.clone()));
                 chunk.emit_get_global(idx);

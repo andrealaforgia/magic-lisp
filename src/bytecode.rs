@@ -29,6 +29,8 @@ pub enum Op {
     Dup = 14,
     Swap = 15,
     Eqv = 16,
+    GetUpvalue = 17,
+    SetUpvalue = 18,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +87,22 @@ impl Chunk {
 
     pub fn emit_set_local(&mut self, slot: u8) {
         self.code.push(Op::SetLocal as u8);
+        self.code.push(slot);
+    }
+
+    /// `depth` counts how many captured-environment links to walk up from
+    /// the closure's own environment (1 = the immediately enclosing
+    /// function's locals); `slot` is the position within that ancestor's
+    /// locals once reached.
+    pub fn emit_get_upvalue(&mut self, depth: u8, slot: u8) {
+        self.code.push(Op::GetUpvalue as u8);
+        self.code.push(depth);
+        self.code.push(slot);
+    }
+
+    pub fn emit_set_upvalue(&mut self, depth: u8, slot: u8) {
+        self.code.push(Op::SetUpvalue as u8);
+        self.code.push(depth);
         self.code.push(slot);
     }
 
