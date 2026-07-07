@@ -189,41 +189,57 @@ mod tests {
     }
 
     #[test]
-    fn eval_requires_exactly_one_file_argument() {
+    fn eval_with_one_file_argument_parses_as_eval() {
         assert_eq!(
             parse_args(&args(&["eval", "prog.ml"])).unwrap(),
             Command::Eval {
                 input: "prog.ml".into()
             }
         );
+    }
+
+    #[test]
+    fn eval_with_no_file_argument_is_a_usage_error() {
         assert!(parse_args(&args(&["eval"])).is_err());
+    }
+
+    #[test]
+    fn eval_with_more_than_one_argument_is_a_usage_error() {
         assert!(parse_args(&args(&["eval", "a.ml", "b.ml"])).is_err());
     }
 
     #[test]
-    fn run_requires_exactly_one_artifact_argument() {
+    fn run_with_one_artifact_argument_parses_as_run() {
         assert_eq!(
             parse_args(&args(&["run", "out.mlbc"])).unwrap(),
             Command::Run {
                 artifact: "out.mlbc".into()
             }
         );
+    }
+
+    #[test]
+    fn run_with_no_artifact_argument_is_a_usage_error() {
         assert!(parse_args(&args(&["run"])).is_err());
     }
 
     #[test]
-    fn disasm_requires_exactly_one_artifact_argument() {
+    fn disasm_with_one_artifact_argument_parses_as_disasm() {
         assert_eq!(
             parse_args(&args(&["disasm", "out.mlbc"])).unwrap(),
             Command::Disasm {
                 artifact: "out.mlbc".into()
             }
         );
+    }
+
+    #[test]
+    fn disasm_with_no_artifact_argument_is_a_usage_error() {
         assert!(parse_args(&args(&["disasm"])).is_err());
     }
 
     #[test]
-    fn compile_requires_a_file_and_dash_o_and_an_output_path() {
+    fn compile_with_file_dash_o_and_output_parses_as_compile() {
         assert_eq!(
             parse_args(&args(&["compile", "prog.ml", "-o", "out.mlbc"])).unwrap(),
             Command::Compile {
@@ -231,8 +247,20 @@ mod tests {
                 output: "out.mlbc".into(),
             }
         );
+    }
+
+    #[test]
+    fn compile_missing_dash_o_and_output_is_a_usage_error() {
         assert!(parse_args(&args(&["compile", "prog.ml"])).is_err());
+    }
+
+    #[test]
+    fn compile_missing_the_dash_o_flag_is_a_usage_error() {
         assert!(parse_args(&args(&["compile", "prog.ml", "out.mlbc"])).is_err());
+    }
+
+    #[test]
+    fn compile_with_the_wrong_flag_name_is_a_usage_error() {
         assert!(parse_args(&args(&["compile", "prog.ml", "--wrong-flag", "out.mlbc"])).is_err());
     }
 

@@ -289,7 +289,8 @@ fn e5_reads_boolean_literals() {
 fn e5_reads_a_source_file_exercising_every_supported_construct_together() {
     // The tests above prove each construct is read correctly in isolation;
     // this proves they also compose without interference when combined in a
-    // single file, per E5's "read together" requirement.
+    // single file, per E5's "read together" requirement — so it must check
+    // the actual combined output, not just that the process didn't crash.
     let src = r#"
         ; a leading comment
         (display "line one\nline two\ttabbed\r\"quoted\"\\backslash") (newline)
@@ -304,6 +305,10 @@ fn e5_reads_a_source_file_exercising_every_supported_construct_together() {
         Some(SUCCESS),
         "stderr: {}",
         stderr_of(&output)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "line one\nline two\ttabbed\r\"quoted\"\\backslash\n45\ntrue\nfalse\n"
     );
 }
 

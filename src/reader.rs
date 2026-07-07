@@ -271,7 +271,42 @@ mod tests {
             (display false) (newline)
         "#;
         let forms = read_program(src).unwrap();
-        assert_eq!(forms.len(), 8);
+        // Structural, not just a count: proves the comment was skipped (no
+        // stray form for it), the string escapes decoded correctly, the list
+        // nested (not flattened), and both booleans read distinctly.
+        assert_eq!(
+            forms,
+            vec![
+                Sexpr::List(vec![
+                    Sexpr::Symbol("display".to_string()),
+                    Sexpr::Str("a\nb\tc\r\"d\\e".to_string()),
+                ]),
+                Sexpr::List(vec![Sexpr::Symbol("newline".to_string())]),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("display".to_string()),
+                    Sexpr::List(vec![
+                        Sexpr::Symbol("+".to_string()),
+                        Sexpr::Int(42),
+                        Sexpr::List(vec![
+                            Sexpr::Symbol("+".to_string()),
+                            Sexpr::Int(1),
+                            Sexpr::Int(2),
+                        ]),
+                    ]),
+                ]),
+                Sexpr::List(vec![Sexpr::Symbol("newline".to_string())]),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("display".to_string()),
+                    Sexpr::Bool(true),
+                ]),
+                Sexpr::List(vec![Sexpr::Symbol("newline".to_string())]),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("display".to_string()),
+                    Sexpr::Bool(false),
+                ]),
+                Sexpr::List(vec![Sexpr::Symbol("newline".to_string())]),
+            ]
+        );
     }
 
     #[test]
