@@ -341,6 +341,16 @@ mod tests {
     }
 
     #[test]
+    fn describes_a_float_constant_in_a_const_operand_comment() {
+        // qa flagged this exact gap: Const::Float landed with disasm.rs
+        // touched by the same commit, but no test proving describe_const
+        // actually renders the float's value rather than falling through
+        // to some placeholder.
+        let listing = disassemble_chunk(&entry_chunk_for("(display 1.5)"));
+        assert!(listing.contains("; 1.5"), "{listing}");
+    }
+
+    #[test]
     fn an_unrecognised_opcode_byte_is_reported_as_unknown_not_mistaken_for_halt() {
         let mut chunk = Chunk::new();
         chunk.code.push(253); // no opcode is numbered 253

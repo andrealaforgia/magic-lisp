@@ -64,6 +64,17 @@ fn b4_e3_an_integer_literal_too_large_for_i64_is_a_read_error_not_a_silent_wrap(
 }
 
 #[test]
+fn b4_e3_a_malformed_radix_literal_is_a_read_error_at_the_cli_level_too() {
+    // qa flagged radix coverage as narrower than the rest of B4's CLI-level
+    // discipline: the equivalent oversized-decimal-integer case above has a
+    // process-level test, but no malformed-radix-literal case did.
+    let file = write_source("b4-e3-bad-radix.ml", "(display #b2)");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SOURCE_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
 fn b4_e4a_float_display_uses_the_shortest_round_tripping_digits() {
     assert_eq!(eval_ok("b4-e4a.ml", "(display 0.1)"), "0.1");
 }

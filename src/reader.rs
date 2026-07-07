@@ -352,6 +352,20 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_digit_for_binary_is_a_read_error() {
+        // qa flagged radix coverage as narrower than the rest of B4's
+        // discipline: only overflow was tested, not an invalid digit for
+        // the given radix (2 isn't a valid binary digit).
+        assert!(read_program("#b2").is_err());
+    }
+
+    #[test]
+    fn an_invalid_digit_for_octal_is_a_read_error() {
+        // 8 isn't a valid octal digit.
+        assert!(read_program("#o8").is_err());
+    }
+
+    #[test]
     fn reads_a_symbol() {
         assert_eq!(
             read_program("display").unwrap(),

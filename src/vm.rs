@@ -602,10 +602,21 @@ fn int_div_step(acc: i64, divisor: i64) -> Result<IntDivStep, RuntimeError> {
     if divisor == 0 {
         return Err(error("division by exact zero"));
     }
-    if acc % divisor == 0 {
-        Ok(IntDivStep::Exact(acc / divisor))
-    } else {
-        Ok(IntDivStep::Inexact(acc as f64 / divisor as f64))
+    // i64::MIN / -1 (and the equivalent %) is the one integer-division case
+    // Rust panics on unconditionally, even in release builds — the same
+    // overflow class this file otherwise always handles via wrapping
+    // arithmetic (e.g. native_minus's unary case already uses
+    // wrapping_neg() for this exact input). checked_rem/checked_div return
+    // None only for that one case here (divisor == 0 is already excluded
+    // above), and i64::MIN negated wraps back to itself, which is exactly
+    // this division's true (exact) mathematical result modulo 2^64.
+    match acc.checked_rem(divisor) {
+        Some(0) => Ok(IntDivStep::Exact(
+            acc.checked_div(divisor)
+                .unwrap_or_else(|| acc.wrapping_neg()),
+        )),
+        Some(_) => Ok(IntDivStep::Inexact(acc as f64 / divisor as f64)),
+        None => Ok(IntDivStep::Exact(acc.wrapping_neg())),
     }
 }
 
@@ -1145,6 +1156,16 @@ mod tests {
     }
 
     #[test]
+    fn division_with_one_float_argument_inverts_it() {
+        // A qa test-design review found this exact case (the single-float-
+        // argument path through native_divide's any_float branch, `1.0 /
+        // first`) had no test at all -- confirmed via independent mutation
+        // replay to genuinely survive `%`/`*` mutants, unlike the sibling
+        // single-integer-argument case above.
+        assert_eq!(eval("(display (/ 4.0))").unwrap(), "0.25");
+    }
+
+    #[test]
     fn whole_number_division_that_comes_out_exact_yields_an_integer() {
         assert_eq!(eval("(display (/ 6 3))").unwrap(), "2");
     }
@@ -1162,6 +1183,23 @@ mod tests {
     #[test]
     fn dividing_by_exact_integer_zero_is_a_runtime_error() {
         assert!(eval("(display (/ 6 0))").is_err());
+    }
+
+    #[test]
+    fn dividing_i64_min_by_negative_one_is_exact_and_does_not_panic() {
+        // A security-review finding: i64::MIN % -1 (and / -1) is the one
+        // integer-division case Rust panics on unconditionally, even in
+        // release builds. i64::MIN negated wraps back to itself (its true
+        // value has no positive i64 representation), matching how
+        // native_minus's own unary case already handles this input.
+        let out = eval(&format!("(display (/ {} -1))", i64::MIN)).unwrap();
+        assert_eq!(out, i64::MIN.to_string());
+    }
+
+    #[test]
+    fn a_division_chain_reaching_i64_min_mid_fold_then_dividing_by_negative_one_does_not_panic() {
+        let out = eval(&format!("(display (/ {} 1 -1))", i64::MIN)).unwrap();
+        assert_eq!(out, i64::MIN.to_string());
     }
 
     #[test]
