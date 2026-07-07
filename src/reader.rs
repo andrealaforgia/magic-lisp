@@ -26,14 +26,20 @@ fn err(message: impl Into<String>) -> ReadError {
     }
 }
 
+/// Caps list-nesting depth so pathological source (e.g. thousands of unmatched
+/// '(') fails cleanly instead of risking a native stack overflow.
+const MAX_NESTING_DEPTH: usize = 512;
+
 struct Scanner<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    depth: usize,
 }
 
 impl<'a> Scanner<'a> {
     fn new(src: &'a str) -> Self {
         Scanner {
             chars: src.chars().peekable(),
+            depth: 0,
         }
     }
 
@@ -74,6 +80,19 @@ impl<'a> Scanner<'a> {
     }
 
     fn read_list(&mut self) -> Result<Sexpr, ReadError> {
+        self.depth += 1;
+        let result = if self.depth > MAX_NESTING_DEPTH {
+            Err(err(format!(
+                "list nesting exceeds the maximum supported depth ({MAX_NESTING_DEPTH})"
+            )))
+        } else {
+            self.read_list_body()
+        };
+        self.depth -= 1;
+        result
+    }
+
+    fn read_list_body(&mut self) -> Result<Sexpr, ReadError> {
         let mut items = Vec::new();
         loop {
             self.skip_atmosphere();
@@ -321,5 +340,50 @@ mod tests {
     #[test]
     fn a_comment_with_no_trailing_newline_before_eof_is_skipped_cleanly() {
         assert_eq!(read_program("; just a comment").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn rejects_nesting_deeper_than_the_configured_maximum_with_a_clean_error() {
+        // Well-formed but pathologically deep: without an explicit depth
+        // limit this would recurse once per '(' and risk a stack overflow
+        // on attacker-supplied source (a security-review finding on B1).
+        let src = format!("{}1{}", "(".repeat(600), ")".repeat(600));
+        assert!(read_program(&src).is_err());
+    }
+
+    #[test]
+    fn accepts_nesting_comfortably_under_the_configured_maximum() {
+        let src = format!("{}1{}", "(".repeat(100), ")".repeat(100));
+        assert!(read_program(&src).is_ok());
+    }
+
+    #[test]
+    fn accepts_nesting_of_exactly_the_configured_maximum_depth() {
+        let src = format!(
+            "{}1{}",
+            "(".repeat(MAX_NESTING_DEPTH),
+            ")".repeat(MAX_NESTING_DEPTH)
+        );
+        assert!(read_program(&src).is_ok());
+    }
+
+    #[test]
+    fn rejects_nesting_of_one_more_than_the_configured_maximum_depth() {
+        let src = format!(
+            "{}1{}",
+            "(".repeat(MAX_NESTING_DEPTH + 1),
+            ")".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        assert!(read_program(&src).is_err());
+    }
+
+    #[test]
+    fn depth_is_restored_after_a_list_closes_so_sibling_lists_get_a_fresh_budget() {
+        // Each sibling is well under the limit on its own; if depth weren't
+        // correctly decremented on exit from the first list, it would carry
+        // over and push the second list over budget.
+        let one_sibling = format!("{}1{}", "(".repeat(300), ")".repeat(300));
+        let src = format!("{one_sibling} {one_sibling}");
+        assert!(read_program(&src).is_ok());
     }
 }

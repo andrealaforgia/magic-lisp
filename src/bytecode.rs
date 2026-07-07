@@ -140,11 +140,13 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], BytecodeError> {
-        if self.pos + n > self.bytes.len() {
-            return Err(BytecodeError::Truncated);
-        }
-        let slice = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or(BytecodeError::Truncated)?;
+        let slice = &self.bytes[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -185,12 +187,17 @@ pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
     let entry_index = r.u32()?;
     let fn_count = r.u32()?;
 
-    let mut functions = Vec::with_capacity(fn_count as usize);
+    // fn_count/const_count come straight off the file, unchecked against the
+    // remaining byte count: pre-sizing on them would let a tiny crafted file
+    // request an arbitrarily large allocation. Vec::new() grows only as far
+    // as bytes actually taken from `r` (which is itself bounds-checked), so a
+    // bogus count still fails fast on the first out-of-range read.
+    let mut functions = Vec::new();
     for _ in 0..fn_count {
         let code_len = r.u32()? as usize;
         let code = r.bytes_owned(code_len)?;
         let const_count = r.u32()?;
-        let mut constants = Vec::with_capacity(const_count as usize);
+        let mut constants = Vec::new();
         for _ in 0..const_count {
             let tag = r.u8()?;
             let c = match tag {
@@ -311,6 +318,38 @@ mod tests {
             Err(BytecodeError::OutOfRange(_)) => {}
             other => panic!("expected OutOfRange, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_a_huge_declared_function_count_without_over_allocating() {
+        // A ~14-byte file claiming 4 billion functions must fail fast on the
+        // first bounds check, not attempt a multi-gigabyte allocation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION_MAJOR);
+        bytes.push(VERSION_MINOR);
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // entry_index
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // fn_count: absurd
+        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+    }
+
+    #[test]
+    fn rejects_a_huge_declared_constant_count_without_over_allocating() {
+        let mut chunk = Chunk::new();
+        chunk.emit_halt();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION_MAJOR);
+        bytes.push(VERSION_MINOR);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // entry_index
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // fn_count = 1
+        bytes.extend_from_slice(&(chunk.code.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&chunk.code);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // const_count: absurd
+        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
     }
 
     #[test]

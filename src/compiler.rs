@@ -14,17 +14,29 @@ impl std::fmt::Display for CompileError {
     }
 }
 
+/// Caps expression-nesting depth so a pathologically deep (but structurally
+/// valid) expression tree fails cleanly instead of risking a native stack
+/// overflow while compiling.
+const MAX_NESTING_DEPTH: usize = 512;
+
 pub fn compile_program(forms: &[Sexpr]) -> Result<Chunk, CompileError> {
     let mut chunk = Chunk::new();
     for form in forms {
-        compile_expr(form, &mut chunk)?;
+        compile_expr(form, &mut chunk, 0)?;
         chunk.emit_pop();
     }
     chunk.emit_halt();
     Ok(chunk)
 }
 
-fn compile_expr(expr: &Sexpr, chunk: &mut Chunk) -> Result<(), CompileError> {
+fn compile_expr(expr: &Sexpr, chunk: &mut Chunk, depth: usize) -> Result<(), CompileError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(CompileError {
+            message: format!(
+                "expression nesting exceeds the maximum supported depth ({MAX_NESTING_DEPTH})"
+            ),
+        });
+    }
     match expr {
         Sexpr::Int(n) => {
             let idx = chunk.add_const(Const::Int(*n));
@@ -46,9 +58,9 @@ fn compile_expr(expr: &Sexpr, chunk: &mut Chunk) -> Result<(), CompileError> {
             let (callee, args) = items.split_first().ok_or_else(|| CompileError {
                 message: "cannot call the empty list ()".to_string(),
             })?;
-            compile_expr(callee, chunk)?;
+            compile_expr(callee, chunk, depth + 1)?;
             for arg in args {
-                compile_expr(arg, chunk)?;
+                compile_expr(arg, chunk, depth + 1)?;
             }
             if args.len() > u8::MAX as usize {
                 return Err(CompileError {
@@ -188,5 +200,63 @@ mod tests {
     fn rejects_a_call_with_one_more_than_the_maximum_representable_argument_count() {
         let program = [call_with_n_args(u8::MAX as usize + 1)];
         assert!(compile_program(&program).is_err());
+    }
+
+    fn nested_call(depth: usize) -> Sexpr {
+        let mut expr = Sexpr::Int(1);
+        for _ in 0..depth {
+            expr = Sexpr::List(vec![Sexpr::Symbol("+".to_string()), expr]);
+        }
+        expr
+    }
+
+    #[test]
+    fn rejects_expression_nesting_deeper_than_the_configured_maximum() {
+        // Guards against unbounded recursion in compile_expr on a
+        // pathologically deep (but structurally valid) expression tree
+        // (a security-review finding on B1).
+        let program = [nested_call(600)];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn accepts_expression_nesting_comfortably_under_the_configured_maximum() {
+        let program = [nested_call(100)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    fn accepts_expression_nesting_of_exactly_the_configured_maximum_depth() {
+        let program = [nested_call(MAX_NESTING_DEPTH)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    fn rejects_expression_nesting_of_one_more_than_the_configured_maximum_depth() {
+        let program = [nested_call(MAX_NESTING_DEPTH + 1)];
+        assert!(compile_program(&program).is_err());
+    }
+
+    fn nested_in_callee_position(depth: usize) -> Sexpr {
+        // Nests via the callee slot only (never the argument list), to
+        // isolate the depth-tracking on that recursive call from the one on
+        // the argument-list recursive call.
+        let mut expr = Sexpr::Symbol("+".to_string());
+        for _ in 0..depth {
+            expr = Sexpr::List(vec![expr]);
+        }
+        expr
+    }
+
+    #[test]
+    fn tracks_depth_through_the_callee_position_not_just_the_argument_list() {
+        let program = [nested_in_callee_position(600)];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn accepts_callee_position_nesting_comfortably_under_the_configured_maximum() {
+        let program = [nested_in_callee_position(100)];
+        assert!(compile_program(&program).is_ok());
     }
 }
