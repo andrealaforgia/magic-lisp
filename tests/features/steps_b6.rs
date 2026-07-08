@@ -44,27 +44,46 @@ pub(crate) fn registry() -> Registry {
                     w.notes.push(out.trim_end_matches('\n').to_string());
                 }
                 2 => {
-                    let small_file = write_source("b6-small.ml", &variants[0]);
-                    let (small_out, small_rss) =
-                        run_with_peak_rss(&["eval", small_file.to_str().unwrap()]);
-                    assert!(
-                        small_out.status.success(),
-                        "small run should succeed, stderr: {}",
-                        stderr_of(&small_out)
-                    );
-
                     let full_file = write_source("b6-full.ml", &variants[1]);
-                    let (full_out, full_rss) =
-                        run_with_peak_rss(&["eval", full_file.to_str().unwrap()]);
-                    assert!(
-                        full_out.status.success(),
-                        "full run should succeed, stderr: {}",
-                        stderr_of(&full_out)
-                    );
+                    // `/usr/bin/time -l` (peak-RSS measurement) is macOS/BSD-
+                    // specific; other platforms (e.g. Linux's GNU/BusyBox
+                    // `time`, which uses a different flag and often isn't
+                    // installed at all) have no portable equivalent here.
+                    // Correctness is always checked; the memory-flatness
+                    // check is gated to where it can actually run, rather
+                    // than hard-panicking the whole test binary elsewhere
+                    // (qa test-design review on ebe43a2).
+                    if cfg!(target_os = "macos") {
+                        let small_file = write_source("b6-small.ml", &variants[0]);
+                        let (small_out, small_rss) =
+                            run_with_peak_rss(&["eval", small_file.to_str().unwrap()]);
+                        assert!(
+                            small_out.status.success(),
+                            "small run should succeed, stderr: {}",
+                            stderr_of(&small_out)
+                        );
 
-                    w.notes
-                        .push(stdout_of(&full_out).trim_end_matches('\n').to_string());
-                    w.rss_pairs.push((small_rss, full_rss));
+                        let (full_out, full_rss) =
+                            run_with_peak_rss(&["eval", full_file.to_str().unwrap()]);
+                        assert!(
+                            full_out.status.success(),
+                            "full run should succeed, stderr: {}",
+                            stderr_of(&full_out)
+                        );
+
+                        w.notes
+                            .push(stdout_of(&full_out).trim_end_matches('\n').to_string());
+                        w.rss_pairs.push((small_rss, full_rss));
+                    } else {
+                        let full_out = run(&["eval", full_file.to_str().unwrap()]);
+                        assert!(
+                            full_out.status.success(),
+                            "full run should succeed, stderr: {}",
+                            stderr_of(&full_out)
+                        );
+                        w.notes
+                            .push(stdout_of(&full_out).trim_end_matches('\n').to_string());
+                    }
                 }
                 n => panic!("unexpected number of queued source variants: {n}"),
             }
@@ -82,11 +101,13 @@ pub(crate) fn registry() -> Registry {
         .step(
             "peak memory usage does not scale with iteration count — it stays flat between a small-iteration-count run and the full ten-million-iteration run",
             |w, _text, _| {
-                let (small_rss, full_rss) = w
-                    .rss_pairs
-                    .last()
-                    .copied()
-                    .expect("a flat-memory When step should have recorded an RSS pair");
+                // No pair recorded means the platform-gated When step above
+                // skipped real RSS measurement here (no portable peak-RSS
+                // tool on this platform) -- correctness was already
+                // checked; there's nothing further to assert.
+                let Some(&(small_rss, full_rss)) = w.rss_pairs.last() else {
+                    return;
+                };
                 assert!(
                     full_rss < small_rss * 10,
                     "expected flat memory (full within 10x of small), got small={small_rss} full={full_rss} \
@@ -108,11 +129,9 @@ pub(crate) fn registry() -> Registry {
         .step(
             "peak memory usage stays flat between a small-depth run and the full ten-million-depth run, the same as E1",
             |w, _text, _| {
-                let (small_rss, full_rss) = w
-                    .rss_pairs
-                    .last()
-                    .copied()
-                    .expect("a flat-memory When step should have recorded an RSS pair");
+                let Some(&(small_rss, full_rss)) = w.rss_pairs.last() else {
+                    return;
+                };
                 assert!(
                     full_rss < small_rss * 10,
                     "expected flat memory (full within 10x of small), got small={small_rss} full={full_rss}"

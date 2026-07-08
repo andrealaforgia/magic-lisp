@@ -2397,18 +2397,6 @@ mod tests {
         // silently resolving to the wrong value via a same-named global).
         // Mirrors MAX_NESTING_DEPTH's own established boundary-test pattern
         // in this same file.
-        fn nested_capture(depth: usize) -> Sexpr {
-            // (lambda (x) (lambda () (lambda () ... x ...)))  -- `depth`
-            // levels of parameterless lambdas sit between x's binding
-            // function and the innermost body that references it, so x is
-            // an upvalue exactly `depth` enclosing-function levels away.
-            let mut body = sym("x");
-            for _ in 0..depth {
-                body = list(vec![sym("lambda"), list(vec![]), body]);
-            }
-            list(vec![sym("lambda"), list(vec![sym("x")]), body])
-        }
-
         let program = [nested_capture(300)];
         let err = compile_program(&program).unwrap_err();
         assert!(
@@ -2416,6 +2404,30 @@ mod tests {
             "expected the depth-overflow error naming the captured variable, got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn capturing_a_variable_through_exactly_255_nested_function_levels_still_succeeds() {
+        // Companion to the test above (qa test-design review, msg #112):
+        // the depth-255 overflow guard must reject only what's genuinely
+        // too deep to encode, not the boundary value itself. 255 is the
+        // deepest capture this bytecode format's u8 depth operand can
+        // represent, so it must still compile successfully.
+        let program = [nested_capture(255)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    /// (lambda (x) (lambda () (lambda () ... x ...)))  -- `depth` levels of
+    /// parameterless lambdas sit between x's binding function and the
+    /// innermost body that references it, so x is an upvalue exactly
+    /// `depth` enclosing-function levels away. Shared by the two
+    /// capture-depth boundary tests above.
+    fn nested_capture(depth: usize) -> Sexpr {
+        let mut body = sym("x");
+        for _ in 0..depth {
+            body = list(vec![sym("lambda"), list(vec![]), body]);
+        }
+        list(vec![sym("lambda"), list(vec![sym("x")]), body])
     }
 
     // B6: tail-call analysis. These tests pin down exactly which call sites
