@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 59] = [
+const NATIVE_NAMES: [&str; 79] = [
     "display",
     "newline",
     "+",
@@ -88,6 +88,27 @@ const NATIVE_NAMES: [&str; 59] = [
     "vector?",
     "hash?",
     "make-hash",
+    // B9: pairs and lists (spec 5.1).
+    "set-car!",
+    "set-cdr!",
+    "caar",
+    "cadr",
+    "cdar",
+    "cddr",
+    "caddr",
+    "list",
+    "length",
+    "append",
+    "reverse",
+    "list-ref",
+    "list-tail",
+    "last-pair",
+    "member",
+    "memv",
+    "memq",
+    "assoc",
+    "assv",
+    "assq",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -618,24 +639,73 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
                     args.len()
                 )));
             };
-            Ok(Value::Pair(Rc::new((a.clone(), b.clone()))))
+            Ok(Value::Pair(Rc::new(RefCell::new((a.clone(), b.clone())))))
         }
-        "car" => match args {
-            [Value::Pair(cell)] => Ok(cell.0.clone()),
-            [other] => Err(error(format!("car expects a pair, found {other}"))),
-            _ => Err(error(format!(
-                "car expects exactly 1 argument, got {}",
-                args.len()
-            ))),
-        },
-        "cdr" => match args {
-            [Value::Pair(cell)] => Ok(cell.1.clone()),
-            [other] => Err(error(format!("cdr expects a pair, found {other}"))),
-            _ => Err(error(format!(
-                "cdr expects exactly 1 argument, got {}",
-                args.len()
-            ))),
-        },
+        "car" => native_unary("car", args, |v| car_of("car", v)),
+        "cdr" => native_unary("cdr", args, |v| cdr_of("cdr", v)),
+        "caar" => native_unary("caar", args, |v| cxr("caar", "aa", v)),
+        "cadr" => native_unary("cadr", args, |v| cxr("cadr", "ad", v)),
+        "cdar" => native_unary("cdar", args, |v| cxr("cdar", "da", v)),
+        "cddr" => native_unary("cddr", args, |v| cxr("cddr", "dd", v)),
+        "caddr" => native_unary("caddr", args, |v| cxr("caddr", "add", v)),
+        "set-car!" => native_set_half("set-car!", args, |cell, v| cell.0 = v),
+        "set-cdr!" => native_set_half("set-cdr!", args, |cell, v| cell.1 = v),
+        "list" => Ok(vec_to_list(args.to_vec())),
+        "length" => native_unary("length", args, |v| {
+            Ok(Value::Int(list_to_vec("length", v)?.len() as i64))
+        }),
+        "append" => {
+            let [a, b] = args else {
+                return Err(error(format!(
+                    "append expects exactly 2 arguments, got {}",
+                    args.len()
+                )));
+            };
+            let mut items = list_to_vec("append", a)?;
+            items.extend(list_to_vec("append", b)?);
+            Ok(vec_to_list(items))
+        }
+        "reverse" => native_unary("reverse", args, |v| {
+            let mut items = list_to_vec("reverse", v)?;
+            items.reverse();
+            Ok(vec_to_list(items))
+        }),
+        "list-ref" => {
+            let [v, Value::Int(n)] = args else {
+                return Err(error(format!(
+                    "list-ref expects a list and an integer index, got {} arguments",
+                    args.len()
+                )));
+            };
+            let items = list_to_vec("list-ref", v)?;
+            usize::try_from(*n)
+                .ok()
+                .and_then(|i| items.get(i).cloned())
+                .ok_or_else(|| error(format!("list-ref index {n} is out of range")))
+        }
+        "list-tail" => {
+            let [v, Value::Int(n)] = args else {
+                return Err(error(format!(
+                    "list-tail expects a list and an integer index, got {} arguments",
+                    args.len()
+                )));
+            };
+            if *n < 0 {
+                return Err(error(format!("list-tail index {n} must not be negative")));
+            }
+            let mut current = v.clone();
+            for _ in 0..*n {
+                current = cdr_of("list-tail", &current)?;
+            }
+            Ok(current)
+        }
+        "last-pair" => native_unary("last-pair", args, |v| last_pair("last-pair", v)),
+        "member" => native_member("member", args, value_equal),
+        "memv" => native_member("memv", args, value_eqv),
+        "memq" => native_member("memq", args, value_eqv),
+        "assoc" => native_assoc("assoc", args, value_equal),
+        "assv" => native_assoc("assv", args, value_eqv),
+        "assq" => native_assoc("assq", args, value_eqv),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -708,9 +778,209 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
 fn is_proper_list(v: &Value) -> bool {
     match v {
         Value::List(_) => true,
-        Value::Pair(cell) => is_proper_list(&cell.1),
+        Value::Pair(cell) => is_proper_list(&cell.borrow().1),
         _ => false,
     }
+}
+
+/// A non-empty `List` is a proper list too (spec 5.1; see [`is_pair`]), so
+/// `car`/`cdr` reach into one exactly as they would a `Pair` chain built
+/// with `cons` -- which representation backs a given list is not
+/// observable.
+fn car_of(opname: &str, v: &Value) -> Result<Value, RuntimeError> {
+    match v {
+        Value::Pair(cell) => Ok(cell.borrow().0.clone()),
+        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+        other => Err(error(format!("{opname} expects a pair, found {other}"))),
+    }
+}
+
+fn cdr_of(opname: &str, v: &Value) -> Result<Value, RuntimeError> {
+    match v {
+        Value::Pair(cell) => Ok(cell.borrow().1.clone()),
+        Value::List(items) if !items.is_empty() => Ok(Value::List(Rc::new(items[1..].to_vec()))),
+        other => Err(error(format!("{opname} expects a pair, found {other}"))),
+    }
+}
+
+/// Composes `car`/`cdr` per `ops` (e.g. `"ad"` for `cadr`), applying the
+/// letter closest to the trailing `r` first -- Scheme's `cXXXr` naming
+/// convention reads left to right but *evaluates* right to left, matching
+/// how `(cadr x)` means `(car (cdr x))`.
+fn cxr(opname: &str, ops: &str, v: &Value) -> Result<Value, RuntimeError> {
+    let mut result = v.clone();
+    for op in ops.chars().rev() {
+        result = match op {
+            'a' => car_of(opname, &result)?,
+            'd' => cdr_of(opname, &result)?,
+            _ => unreachable!("cxr ops string must only contain 'a'/'d'"),
+        };
+    }
+    Ok(result)
+}
+
+fn native_unary(
+    opname: &str,
+    args: &[Value],
+    f: impl Fn(&Value) -> Result<Value, RuntimeError>,
+) -> Result<Value, RuntimeError> {
+    let [a] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    };
+    f(a)
+}
+
+fn native_set_half(
+    opname: &str,
+    args: &[Value],
+    set: impl Fn(&mut (Value, Value), Value),
+) -> Result<Value, RuntimeError> {
+    let [target, v] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    match target {
+        Value::Pair(cell) => {
+            set(&mut cell.borrow_mut(), v.clone());
+            Ok(Value::Unspecified)
+        }
+        other => Err(error(format!("{opname} expects a pair, found {other}"))),
+    }
+}
+
+/// Flattens any proper list (a `Pair` chain terminating in the empty
+/// `List`, or a `List` outright) into a plain `Vec` -- the shared traversal
+/// behind every B9 list operation, so each one doesn't have to walk both
+/// representations itself.
+fn list_to_vec(opname: &str, v: &Value) -> Result<Vec<Value>, RuntimeError> {
+    let mut out = Vec::new();
+    let mut current = v.clone();
+    loop {
+        match current {
+            Value::List(items) => {
+                out.extend(items.iter().cloned());
+                return Ok(out);
+            }
+            Value::Pair(cell) => {
+                let (car, cdr) = {
+                    let borrowed = cell.borrow();
+                    (borrowed.0.clone(), borrowed.1.clone())
+                };
+                out.push(car);
+                current = cdr;
+            }
+            other => {
+                return Err(error(format!(
+                    "{opname} expects a proper list, found {other}"
+                )));
+            }
+        }
+    }
+}
+
+/// Builds a proper list back out of a `Vec`, as a genuine `Pair` chain (not
+/// a flat `List`) so the result supports `set-car!`/`set-cdr!` mutation
+/// like any list a real Scheme program constructs.
+fn vec_to_list(items: Vec<Value>) -> Value {
+    let mut result = Value::List(Rc::new(Vec::new()));
+    for item in items.into_iter().rev() {
+        result = Value::Pair(Rc::new(RefCell::new((item, result))));
+    }
+    result
+}
+
+/// The final pair of a `Pair` chain (or the `List`-backed equivalent,
+/// converted via [`vec_to_list`] first) -- spec 5.1 requires this stay
+/// cons-shaped (holding the last element and the empty list), not just the
+/// bare last element.
+fn last_pair(opname: &str, v: &Value) -> Result<Value, RuntimeError> {
+    let v = match v {
+        Value::List(items) if !items.is_empty() => vec_to_list(items.to_vec()),
+        other => other.clone(),
+    };
+    match &v {
+        Value::Pair(cell) => {
+            let cdr = cell.borrow().1.clone();
+            if matches!(cdr, Value::Pair(_)) {
+                last_pair(opname, &cdr)
+            } else {
+                Ok(v)
+            }
+        }
+        other => Err(error(format!("{opname} expects a pair, found {other}"))),
+    }
+}
+
+/// Finds the first sublist of `haystack` whose car matches `needle` under
+/// `matches` (spec 5.1's `member`/`memv`/`memq`, distinguished only by
+/// which equality relation they search with), returning that sublist
+/// directly -- or `#f` if the search runs off the end without a match.
+fn native_member(
+    opname: &str,
+    args: &[Value],
+    matches: fn(&Value, &Value) -> bool,
+) -> Result<Value, RuntimeError> {
+    let [needle, haystack] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    let mut current = haystack.clone();
+    loop {
+        match current {
+            Value::List(items) => {
+                let Some(pos) = items.iter().position(|item| matches(needle, item)) else {
+                    return Ok(Value::Bool(false));
+                };
+                return Ok(vec_to_list(items[pos..].to_vec()));
+            }
+            Value::Pair(cell) => {
+                let (car, cdr) = {
+                    let borrowed = cell.borrow();
+                    (borrowed.0.clone(), borrowed.1.clone())
+                };
+                if matches(needle, &car) {
+                    return Ok(Value::Pair(cell));
+                }
+                current = cdr;
+            }
+            other => {
+                return Err(error(format!(
+                    "{opname} expects a proper list, found {other}"
+                )));
+            }
+        }
+    }
+}
+
+/// Finds the first entry (a key/value pair) of `alist` whose key matches
+/// `needle` under `matches` (spec 5.1's `assoc`/`assv`/`assq`, distinguished
+/// only by which equality relation they search with), returning that whole
+/// entry -- or `#f` if no key matches.
+fn native_assoc(
+    opname: &str,
+    args: &[Value],
+    matches: fn(&Value, &Value) -> bool,
+) -> Result<Value, RuntimeError> {
+    let [needle, alist] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    for entry in list_to_vec(opname, alist)? {
+        let key = car_of(opname, &entry)?;
+        if matches(needle, &key) {
+            return Ok(entry);
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 /// A non-empty list is, per real Scheme semantics, built from pairs -- so
@@ -3069,6 +3339,243 @@ mod tests {
         assert!(
             !has_bare_call,
             "add's body has exactly one call, and it's a tail call, not a plain CALL: {listing}"
+        );
+    }
+
+    // --- B9 E1: pair mutation and cxr accessors (spec 5.1) ---
+
+    #[test]
+    fn a_freshly_constructed_pair_retrieves_both_halves_back_out() {
+        assert_eq!(eval("(display (car (cons 1 2)))").unwrap(), "1");
+        assert_eq!(eval("(display (cdr (cons 1 2)))").unwrap(), "2");
+    }
+
+    #[test]
+    fn set_car_replaces_the_first_half_in_place_and_it_is_observed_afterward() {
+        assert_eq!(
+            eval("(define p (cons 1 2)) (set-car! p 99) (display (car p))").unwrap(),
+            "99"
+        );
+    }
+
+    #[test]
+    fn set_cdr_replaces_the_second_half_in_place_and_it_is_observed_afterward() {
+        assert_eq!(
+            eval("(define p (cons 1 2)) (set-cdr! p 99) (display (cdr p))").unwrap(),
+            "99"
+        );
+    }
+
+    #[test]
+    fn set_car_and_set_cdr_mutate_the_same_pair_independently() {
+        assert_eq!(
+            eval(
+                "(define p (cons 1 2)) (set-car! p 10) (set-cdr! p 20) \
+                  (display (car p)) (display (cdr p))"
+            )
+            .unwrap(),
+            "1020"
+        );
+    }
+
+    #[test]
+    fn cadr_reaches_the_second_element() {
+        assert_eq!(eval("(display (cadr (cons 1 (cons 2 3))))").unwrap(), "2");
+    }
+
+    #[test]
+    fn cddr_drops_the_first_element_twice() {
+        assert_eq!(eval("(display (cddr (cons 1 (cons 2 3))))").unwrap(), "3");
+    }
+
+    #[test]
+    fn caar_reaches_the_first_of_the_first() {
+        assert_eq!(eval("(display (caar (cons (cons 1 2) 3)))").unwrap(), "1");
+    }
+
+    #[test]
+    fn cdar_reaches_the_rest_of_the_first() {
+        assert_eq!(eval("(display (cdar (cons (cons 1 2) 3)))").unwrap(), "2");
+    }
+
+    #[test]
+    fn caddr_reaches_three_levels_deep() {
+        assert_eq!(
+            eval("(display (caddr (cons 1 (cons 2 (cons 3 4)))))").unwrap(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn car_and_cdr_also_reach_into_a_quoted_list_literal() {
+        assert_eq!(eval("(display (car (quote (1 2 3))))").unwrap(), "1");
+        assert_eq!(eval("(display (cdr (quote (1 2 3))))").unwrap(), "(2 3)");
+    }
+
+    #[test]
+    fn car_of_a_non_pair_is_a_clean_runtime_error() {
+        assert!(eval("(display (car 5))").is_err());
+    }
+
+    #[test]
+    fn set_car_of_a_non_pair_is_a_clean_runtime_error() {
+        assert!(eval("(set-car! 5 1)").is_err());
+    }
+
+    // --- B9 E2: list construction and inspection (spec 5.1) ---
+
+    #[test]
+    fn list_constructs_a_proper_list_from_a_sequence_of_values() {
+        assert_eq!(eval("(display (list 1 2 3))").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn list_with_no_arguments_is_the_empty_list() {
+        assert_eq!(eval("(display (list))").unwrap(), "()");
+    }
+
+    #[test]
+    fn length_of_a_quoted_list_literal() {
+        assert_eq!(eval("(display (length (quote (a b c))))").unwrap(), "3");
+    }
+
+    #[test]
+    fn length_of_the_empty_list_is_zero() {
+        assert_eq!(eval("(display (length (quote ())))").unwrap(), "0");
+    }
+
+    #[test]
+    fn append_concatenates_two_lists() {
+        assert_eq!(
+            eval("(display (append (list 1 2) (list 3 4)))").unwrap(),
+            "(1 2 3 4)"
+        );
+    }
+
+    #[test]
+    fn reverse_a_list() {
+        assert_eq!(eval("(display (reverse (list 1 2 3)))").unwrap(), "(3 2 1)");
+    }
+
+    #[test]
+    fn list_ref_at_a_middle_position() {
+        assert_eq!(
+            eval("(display (list-ref (list 10 20 30) 1))").unwrap(),
+            "20"
+        );
+    }
+
+    #[test]
+    fn list_ref_at_the_last_valid_position() {
+        assert_eq!(
+            eval("(display (list-ref (list 10 20 30) 2))").unwrap(),
+            "30"
+        );
+    }
+
+    #[test]
+    fn list_tail_at_position_zero_is_the_identity() {
+        assert_eq!(
+            eval("(display (list-tail (list 1 2 3) 0))").unwrap(),
+            "(1 2 3)"
+        );
+    }
+
+    #[test]
+    fn list_tail_at_a_position_beyond_zero() {
+        assert_eq!(eval("(display (list-tail (list 1 2 3) 2))").unwrap(), "(3)");
+    }
+
+    #[test]
+    fn last_pair_of_a_multi_element_list_is_cons_shaped_holding_the_last_element_and_empty() {
+        assert_eq!(eval("(display (last-pair (list 1 2 3)))").unwrap(), "(3)");
+        assert_eq!(
+            eval("(display (pair? (last-pair (list 1 2 3))))").unwrap(),
+            "#t"
+        );
+        assert_eq!(
+            eval("(display (cdr (last-pair (list 1 2 3))))").unwrap(),
+            "()"
+        );
+    }
+
+    // --- B9 E3: member/memv/memq at the three equality strictness levels ---
+
+    #[test]
+    fn member_finds_the_first_sublist_starting_with_a_matching_element() {
+        assert_eq!(eval("(display (member 2 (list 1 2 3)))").unwrap(), "(2 3)");
+    }
+
+    #[test]
+    fn member_returns_false_when_nothing_matches() {
+        assert_eq!(eval("(display (member 5 (list 1 2 3)))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn memv_finds_the_first_sublist_starting_with_a_matching_element() {
+        assert_eq!(eval("(display (memv 2 (list 1 2 3)))").unwrap(), "(2 3)");
+    }
+
+    #[test]
+    fn memq_finds_the_first_sublist_starting_with_a_matching_element() {
+        assert_eq!(eval("(display (memq 2 (list 1 2 3)))").unwrap(), "(2 3)");
+    }
+
+    #[test]
+    fn member_finds_a_separately_built_compound_value_that_memq_cannot() {
+        assert_eq!(
+            eval("(display (member (list 1 2) (list (list 1 2) 3)))").unwrap(),
+            "((1 2) 3)"
+        );
+        assert_eq!(
+            eval("(display (memq (list 1 2) (list (list 1 2) 3)))").unwrap(),
+            "#f"
+        );
+    }
+
+    // --- B9 E4: assoc/assv/assq at the three equality strictness levels ---
+
+    #[test]
+    fn assoc_finds_the_first_entry_whose_key_matches() {
+        assert_eq!(
+            eval("(display (assoc 2 (list (cons 1 (quote a)) (cons 2 (quote b)))))").unwrap(),
+            "(2 . b)"
+        );
+    }
+
+    #[test]
+    fn assoc_returns_false_when_no_key_matches() {
+        assert_eq!(
+            eval("(display (assoc 5 (list (cons 1 (quote a)) (cons 2 (quote b)))))").unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn assv_finds_the_first_entry_whose_key_matches() {
+        assert_eq!(
+            eval("(display (assv 2 (list (cons 1 (quote a)) (cons 2 (quote b)))))").unwrap(),
+            "(2 . b)"
+        );
+    }
+
+    #[test]
+    fn assq_finds_the_first_entry_whose_key_matches() {
+        assert_eq!(
+            eval("(display (assq 2 (list (cons 1 (quote a)) (cons 2 (quote b)))))").unwrap(),
+            "(2 . b)"
+        );
+    }
+
+    #[test]
+    fn assoc_finds_a_separately_built_compound_key_that_assq_cannot() {
+        assert_eq!(
+            eval("(display (assoc (list 1 2) (list (cons (list 1 2) (quote a)))))").unwrap(),
+            "((1 2) . a)"
+        );
+        assert_eq!(
+            eval("(display (assq (list 1 2) (list (cons (list 1 2) (quote a)))))").unwrap(),
+            "#f"
         );
     }
 }

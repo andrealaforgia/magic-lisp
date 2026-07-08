@@ -33,11 +33,11 @@ pub enum Value {
     /// plus the environment it closed over at creation time (empty/parentless
     /// for a top-level definition, which has no enclosing locals to capture).
     Closure(u32, Rc<Env>),
-    /// A minimal cons cell — just enough to construct a pair and retrieve
-    /// each half back out; the broader pair/list operation library is a
-    /// later behaviour, so this deliberately isn't unified with `List`.
-    /// `Rc`, not `Box`, for the same `eq?`-identity reason as `Str` above.
-    Pair(Rc<(Value, Value)>),
+    /// A cons cell (spec 5.1): its two halves can be replaced in place after
+    /// construction (`set-car!`/`set-cdr!`), so it needs interior
+    /// mutability, not just `Rc`'s shared-ownership identity (the same
+    /// `eq?`-identity reason as `Str` above).
+    Pair(Rc<RefCell<(Value, Value)>>),
     /// `Rc`, not a plain `Vec`, for the same `eq?`-identity reason as `Str`
     /// and `Pair` above — a non-empty list is a compound/reference value
     /// per spec 3.7, so two separately-quoted lists with the same contents
@@ -95,6 +95,46 @@ fn format_float(n: f64) -> String {
     }
 }
 
+/// Prints a pair the way a proper (possibly improper-tailed) list reads:
+/// walking the cdr chain space-separating each car, switching to a trailing
+/// `. tail` only once the chain ends in something other than the empty
+/// list -- rather than the raw `(a . b)` a single cons cell would suggest.
+/// No cycle detection: terminates on acyclic data, as required; behaviour
+/// on cyclic data is implementation-defined per spec.
+fn display_pair_chain(
+    f: &mut fmt::Formatter<'_>,
+    cell: &Rc<RefCell<(Value, Value)>>,
+) -> fmt::Result {
+    write!(f, "(")?;
+    let first = cell.borrow().0.clone();
+    write!(f, "{first}")?;
+    let mut current = cell.borrow().1.clone();
+    loop {
+        match current {
+            Value::Pair(next) => {
+                let (car, cdr) = {
+                    let borrowed = next.borrow();
+                    (borrowed.0.clone(), borrowed.1.clone())
+                };
+                write!(f, " {car}")?;
+                current = cdr;
+            }
+            Value::List(items) if items.is_empty() => break,
+            Value::List(items) => {
+                for item in items.iter() {
+                    write!(f, " {item}")?;
+                }
+                break;
+            }
+            other => {
+                write!(f, " . {other}")?;
+                break;
+            }
+        }
+    }
+    write!(f, ")")
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -107,7 +147,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Native(name) => write!(f, "#<procedure:{name}>"),
             Value::Closure(idx, _) => write!(f, "#<procedure:{idx}>"),
-            Value::Pair(cell) => write!(f, "({} . {})", cell.0, cell.1),
+            Value::Pair(cell) => display_pair_chain(f, cell),
             Value::List(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
@@ -184,7 +224,11 @@ pub fn value_eqv(a: &Value, b: &Value) -> bool {
 pub fn value_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Pair(x), Value::Pair(y)) => value_equal(&x.0, &y.0) && value_equal(&x.1, &y.1),
+        (Value::Pair(x), Value::Pair(y)) => {
+            let x = x.borrow();
+            let y = y.borrow();
+            value_equal(&x.0, &y.0) && value_equal(&x.1, &y.1)
+        }
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_equal(a, b))
         }
@@ -261,6 +305,33 @@ mod tests {
             Value::Int(3),
         ])));
         assert_eq!(vector.to_string(), "#(1 2 3)");
+    }
+
+    #[test]
+    fn displays_a_dotted_pair_with_the_dot_notation() {
+        let pair = Value::Pair(Rc::new(RefCell::new((Value::Int(1), Value::Int(2)))));
+        assert_eq!(pair.to_string(), "(1 . 2)");
+    }
+
+    #[test]
+    fn displays_a_proper_list_built_from_pairs_without_dot_notation() {
+        let list = Value::Pair(Rc::new(RefCell::new((
+            Value::Int(1),
+            Value::Pair(Rc::new(RefCell::new((
+                Value::Int(2),
+                Value::List(Rc::new(vec![])),
+            )))),
+        ))));
+        assert_eq!(list.to_string(), "(1 2)");
+    }
+
+    #[test]
+    fn displays_an_improper_list_with_a_trailing_dotted_tail() {
+        let list = Value::Pair(Rc::new(RefCell::new((
+            Value::Int(1),
+            Value::Pair(Rc::new(RefCell::new((Value::Int(2), Value::Int(3))))),
+        ))));
+        assert_eq!(list.to_string(), "(1 2 . 3)");
     }
 
     #[test]
