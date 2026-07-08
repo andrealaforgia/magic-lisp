@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 82] = [
+const NATIVE_NAMES: [&str; 85] = [
     "display",
     "newline",
     "+",
@@ -112,6 +112,9 @@ const NATIVE_NAMES: [&str; 82] = [
     "map",
     "for-each",
     "filter",
+    "fold-left",
+    "fold-right",
+    "reduce",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -717,6 +720,9 @@ fn call_native(
         "map" => native_map(vm, args, out),
         "for-each" => native_for_each(vm, args, out),
         "filter" => native_filter(vm, args, out),
+        "fold-left" => native_fold_left(vm, args, out),
+        "fold-right" => native_fold_right(vm, args, out),
+        "reduce" => native_reduce(vm, args, out),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -1067,6 +1073,69 @@ fn native_filter(vm: &mut Vm, args: &[Value], out: &mut impl Write) -> Result<Va
         }
     }
     Ok(vec_to_list(results))
+}
+
+/// Folds `list` left to right, calling `proc` as `(proc acc elem)` starting
+/// from `init` (spec 5.1) -- evaluation order matters for non-commutative
+/// `proc`, unlike [`native_fold_right`].
+fn native_fold_left(
+    vm: &mut Vm,
+    args: &[Value],
+    out: &mut impl Write,
+) -> Result<Value, RuntimeError> {
+    let [proc, init, list] = args else {
+        return Err(error(format!(
+            "fold-left expects exactly 3 arguments, got {}",
+            args.len()
+        )));
+    };
+    let mut acc = init.clone();
+    for item in list_to_vec("fold-left", list)? {
+        acc = vm.call_value(proc, vec![acc, item], out)?;
+    }
+    Ok(acc)
+}
+
+/// Folds `list` right to left, calling `proc` as `(proc elem acc)` starting
+/// from `init` (spec 5.1) -- e.g. `(fold-right cons '() lst)` rebuilds
+/// `lst` in its original order.
+fn native_fold_right(
+    vm: &mut Vm,
+    args: &[Value],
+    out: &mut impl Write,
+) -> Result<Value, RuntimeError> {
+    let [proc, init, list] = args else {
+        return Err(error(format!(
+            "fold-right expects exactly 3 arguments, got {}",
+            args.len()
+        )));
+    };
+    let mut acc = init.clone();
+    for item in list_to_vec("fold-right", list)?.into_iter().rev() {
+        acc = vm.call_value(proc, vec![item, acc], out)?;
+    }
+    Ok(acc)
+}
+
+/// A self-seeded left-fold (spec 5.1): uses the list's own first element as
+/// the seed instead of `init`, falling back to `init` only when the list is
+/// empty (there's no element to seed from).
+fn native_reduce(vm: &mut Vm, args: &[Value], out: &mut impl Write) -> Result<Value, RuntimeError> {
+    let [proc, init, list] = args else {
+        return Err(error(format!(
+            "reduce expects exactly 3 arguments, got {}",
+            args.len()
+        )));
+    };
+    let items = list_to_vec("reduce", list)?;
+    let Some((first, rest)) = items.split_first() else {
+        return Ok(init.clone());
+    };
+    let mut acc = first.clone();
+    for item in rest {
+        acc = vm.call_value(proc, vec![acc, item.clone()], out)?;
+    }
+    Ok(acc)
 }
 
 /// A non-empty list is, per real Scheme semantics, built from pairs -- so
@@ -3718,5 +3787,45 @@ mod tests {
             .unwrap(),
             "(1 4 9)\n149"
         );
+    }
+
+    // --- B9 E6: fold-left/fold-right/reduce (spec 5.1) ---
+
+    #[test]
+    fn fold_left_sums_from_a_given_initial_value() {
+        assert_eq!(
+            eval("(display (fold-left + 0 (list 1 2 3 4)))").unwrap(),
+            "10"
+        );
+    }
+
+    #[test]
+    fn fold_right_builds_the_list_back_up_via_cons_preserving_order() {
+        assert_eq!(
+            eval("(display (fold-right cons (quote ()) (list 1 2 3)))").unwrap(),
+            "(1 2 3)"
+        );
+    }
+
+    #[test]
+    fn fold_left_and_fold_right_diverge_on_a_non_commutative_operation() {
+        assert_eq!(
+            eval("(display (fold-left - 0 (list 1 2 3)))").unwrap(),
+            "-6"
+        );
+        assert_eq!(
+            eval("(display (fold-right - 0 (list 1 2 3)))").unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn reduce_self_seeds_from_the_lists_own_first_element() {
+        assert_eq!(eval("(display (reduce + 0 (list 1 2 3 4)))").unwrap(), "10");
+    }
+
+    #[test]
+    fn reduce_falls_back_to_the_given_initial_value_on_an_empty_list() {
+        assert_eq!(eval("(display (reduce + 99 (quote ())))").unwrap(), "99");
     }
 }
