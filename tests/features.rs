@@ -17,6 +17,8 @@ mod world;
 mod steps_b1;
 #[path = "features/steps_b10.rs"]
 mod steps_b10;
+#[path = "features/steps_b11.rs"]
+mod steps_b11;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -108,4 +110,10 @@ fn b9_pairs_and_lists() {
 fn b10_strings_and_characters() {
     let src = include_str!("../features/B10-strings-and-characters.feature");
     registry::run_feature("B10-strings-and-characters", src, &steps_b10::registry());
+}
+
+#[test]
+fn b11_vectors_and_hash_tables() {
+    let src = include_str!("../features/B11-vectors-and-hash-tables.feature");
+    registry::run_feature("B11-vectors-and-hash-tables", src, &steps_b11::registry());
 }
