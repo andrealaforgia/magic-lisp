@@ -275,4 +275,53 @@ pub(crate) fn registry() -> Registry {
                 assert_eq!(w.notes.last().unwrap(), "1\n2");
             },
         )
+        // --- E14 ---
+        .step(
+            "a let binding x to 1, containing a nested let that rebinds x to 2",
+            |w, _text, _| {
+                w.pending = vec![
+                    "(display (let ((x 1)) (let ((x 2)) (display x)) (newline) x))".to_string(),
+                ];
+            },
+        )
+        .step(
+            "the inner scope sees 2 while it is active, and the outer scope sees its own 1 again afterward",
+            |w, _text, _| {
+                assert_eq!(w.notes.last().unwrap(), "2\n1");
+            },
+        )
+        // --- E15 ---
+        .step(
+            "a let binding x to 1, containing a nested let that mutates x with set!",
+            |w, _text, _| {
+                w.pending = vec![
+                    "(display (let ((x 1)) (let ((y 2)) (set! x 99)) x))".to_string(),
+                ];
+            },
+        )
+        .step(
+            "the outer x reflects the mutation once the inner scope closes",
+            |w, _text, _| {
+                assert_eq!(w.notes.last().unwrap(), "99");
+            },
+        )
+        // --- E16 ---
+        .step(
+            "a letrec group where one binding's own initializer reads another binding that has not run yet",
+            |_w, _text, _| {},
+        )
+        .step("the letrec expression is evaluated", |w, _text, _| {
+            let file = write_source("b3-e16.ml", "(display (letrec ((a b) (b 1)) a))");
+            w.outputs.push(run(&["eval", file.to_str().unwrap()]));
+        })
+        // --- E17 ---
+        .step(
+            "a let binding x, containing a lambda with no parameters of its own that references x",
+            |w, _text, _| {
+                w.pending = vec!["(display (let ((x 5)) ((lambda () x))))".to_string()];
+            },
+        )
+        .step("it correctly resolves x from the enclosing scope", |w, _text, _| {
+            assert_eq!(w.notes.last().unwrap(), "5");
+        })
 }

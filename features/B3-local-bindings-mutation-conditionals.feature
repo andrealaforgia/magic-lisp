@@ -132,3 +132,34 @@ Feature: B3 — Local bindings, mutation, and the full family of conditional/seq
     # Evidence: (define (f) (let ((a 1)) (display a)) (newline) (let ((b 2)) (display b))) (f)
     #   pre-fix:  "1\n1" (wrong — second let silently returned the first let's stale value)
     #   post-fix: "1\n2" (correct)
+
+  Scenario: E14 — a nested let shadows the outer binding, then the outer resumes once the inner scope closes
+    Given a let binding x to 1, containing a nested let that rebinds x to 2
+    When the function is called
+    Then the inner scope sees 2 while it is active, and the outer scope sees its own 1 again afterward
+    # Retroactive addition: scope-edge-case regression coverage (qa test-design review, msg #49)
+    # Evidence: (display (let ((x 1)) (let ((x 2)) (display x)) (newline) x)) -> "2\n1"
+
+  Scenario: E15 — set! from a nested scope mutates the outer let's own binding, not a shadowed copy
+    Given a let binding x to 1, containing a nested let that mutates x with set!
+    When the function is called
+    Then the outer x reflects the mutation once the inner scope closes
+    # Retroactive addition: scope-edge-case regression coverage (qa test-design review, msg #49)
+    # Evidence: (display (let ((x 1)) (let ((y 2)) (set! x 99)) x)) -> "99"
+
+  Scenario: E16 — a letrec binding referencing another binding before it is initialized fails cleanly
+    Given a letrec group where one binding's own initializer reads another binding that has not run yet
+    When the letrec expression is evaluated
+    Then the process fails with a distinct, non-zero exit code separate from success/usage/read-compile/file-format errors
+    # Retroactive addition: scope-edge-case regression coverage (qa test-design review, msg #49)
+    # Evidence: (display (letrec ((a b) (b 1)) a)) -> runtime error, exit 70
+
+  Scenario: E17 — a lambda body correctly captures a variable from its enclosing let
+    Given a let binding x, containing a lambda with no parameters of its own that references x
+    When the function is called
+    Then it correctly resolves x from the enclosing scope
+    # Retroactive addition: scope-edge-case regression coverage (qa test-design review, msg #49) —
+    # originally a documented B3-era limitation (lambdas compiled as separate chunks had no access
+    # to enclosing locals and failed with "unbound global"); B5 gave lambdas real upvalue capture,
+    # so this now resolves correctly.
+    # Evidence: (display (let ((x 5)) ((lambda () x)))) -> "5"

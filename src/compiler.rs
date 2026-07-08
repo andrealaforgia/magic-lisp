@@ -2388,6 +2388,36 @@ mod tests {
         });
     }
 
+    #[test]
+    fn capturing_a_variable_through_more_than_255_nested_function_levels_is_a_compile_error() {
+        // qa test-design review (msg #101): the resolve_upvalue depth->255
+        // overflow fix had tests at resolve_env/upvalue_cell (the adjacent
+        // runtime layer) but none here, at compile_program itself -- the
+        // layer where the original bug actually lived (a >255-deep capture
+        // silently resolving to the wrong value via a same-named global).
+        // Mirrors MAX_NESTING_DEPTH's own established boundary-test pattern
+        // in this same file.
+        fn nested_capture(depth: usize) -> Sexpr {
+            // (lambda (x) (lambda () (lambda () ... x ...)))  -- `depth`
+            // levels of parameterless lambdas sit between x's binding
+            // function and the innermost body that references it, so x is
+            // an upvalue exactly `depth` enclosing-function levels away.
+            let mut body = sym("x");
+            for _ in 0..depth {
+                body = list(vec![sym("lambda"), list(vec![]), body]);
+            }
+            list(vec![sym("lambda"), list(vec![sym("x")]), body])
+        }
+
+        let program = [nested_capture(300)];
+        let err = compile_program(&program).unwrap_err();
+        assert!(
+            err.message.contains('x') && err.message.contains("too many levels"),
+            "expected the depth-overflow error naming the captured variable, got: {}",
+            err.message
+        );
+    }
+
     // B6: tail-call analysis. These tests pin down exactly which call sites
     // become Op::TailCall (reusing the current native frame) versus
     // Op::Call (a genuine, stack-consuming call) per spec 3.8's enumerated
