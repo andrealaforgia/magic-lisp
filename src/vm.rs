@@ -1183,12 +1183,26 @@ fn list_to_vec(opname: &str, v: &Value) -> Result<Vec<Value>, RuntimeError> {
     }
 }
 
-/// Builds a proper list back out of a `Vec`, as a genuine `Pair` chain (not
-/// a flat `List`) so the result supports `set-car!`/`set-cdr!` mutation
-/// like any list a real Scheme program constructs.
+/// Caps how many elements a single `make-vector` call can request. Without
+/// this, `vec![fill; len]` hands an arbitrary `i64` straight to the
+/// allocator as one contiguous up-front request with no loop or recursion
+/// in source -- unlike building a comparably large structure via `cons`
+/// (throttled by real per-element allocator overhead, and already bounded
+/// by this project's own step/call-depth budgets), a single `make-vector`
+/// call can request many gigabytes instantly. Worse, the OS killing the
+/// process for that (SIGKILL) is not a catchable Rust panic, unlike this
+/// project's other bounded-input guards, so it bypasses the panic-catching
+/// defense in depth entirely (warden security review, msgs #191/#192).
+const MAX_VECTOR_LENGTH: usize = 10_000_000;
+
 fn make_vector(n: i64, fill: Value) -> Result<Value, RuntimeError> {
     let len = usize::try_from(n)
         .map_err(|_| error(format!("make-vector length {n} must not be negative")))?;
+    if len > MAX_VECTOR_LENGTH {
+        return Err(error(format!(
+            "make-vector length {len} exceeds the maximum of {MAX_VECTOR_LENGTH}"
+        )));
+    }
     Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
 }
 
@@ -1204,6 +1218,9 @@ fn find_hash_value(entries: &Rc<RefCell<Vec<(Value, Value)>>>, key: &Value) -> O
         .map(|(_, v)| v.clone())
 }
 
+/// Builds a proper list back out of a `Vec`, as a genuine `Pair` chain (not
+/// a flat `List`) so the result supports `set-car!`/`set-cdr!` mutation
+/// like any list a real Scheme program constructs.
 fn vec_to_list(items: Vec<Value>) -> Value {
     let mut result = Value::List(Rc::new(Vec::new()));
     for item in items.into_iter().rev() {
@@ -5197,6 +5214,59 @@ mod tests {
     #[test]
     fn make_vector_with_a_negative_length_is_a_clean_runtime_error() {
         assert!(eval("(display (make-vector -1))").is_err());
+    }
+
+    // --- warden security review (msgs #191/#192): make-vector must reject
+    // an unbounded length with a clean error, not hand an arbitrary i64
+    // straight to the allocator as one uncontrolled up-front request ---
+
+    #[test]
+    fn make_vector_past_the_maximum_length_is_a_clean_runtime_error_not_an_allocation() {
+        let err = eval("(display (make-vector 999999999999))").unwrap_err();
+        assert!(err.message.contains("exceeds the maximum"));
+    }
+
+    #[test]
+    fn make_vector_at_exactly_the_maximum_length_still_succeeds() {
+        assert_eq!(
+            eval("(display (vector-length (make-vector 10000000)))").unwrap(),
+            "10000000"
+        );
+    }
+
+    // --- warden security review (msgs #191/#192): a cross-type cycle
+    // alternating through a mutable Pair and a mutable Vector must not
+    // crash display with a native stack overflow, the same way a same-
+    // type (pure Pair or pure Vector) cycle already doesn't ---
+
+    #[test]
+    fn displaying_a_cross_type_pair_and_vector_cycle_terminates_instead_of_crashing() {
+        assert_eq!(
+            eval("(define p (cons 1 2)) (define v (vector p)) (set-cdr! p v) (display p)").unwrap(),
+            "(1 . #((...)))"
+        );
+    }
+
+    #[test]
+    fn displaying_a_vector_containing_a_pair_that_contains_that_same_vector_terminates() {
+        assert_eq!(
+            eval("(define v (vector 1)) (define p (cons v 2)) (vector-set! v 0 p) (display v)")
+                .unwrap(),
+            "#((#(...) . 2))"
+        );
+    }
+
+    #[test]
+    fn a_shared_but_non_cyclic_sub_list_referenced_twice_still_prints_in_full_both_times() {
+        // Confirms the fix's ancestors set tracks only the CURRENT print
+        // path (popped again once a subtree finishes), not every address
+        // ever seen -- a DAG (the same sub-list reachable from two places,
+        // but not forming a cycle) must not be mistaken for a cycle and
+        // truncated on its second occurrence.
+        assert_eq!(
+            eval("(define x (list 1 2)) (display (list x x))").unwrap(),
+            "((1 2) (1 2))"
+        );
     }
 
     #[test]

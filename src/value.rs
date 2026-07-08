@@ -114,129 +114,161 @@ fn format_float(n: f64) -> String {
     }
 }
 
+/// Tags an address in the shared `ancestors` set by which container type it
+/// belongs to, so a `Pair` and a `Vector` allocation can never be confused
+/// even in the (practically impossible, since every displayed object stays
+/// alive for the duration of the call) case of an address coincidence.
+const PAIR_TAG: u8 = 0;
+const VECTOR_TAG: u8 = 1;
+
+/// The single entry point for printing any `Value`, threading one shared
+/// `ancestors` set through every recursive/iterative descent -- into a
+/// pair's car, a pair's cdr chain, a list's elements, and a vector's
+/// elements alike. This exists so cycle detection composes ACROSS container
+/// types: a vector holding a pair whose cdr was set back to that same
+/// vector (or any other Pair/Vector mixture) is caught exactly the same way
+/// a same-type cycle is, because both sides check and update the identical
+/// set rather than each container type keeping its own independent,
+/// freshly-seeded local state (warden security reviews msgs #144, #146,
+/// #147, #191, #192 -- an earlier fix that gave `Vector` its own isolated
+/// cycle guard, mirroring `Pair`'s in isolation, closed the same-type case
+/// but left this cross-type case open, confirmed via a 4-line reproduction
+/// that still crashed with a native stack overflow).
+fn fmt_value(
+    f: &mut fmt::Formatter<'_>,
+    value: &Value,
+    ancestors: &mut HashSet<(u8, usize)>,
+) -> fmt::Result {
+    match value {
+        Value::Int(n) => write!(f, "{n}"),
+        Value::Float(n) => write!(f, "{}", format_float(*n)),
+        Value::Bool(true) => write!(f, "#t"),
+        Value::Bool(false) => write!(f, "#f"),
+        Value::Char(c) => write!(f, "{c}"),
+        Value::Str(s) => write!(f, "{s}"),
+        Value::Symbol(s) => write!(f, "{s}"),
+        Value::Native(name) => write!(f, "#<procedure:{name}>"),
+        Value::Closure(idx, _) => write!(f, "#<procedure:{idx}>"),
+        Value::Pair(cell) => fmt_pair_chain(f, cell, ancestors),
+        Value::List(items) => {
+            write!(f, "(")?;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    write!(f, " ")?;
+                }
+                fmt_value(f, item, ancestors)?;
+            }
+            write!(f, ")")
+        }
+        Value::Vector(items) => fmt_vector(f, items, ancestors),
+        Value::Hash(_) => write!(f, "#<hash>"),
+        Value::Unspecified => Ok(()),
+    }
+}
+
 /// Prints a pair the way a proper (possibly improper-tailed) list reads:
 /// walking the cdr chain space-separating each car, switching to a trailing
 /// `. tail` only once the chain ends in something other than the empty
 /// list -- rather than the raw `(a . b)` a single cons cell would suggest.
-/// No cycle detection: terminates on acyclic data, as required; behaviour
-/// on cyclic data is implementation-defined per spec.
-fn display_pair_chain(
+///
+/// `ancestors` tracks every `(type tag, address)` currently on the print
+/// path (removed again once this call's own subtree finishes), shared with
+/// [`fmt_vector`] via [`fmt_value`] -- so both a plain cdr-chain cycle back
+/// to this chain's own start (prints a trailing ` ...`, preserving the
+/// original wording for this specific, most-common case) and a cycle
+/// reached by re-entering this exact pair from an ancestor context (prints
+/// `(...)` in place of the whole pair, since its contents can't be printed
+/// without recursing forever) are both caught, instead of only the former.
+fn fmt_pair_chain(
     f: &mut fmt::Formatter<'_>,
     cell: &Rc<RefCell<(Value, Value)>>,
+    ancestors: &mut HashSet<(u8, usize)>,
 ) -> fmt::Result {
-    write!(f, "(")?;
-    let first = cell.borrow().0.clone();
-    write!(f, "{first}")?;
-    let mut current = cell.borrow().1.clone();
-    // Tracks visited Pair addresses so a circular list (via set-cdr!)
-    // prints `...` and stops instead of printing forever (warden security
-    // review, msg #146).
-    let mut seen = HashSet::new();
-    seen.insert(Rc::as_ptr(cell) as usize);
-    loop {
-        match &current {
-            Value::Pair(next) => {
-                if !seen.insert(Rc::as_ptr(next) as usize) {
-                    write!(f, " ...")?;
+    let start = (PAIR_TAG, Rc::as_ptr(cell) as usize);
+    if !ancestors.insert(start) {
+        return write!(f, "(...)");
+    }
+    let mut inserted = vec![start];
+
+    let result = (|| {
+        write!(f, "(")?;
+        let first = cell.borrow().0.clone();
+        fmt_value(f, &first, ancestors)?;
+        let mut current = cell.borrow().1.clone();
+        loop {
+            match &current {
+                Value::Pair(next) => {
+                    let addr = (PAIR_TAG, Rc::as_ptr(next) as usize);
+                    if !ancestors.insert(addr) {
+                        write!(f, " ...")?;
+                        break;
+                    }
+                    inserted.push(addr);
+                    let (car, cdr) = {
+                        let borrowed = next.borrow();
+                        (borrowed.0.clone(), borrowed.1.clone())
+                    };
+                    write!(f, " ")?;
+                    fmt_value(f, &car, ancestors)?;
+                    current = cdr;
+                }
+                // This guard is unobservable: dropping it entirely would
+                // still print nothing extra for an empty items Vec, since
+                // the next arm's loop is a no-op over zero elements before
+                // its own `break`. Hand-verified: with the guard forced to
+                // `false`, the full test suite still passes.
+                Value::List(items) if items.is_empty() => break,
+                Value::List(items) => {
+                    for item in items.iter() {
+                        write!(f, " ")?;
+                        fmt_value(f, item, ancestors)?;
+                    }
                     break;
                 }
-                let (car, cdr) = {
-                    let borrowed = next.borrow();
-                    (borrowed.0.clone(), borrowed.1.clone())
-                };
-                write!(f, " {car}")?;
-                current = cdr;
-            }
-            // This guard is unobservable: dropping it entirely would still
-            // print nothing extra for an empty items Vec, since the next
-            // arm's loop is a no-op over zero elements before its own
-            // `break`. Hand-verified: with the guard forced to `false`,
-            // the full test suite still passes.
-            Value::List(items) if items.is_empty() => break,
-            Value::List(items) => {
-                for item in items.iter() {
-                    write!(f, " {item}")?;
+                other => {
+                    write!(f, " . ")?;
+                    fmt_value(f, other, ancestors)?;
+                    break;
                 }
-                break;
-            }
-            other => {
-                write!(f, " . {other}")?;
-                break;
             }
         }
+        write!(f, ")")
+    })();
+
+    for addr in inserted {
+        ancestors.remove(&addr);
     }
-    write!(f, ")")
+    result
 }
 
-/// Prints a vector, `#(a b c)`. `ancestors` tracks the chain of `Vector`
-/// addresses currently being printed on THIS path (removed again once their
-/// subtree finishes), not every vector ever seen -- so a vector referenced
-/// twice non-cyclically (a DAG, not a cycle) still prints in full both
-/// times, while an actual cycle (constructible via `vector-set!`, spec 4.5,
-/// since vectors became mutable in the same behaviour that added them)
-/// prints `#(...)` and stops instead of recursing until the native stack
-/// overflows and aborts the process -- the same class of defect this
-/// project already fixed for pairs (warden security reviews msgs #144,
-/// #146, #147; qa test-design warning msg #189 found the identical gap,
-/// reproduced, for the newly-mutable vector type).
-///
-/// Deliberately scoped to vector-to-vector nesting only, mirroring exactly
-/// what was reported: a cross-type cycle alternating through a mutable
-/// `Pair` (e.g. a vector holding a pair whose cdr is set back to that same
-/// vector) is not caught by this guard, since a `Pair` element still goes
-/// through its own independent, freshly-seeded `display_pair_chain` call.
-/// Tracked as a known, narrower-scope limitation, not fixed here.
-fn display_vector(
+/// Prints a vector, `#(a b c)`. See [`fmt_pair_chain`] for the shared
+/// `ancestors` set this composes cycle detection with.
+fn fmt_vector(
     f: &mut fmt::Formatter<'_>,
     items: &Rc<RefCell<Vec<Value>>>,
-    ancestors: &mut HashSet<usize>,
+    ancestors: &mut HashSet<(u8, usize)>,
 ) -> fmt::Result {
-    let addr = Rc::as_ptr(items) as usize;
+    let addr = (VECTOR_TAG, Rc::as_ptr(items) as usize);
     if !ancestors.insert(addr) {
         return write!(f, "#(...)");
     }
-    write!(f, "#(")?;
-    for (i, item) in items.borrow().iter().enumerate() {
-        if i > 0 {
-            write!(f, " ")?;
+    let result = (|| {
+        write!(f, "#(")?;
+        for (i, item) in items.borrow().iter().enumerate() {
+            if i > 0 {
+                write!(f, " ")?;
+            }
+            fmt_value(f, item, ancestors)?;
         }
-        match item {
-            Value::Vector(nested) => display_vector(f, nested, ancestors)?,
-            other => write!(f, "{other}")?,
-        }
-    }
-    write!(f, ")")?;
+        write!(f, ")")
+    })();
     ancestors.remove(&addr);
-    Ok(())
+    result
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Int(n) => write!(f, "{n}"),
-            Value::Float(n) => write!(f, "{}", format_float(*n)),
-            Value::Bool(true) => write!(f, "#t"),
-            Value::Bool(false) => write!(f, "#f"),
-            Value::Char(c) => write!(f, "{c}"),
-            Value::Str(s) => write!(f, "{s}"),
-            Value::Symbol(s) => write!(f, "{s}"),
-            Value::Native(name) => write!(f, "#<procedure:{name}>"),
-            Value::Closure(idx, _) => write!(f, "#<procedure:{idx}>"),
-            Value::Pair(cell) => display_pair_chain(f, cell),
-            Value::List(items) => {
-                write!(f, "(")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{item}")?;
-                }
-                write!(f, ")")
-            }
-            Value::Vector(items) => display_vector(f, items, &mut HashSet::new()),
-            Value::Hash(_) => write!(f, "#<hash>"),
-            Value::Unspecified => Ok(()),
-        }
+        fmt_value(f, self, &mut HashSet::new())
     }
 }
 
