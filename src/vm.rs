@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 90] = [
+const NATIVE_NAMES: [&str; 93] = [
     "display",
     "newline",
     "+",
@@ -121,6 +121,9 @@ const NATIVE_NAMES: [&str; 90] = [
     "string-ref",
     "substring",
     "string-append",
+    "string=?",
+    "string<?",
+    "string>?",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -758,6 +761,9 @@ fn call_native(
         "string-ref" => native_string_ref(args),
         "substring" => native_substring(args),
         "string-append" => native_string_append(args),
+        "string=?" => native_string_compare("string=?", args, |a, b| a == b),
+        "string<?" => native_string_compare("string<?", args, |a, b| a < b),
+        "string>?" => native_string_compare("string>?", args, |a, b| a > b),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -1314,6 +1320,20 @@ fn native_string_append(args: &[Value]) -> Result<Value, RuntimeError> {
         }
     }
     Ok(Value::Str(Rc::new(result)))
+}
+
+fn native_string_compare(
+    opname: &str,
+    args: &[Value],
+    holds: fn(&str, &str) -> bool,
+) -> Result<Value, RuntimeError> {
+    let [Value::Str(a), Value::Str(b)] = args else {
+        return Err(error(format!(
+            "{opname} expects two strings, got {} argument(s)",
+            args.len()
+        )));
+    };
+    Ok(Value::Bool(holds(a, b)))
 }
 
 /// A non-empty list is, per real Scheme semantics, built from pairs -- so
@@ -4309,5 +4329,33 @@ mod tests {
     #[test]
     fn substring_out_of_bounds_is_a_clean_runtime_error() {
         assert!(eval("(display (substring \"hello\" 1 10))").is_err());
+    }
+
+    // --- B10 E2: string=?/string<?/string>? (spec 6.1) ---
+
+    #[test]
+    fn string_equal_is_true_for_two_equal_strings() {
+        assert_eq!(eval("(display (string=? \"abc\" \"abc\"))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn string_equal_is_false_for_two_unequal_strings() {
+        assert_eq!(eval("(display (string=? \"abc\" \"abd\"))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn string_less_than_is_true_when_the_first_string_comes_before() {
+        assert_eq!(eval("(display (string<? \"abc\" \"abd\"))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn string_less_than_is_false_with_reversed_operands() {
+        assert_eq!(eval("(display (string<? \"abd\" \"abc\"))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn string_greater_than_is_shown_both_true_and_false() {
+        assert_eq!(eval("(display (string>? \"abd\" \"abc\"))").unwrap(), "#t");
+        assert_eq!(eval("(display (string>? \"abc\" \"abd\"))").unwrap(), "#f");
     }
 }
