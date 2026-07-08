@@ -281,3 +281,25 @@ fn a_self_referential_vector_terminates_cleanly_through_the_real_cli_not_a_hang_
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "#t\n#(#(...) 2 3)");
 }
+
+#[test]
+fn a_cross_type_pair_and_vector_cycle_terminates_cleanly_through_the_real_cli_not_a_crash() {
+    // Acceptance-level counterpart to the cross-type cycle unit tests
+    // (warden security reviews msgs #191/#192): a cycle alternating
+    // through a mutable Pair and a mutable Vector must not crash the real
+    // CLI process with a native stack overflow, verified through the
+    // actual argument-parsing/process-exit path a real user would hit --
+    // mirroring the same-type test above and B9's circular-list CLI test.
+    let src = "(define p (cons 1 2)) (define v (vector p)) (set-cdr! p v) \
+               (display p)";
+    let file = write_source("b11-cross-type-cycle.ml", src);
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "expected a clean exit, got: {:?} (stderr: {})",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "(1 . #((...)))");
+}
