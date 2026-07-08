@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 106] = [
+const NATIVE_NAMES: [&str; 120] = [
     "display",
     "newline",
     "+",
@@ -137,6 +137,21 @@ const NATIVE_NAMES: [&str; 106] = [
     "char-alphabetic?",
     "char-numeric?",
     "char-whitespace?",
+    // B11: vectors and hash tables (spec 4.5, 4.6).
+    "vector",
+    "make-vector",
+    "vector-ref",
+    "vector-set!",
+    "vector-length",
+    "vector->list",
+    "list->vector",
+    "vector-fill!",
+    "hash-ref",
+    "hash-set!",
+    "hash-remove!",
+    "hash-count",
+    "hash-keys",
+    "hash-has-key?",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -895,6 +910,132 @@ fn call_native(
                 args.len()
             ))),
         },
+        "vector" => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
+        "make-vector" => match args {
+            [Value::Int(n)] => make_vector(*n, Value::Int(0)),
+            [Value::Int(n), fill] => make_vector(*n, fill.clone()),
+            _ => Err(error(format!(
+                "make-vector expects a length and an optional fill value, got {} argument(s)",
+                args.len()
+            ))),
+        },
+        "vector-ref" => {
+            let [Value::Vector(items), Value::Int(idx)] = args else {
+                return Err(error(format!(
+                    "vector-ref expects a vector and an integer index, got {} argument(s)",
+                    args.len()
+                )));
+            };
+            usize::try_from(*idx)
+                .ok()
+                .and_then(|i| items.borrow().get(i).cloned())
+                .ok_or_else(|| error(format!("vector-ref index {idx} is out of range")))
+        }
+        "vector-set!" => {
+            let [Value::Vector(items), Value::Int(idx), v] = args else {
+                return Err(error(format!(
+                    "vector-set! expects a vector, an integer index, and a value, got {} argument(s)",
+                    args.len()
+                )));
+            };
+            let mut borrowed = items.borrow_mut();
+            let len = borrowed.len();
+            match usize::try_from(*idx).ok().filter(|&i| i < len) {
+                Some(i) => {
+                    borrowed[i] = v.clone();
+                    Ok(Value::Unspecified)
+                }
+                None => Err(error(format!("vector-set! index {idx} is out of range"))),
+            }
+        }
+        "vector-length" => native_unary("vector-length", args, |v| match v {
+            Value::Vector(items) => Ok(Value::Int(items.borrow().len() as i64)),
+            other => Err(error(format!(
+                "vector-length expects a vector, found {other}"
+            ))),
+        }),
+        "vector->list" => native_unary("vector->list", args, |v| match v {
+            Value::Vector(items) => Ok(vec_to_list(items.borrow().clone())),
+            other => Err(error(format!(
+                "vector->list expects a vector, found {other}"
+            ))),
+        }),
+        "list->vector" => native_unary("list->vector", args, |v| {
+            Ok(Value::Vector(Rc::new(RefCell::new(list_to_vec(
+                "list->vector",
+                v,
+            )?))))
+        }),
+        "vector-fill!" => {
+            let [Value::Vector(items), v] = args else {
+                return Err(error(format!(
+                    "vector-fill! expects a vector and a fill value, got {} argument(s)",
+                    args.len()
+                )));
+            };
+            for slot in items.borrow_mut().iter_mut() {
+                *slot = v.clone();
+            }
+            Ok(Value::Unspecified)
+        }
+        "hash-ref" => match args {
+            [Value::Hash(entries), key] => find_hash_value(entries, key)
+                .ok_or_else(|| error(format!("hash-ref: key {key} not found"))),
+            [Value::Hash(entries), key, default] => {
+                Ok(find_hash_value(entries, key).unwrap_or_else(|| default.clone()))
+            }
+            _ => Err(error(format!(
+                "hash-ref expects a hash table, a key, and an optional default value, got {} argument(s)",
+                args.len()
+            ))),
+        },
+        "hash-set!" => {
+            let [Value::Hash(entries), key, v] = args else {
+                return Err(error(format!(
+                    "hash-set! expects a hash table, a key, and a value, got {} argument(s)",
+                    args.len()
+                )));
+            };
+            let mut borrowed = entries.borrow_mut();
+            match borrowed.iter_mut().find(|(k, _)| value_equal(k, key)) {
+                Some(entry) => entry.1 = v.clone(),
+                None => borrowed.push((key.clone(), v.clone())),
+            }
+            Ok(Value::Unspecified)
+        }
+        "hash-remove!" => {
+            let [Value::Hash(entries), key] = args else {
+                return Err(error(format!(
+                    "hash-remove! expects a hash table and a key, got {} argument(s)",
+                    args.len()
+                )));
+            };
+            entries.borrow_mut().retain(|(k, _)| !value_equal(k, key));
+            Ok(Value::Unspecified)
+        }
+        "hash-count" => native_unary("hash-count", args, |v| match v {
+            Value::Hash(entries) => Ok(Value::Int(entries.borrow().len() as i64)),
+            other => Err(error(format!(
+                "hash-count expects a hash table, found {other}"
+            ))),
+        }),
+        "hash-keys" => native_unary("hash-keys", args, |v| match v {
+            Value::Hash(entries) => Ok(vec_to_list(
+                entries.borrow().iter().map(|(k, _)| k.clone()).collect(),
+            )),
+            other => Err(error(format!(
+                "hash-keys expects a hash table, found {other}"
+            ))),
+        }),
+        "hash-has-key?" => match args {
+            [Value::Hash(entries), key] => Ok(Value::Bool(
+                entries.borrow().iter().any(|(k, _)| value_equal(k, key)),
+            )),
+            _ => Err(error(format!(
+                "hash-has-key? expects a hash table and a key, got {} argument(s)",
+                args.len()
+            ))),
+        },
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
 }
@@ -1045,6 +1186,24 @@ fn list_to_vec(opname: &str, v: &Value) -> Result<Vec<Value>, RuntimeError> {
 /// Builds a proper list back out of a `Vec`, as a genuine `Pair` chain (not
 /// a flat `List`) so the result supports `set-car!`/`set-cdr!` mutation
 /// like any list a real Scheme program constructs.
+fn make_vector(n: i64, fill: Value) -> Result<Value, RuntimeError> {
+    let len = usize::try_from(n)
+        .map_err(|_| error(format!("make-vector length {n} must not be negative")))?;
+    Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+}
+
+/// Looks up `key` in a hash table's insertion-ordered entries by `equal?`
+/// (spec 4.6), not by identity -- a separately-built but structurally
+/// identical compound key (e.g. a list or string) must still find its
+/// value, mirroring B9's `member`/`assoc` structural-equality rigor.
+fn find_hash_value(entries: &Rc<RefCell<Vec<(Value, Value)>>>, key: &Value) -> Option<Value> {
+    entries
+        .borrow()
+        .iter()
+        .find(|(k, _)| value_equal(k, key))
+        .map(|(_, v)| v.clone())
+}
+
 fn vec_to_list(items: Vec<Value>) -> Value {
     let mut result = Value::List(Rc::new(Vec::new()));
     for item in items.into_iter().rev() {
@@ -4702,6 +4861,223 @@ mod tests {
             )
             .unwrap(),
             "5\ne\nell\nfoobar\n#t\n#t\nABC\nhello\nworld\n65\nB\n#t\n#t\nhi\n(a b)\n2\né\n"
+        );
+    }
+
+    // --- B11 E1: vector construction, indexing, and bounds errors (spec 4.5) ---
+
+    #[test]
+    fn a_vector_built_from_a_sequence_reads_back_each_position() {
+        assert_eq!(
+            eval("(display (vector-ref (vector 1 2 3) 1))").unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn vector_set_replaces_a_position_in_place_and_is_observed_afterward() {
+        assert_eq!(
+            eval("(define v (vector 1 2 3)) (vector-set! v 1 99) (display (vector-ref v 1))")
+                .unwrap(),
+            "99"
+        );
+    }
+
+    #[test]
+    fn vector_length_counts_its_elements() {
+        assert_eq!(
+            eval("(display (vector-length (vector 1 2 3)))").unwrap(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn make_vector_with_no_fill_defaults_to_zero() {
+        assert_eq!(eval("(display (make-vector 3))").unwrap(), "#(0 0 0)");
+    }
+
+    #[test]
+    fn make_vector_with_an_explicit_non_default_fill_uses_it_for_every_position() {
+        assert_eq!(eval("(display (make-vector 3 7))").unwrap(), "#(7 7 7)");
+    }
+
+    #[test]
+    fn vector_ref_past_the_end_is_a_clean_runtime_error() {
+        let err = eval("(display (vector-ref (vector 1 2 3) 3))").unwrap_err();
+        assert_eq!(err.message, "vector-ref index 3 is out of range");
+    }
+
+    #[test]
+    fn vector_set_past_the_end_is_a_clean_runtime_error_distinct_from_the_read_case() {
+        let err = eval("(vector-set! (vector 1 2 3) 3 99)").unwrap_err();
+        assert_eq!(err.message, "vector-set! index 3 is out of range");
+    }
+
+    // --- B11 E2: vector/list conversion and whole-vector fill (spec 4.5) ---
+
+    #[test]
+    fn vector_to_list_reflects_prior_mutation() {
+        assert_eq!(
+            eval("(define v (vector 1 2 3)) (vector-set! v 1 99) (display (vector->list v))")
+                .unwrap(),
+            "(1 99 3)"
+        );
+    }
+
+    #[test]
+    fn list_to_vector_converts_a_list_and_displays_as_a_vector() {
+        assert_eq!(
+            eval("(display (list->vector (list 1 2)))").unwrap(),
+            "#(1 2)"
+        );
+    }
+
+    #[test]
+    fn vector_fill_overwrites_every_position_not_just_one() {
+        assert_eq!(
+            eval("(define v (vector 1 2 3)) (vector-fill! v 9) (display v)").unwrap(),
+            "#(9 9 9)"
+        );
+    }
+
+    #[test]
+    fn a_list_to_vector_to_list_round_trip_reproduces_the_original() {
+        assert_eq!(
+            eval("(display (vector->list (list->vector (list 1 2 3))))").unwrap(),
+            "(1 2 3)"
+        );
+    }
+
+    // --- B11 E3: vector literals read and evaluate correctly (spec 3.1, 4.5) ---
+
+    #[test]
+    fn a_vector_literal_displays_as_itself() {
+        assert_eq!(eval("(display #(1 2 3))").unwrap(), "#(1 2 3)");
+    }
+
+    #[test]
+    fn a_vector_literal_is_genuinely_a_vector_not_just_text_that_displays_right() {
+        assert_eq!(eval("(display (vector? #(1 2 3)))").unwrap(), "#t");
+        assert_eq!(eval("(display (vector-ref #(1 2 3) 2))").unwrap(), "3");
+    }
+
+    // --- B11 E4: hash table create/store/retrieve/remove (spec 4.6) ---
+
+    #[test]
+    fn a_stored_value_is_retrieved_by_its_key() {
+        assert_eq!(
+            eval(
+                "(define h (make-hash)) (hash-set! h (quote a) 1) (display (hash-ref h (quote a)))"
+            )
+            .unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn hash_count_reports_the_number_of_stored_entries() {
+        assert_eq!(
+            eval(
+                "(define h (make-hash)) (hash-set! h (quote a) 1) (hash-set! h (quote b) 2) \
+                 (display (hash-count h))"
+            )
+            .unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn hash_ref_with_a_fallback_returns_it_for_a_missing_key() {
+        assert_eq!(
+            eval("(display (hash-ref (make-hash) (quote c) \"nope\"))").unwrap(),
+            "nope"
+        );
+    }
+
+    #[test]
+    fn hash_ref_without_a_fallback_on_a_missing_key_is_a_clean_error_distinct_from_the_fallback_case()
+     {
+        let err = eval("(hash-ref (make-hash) (quote c))").unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn hash_has_key_reflects_removal() {
+        assert_eq!(
+            eval(
+                "(define h (make-hash)) (hash-set! h (quote a) 1) \
+                 (hash-remove! h (quote a)) (display (hash-has-key? h (quote a)))"
+            )
+            .unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn hash_keys_are_compared_by_deep_structural_equality_not_identity() {
+        // Two SEPARATELY-built but structurally identical compound keys
+        // (lists, not symbols) must find the same entry -- mirroring B9's
+        // member/assoc rigor for equal?-based lookup.
+        assert_eq!(
+            eval(
+                "(define h (make-hash)) (hash-set! h (list 1 2) 42) \
+                 (display (hash-ref h (list 1 2)))"
+            )
+            .unwrap(),
+            "42"
+        );
+    }
+
+    // --- B11 E5: hash-keys returns deterministic insertion order (spec 4.6) ---
+
+    #[test]
+    fn hash_keys_come_back_in_insertion_order_for_two_entries() {
+        assert_eq!(
+            eval(
+                "(define h (make-hash)) (hash-set! h (quote a) 1) (hash-set! h (quote b) 2) \
+                 (display (hash-keys h))"
+            )
+            .unwrap(),
+            "(a b)"
+        );
+    }
+
+    #[test]
+    fn hash_keys_reflect_a_removal_followed_by_a_re_insertion_going_to_the_end() {
+        assert_eq!(
+            eval(
+                "(define h (make-hash)) \
+                 (hash-set! h (quote a) 1) (hash-set! h (quote b) 2) (hash-set! h (quote c) 3) \
+                 (hash-remove! h (quote a)) (hash-set! h (quote a) 99) \
+                 (display (hash-keys h))"
+            )
+            .unwrap(),
+            "(b c a)"
+        );
+    }
+
+    // --- B11 E6: integration: all twelve demo expressions (spec 4.5, 4.6) ---
+
+    #[test]
+    fn all_twelve_demo_expressions_produce_exactly_the_prescribed_output() {
+        assert_eq!(
+            eval(
+                "(define v (vector 1 2 3)) (display (vector-ref v 1)) (newline) \
+                 (vector-set! v 1 99) (display (vector-ref v 1)) (newline) \
+                 (display (vector-length v)) (newline) \
+                 (display (vector->list v)) (newline) \
+                 (display (make-vector 3 0)) (newline) \
+                 (display (list->vector (cons 1 (cons 2 (quote ()))))) (newline) \
+                 (display #(1 2 3)) (newline) \
+                 (define h (make-hash)) (hash-set! h (quote a) 1) (hash-set! h (quote b) 2) \
+                 (display (hash-count h)) (newline) \
+                 (display (hash-keys h)) (newline) \
+                 (display (hash-ref h (quote c) \"nope\")) (newline) \
+                 (display (hash-has-key? h (quote a))) (newline) \
+                 (hash-remove! h (quote a)) (display (hash-has-key? h (quote a))) (newline)"
+            )
+            .unwrap(),
+            "2\n99\n3\n(1 99 3)\n#(0 0 0)\n#(1 2)\n#(1 2 3)\n2\n(a b)\nnope\n#t\n#f\n"
         );
     }
 }
