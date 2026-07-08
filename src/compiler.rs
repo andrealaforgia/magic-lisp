@@ -308,7 +308,9 @@ pub fn compile_program(forms: &[Sexpr]) -> Result<Module, CompileError> {
     let mut entry = Chunk::new();
     let ctx = Ctx::top_level();
     for form in forms {
-        compile_expr(form, &ctx, &mut entry, &mut comp, 0)?;
+        // Never tail: each top-level form is followed by its own POP, so
+        // none of them is "the last thing" the entry chunk does.
+        compile_expr(form, &ctx, &mut entry, &mut comp, 0, false)?;
         entry.emit_pop();
     }
     entry.emit_halt();
@@ -320,12 +322,16 @@ pub fn compile_program(forms: &[Sexpr]) -> Result<Module, CompileError> {
 /// Compiles a body of expressions where all but the last are evaluated for
 /// effect and discarded, and the last one's value is left on the stack.
 /// Used for `begin` and, via [`compile_body`], for function/let bodies.
+/// `tail` describes whether *this sequence's own result* is itself in tail
+/// position (per spec 3.8) — only ever relevant to the last expression,
+/// since every earlier one is followed by a POP, not a return.
 fn compile_sequence(
     exprs: &[Sexpr],
     ctx: &Ctx,
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let Some((last, rest)) = exprs.split_last() else {
         let idx = chunk.add_const(Const::Unspecified);
@@ -333,10 +339,10 @@ fn compile_sequence(
         return Ok(());
     };
     for e in rest {
-        compile_expr(e, ctx, chunk, comp, depth)?;
+        compile_expr(e, ctx, chunk, comp, depth, false)?;
         chunk.emit_pop();
     }
-    compile_expr(last, ctx, chunk, comp, depth)
+    compile_expr(last, ctx, chunk, comp, depth, tail)
 }
 
 fn is_define_form(expr: &Sexpr) -> bool {
@@ -399,12 +405,13 @@ fn compile_body(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let split = exprs.iter().take_while(|e| is_define_form(e)).count();
     let (defines, rest) = exprs.split_at(split);
 
     if defines.is_empty() {
-        return compile_sequence(rest, ctx, chunk, comp, depth);
+        return compile_sequence(rest, ctx, chunk, comp, depth, tail);
     }
 
     let mut extended = ctx.clone();
@@ -419,12 +426,12 @@ fn compile_body(
         bindings.push((alias, init));
     }
     for (alias, init) in &bindings {
-        compile_expr(init, &extended, chunk, comp, depth + 1)?;
+        compile_expr(init, &extended, chunk, comp, depth + 1, false)?;
         let idx = chunk.add_const(Const::Symbol(alias.clone()));
         chunk.emit_def_global(idx);
         chunk.emit_pop();
     }
-    compile_sequence(rest, &extended, chunk, comp, depth)
+    compile_sequence(rest, &extended, chunk, comp, depth, tail)
 }
 
 /// Compiles `formals body...` into a new function chunk appended to the
@@ -459,7 +466,10 @@ fn compile_function(
     let mut fn_chunk = Chunk::new();
     fn_chunk.arity = arity;
     fn_chunk.has_rest = has_rest;
-    compile_body(body, &ctx, &mut fn_chunk, comp, depth + 1)?;
+    // A function's own body starts a fresh tail-position context: its last
+    // expression's value IS this function's return value, regardless of
+    // whatever tail status the *lambda-creating* expression itself had.
+    compile_body(body, &ctx, &mut fn_chunk, comp, depth + 1, true)?;
     fn_chunk.emit_return();
 
     let index = comp.module.functions.len() as u32;
@@ -483,6 +493,7 @@ fn compile_if(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     if items.len() < 3 || items.len() > 4 {
         return Err(err(
@@ -493,14 +504,14 @@ fn compile_if(
     let then_branch = &items[2];
     let else_branch = items.get(3);
 
-    compile_expr(condition, ctx, chunk, comp, depth + 1)?;
+    compile_expr(condition, ctx, chunk, comp, depth + 1, false)?;
     let else_jump = chunk.emit_jump(Op::JumpIfFalse);
-    compile_expr(then_branch, ctx, chunk, comp, depth + 1)?;
+    compile_expr(then_branch, ctx, chunk, comp, depth + 1, tail)?;
     let end_jump = chunk.emit_jump(Op::Jump);
 
     chunk.patch_jump(else_jump);
     match else_branch {
-        Some(else_expr) => compile_expr(else_expr, ctx, chunk, comp, depth + 1)?,
+        Some(else_expr) => compile_expr(else_expr, ctx, chunk, comp, depth + 1, tail)?,
         None => {
             let idx = chunk.add_const(Const::Unspecified);
             chunk.emit_const(idx);
@@ -521,7 +532,7 @@ fn compile_define(
     // run at the start of a body — compile_body handles that case) binds a
     // real global under its own literal name.
     let (name, value_expr) = extract_define_binding(items)?;
-    compile_expr(&value_expr, ctx, chunk, comp, depth + 1)?;
+    compile_expr(&value_expr, ctx, chunk, comp, depth + 1, false)?;
     let idx = chunk.add_const(Const::Symbol(name));
     chunk.emit_def_global(idx);
     Ok(())
@@ -552,9 +563,10 @@ fn compile_let(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     if let Some(Sexpr::Symbol(_)) = items.get(1) {
-        return compile_named_let(items, ctx, chunk, comp, depth);
+        return compile_named_let(items, ctx, chunk, comp, depth, tail);
     }
     let bindings_sexpr = items
         .get(1)
@@ -564,11 +576,11 @@ fn compile_let(
 
     let mut extended = ctx.clone();
     for (name, init) in &bindings {
-        compile_expr(init, ctx, chunk, comp, depth + 1)?;
+        compile_expr(init, ctx, chunk, comp, depth + 1, false)?;
         chunk.emit_push_local();
         extended.declare(name.clone())?;
     }
-    compile_body(body, &extended, chunk, comp, depth + 1)
+    compile_body(body, &extended, chunk, comp, depth + 1, tail)
 }
 
 /// `let*`: each binding expression sees every binding introduced before it
@@ -579,6 +591,7 @@ fn compile_let_star(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let bindings_sexpr = items
         .get(1)
@@ -588,11 +601,11 @@ fn compile_let_star(
 
     let mut extended = ctx.clone();
     for (name, init) in &bindings {
-        compile_expr(init, &extended, chunk, comp, depth + 1)?;
+        compile_expr(init, &extended, chunk, comp, depth + 1, false)?;
         chunk.emit_push_local();
         extended.declare(name.clone())?;
     }
-    compile_body(body, &extended, chunk, comp, depth + 1)
+    compile_body(body, &extended, chunk, comp, depth + 1, tail)
 }
 
 /// `letrec`: every binding sees every other binding, including itself —
@@ -606,6 +619,7 @@ fn compile_letrec(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let bindings_sexpr = items
         .get(1)
@@ -621,12 +635,12 @@ fn compile_letrec(
         aliased.push((alias, init.clone()));
     }
     for (alias, init) in &aliased {
-        compile_expr(init, &extended, chunk, comp, depth + 1)?;
+        compile_expr(init, &extended, chunk, comp, depth + 1, false)?;
         let idx = chunk.add_const(Const::Symbol(alias.clone()));
         chunk.emit_def_global(idx);
         chunk.emit_pop();
     }
-    compile_body(body, &extended, chunk, comp, depth + 1)
+    compile_body(body, &extended, chunk, comp, depth + 1, tail)
 }
 
 /// Named `let`: `(let loop ((v init) ...) body...)` desugars to a
@@ -638,6 +652,7 @@ fn compile_named_let(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let name = expect_symbol_name(&items[1])?;
     let bindings_sexpr = items
@@ -664,7 +679,7 @@ fn compile_named_let(
     let callee_idx = chunk.add_const(Const::Symbol(alias));
     chunk.emit_get_global(callee_idx);
     for (_, init) in &bindings {
-        compile_expr(init, ctx, chunk, comp, depth + 1)?;
+        compile_expr(init, ctx, chunk, comp, depth + 1, false)?;
     }
     if bindings.len() > u8::MAX as usize {
         return Err(err(format!(
@@ -672,7 +687,15 @@ fn compile_named_let(
             bindings.len()
         )));
     }
-    chunk.emit_call(bindings.len() as u8);
+    // This is the loop's *initial* invocation, from whatever context the
+    // named-let expression itself appears in -- if that context is tail
+    // position, this call inherits it (its own recursive self-calls are
+    // handled independently, inside the freshly-compiled loop body above).
+    if tail {
+        chunk.emit_tail_call(bindings.len() as u8);
+    } else {
+        chunk.emit_call(bindings.len() as u8);
+    }
     Ok(())
 }
 
@@ -695,6 +718,7 @@ fn compile_do(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let bindings_sexpr = items
         .get(1)
@@ -747,7 +771,7 @@ fn compile_do(
         let_bindings,
         if_form,
     ];
-    compile_named_let(&named_let, ctx, chunk, comp, depth)
+    compile_named_let(&named_let, ctx, chunk, comp, depth, tail)
 }
 
 /// `set!`: mutates an existing binding in place. Resolves the target the
@@ -766,7 +790,7 @@ fn compile_set(
         return Err(err("set! requires exactly a name and a value expression"));
     }
     let name = expect_symbol_name(&items[1])?;
-    compile_expr(&items[2], ctx, chunk, comp, depth + 1)?;
+    compile_expr(&items[2], ctx, chunk, comp, depth + 1, false)?;
     if let Some(slot) = ctx.resolve_local(&name) {
         chunk.emit_set_local(slot);
     } else if let Some(alias) = ctx.resolve_alias(&name) {
@@ -790,6 +814,7 @@ fn compile_and(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let exprs = &items[1..];
     let Some((last, rest)) = exprs.split_last() else {
@@ -799,12 +824,12 @@ fn compile_and(
     };
     let mut end_jumps = Vec::new();
     for e in rest {
-        compile_expr(e, ctx, chunk, comp, depth + 1)?;
+        compile_expr(e, ctx, chunk, comp, depth + 1, false)?;
         chunk.emit_dup();
         end_jumps.push(chunk.emit_jump(Op::JumpIfFalse));
         chunk.emit_pop();
     }
-    compile_expr(last, ctx, chunk, comp, depth + 1)?;
+    compile_expr(last, ctx, chunk, comp, depth + 1, tail)?;
     for j in end_jumps {
         chunk.patch_jump(j);
     }
@@ -820,6 +845,7 @@ fn compile_or(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let exprs = &items[1..];
     let Some((last, rest)) = exprs.split_last() else {
@@ -829,14 +855,14 @@ fn compile_or(
     };
     let mut end_jumps = Vec::new();
     for e in rest {
-        compile_expr(e, ctx, chunk, comp, depth + 1)?;
+        compile_expr(e, ctx, chunk, comp, depth + 1, false)?;
         chunk.emit_dup();
         let falsy = chunk.emit_jump(Op::JumpIfFalse);
         end_jumps.push(chunk.emit_jump(Op::Jump));
         chunk.patch_jump(falsy);
         chunk.emit_pop();
     }
-    compile_expr(last, ctx, chunk, comp, depth + 1)?;
+    compile_expr(last, ctx, chunk, comp, depth + 1, tail)?;
     for j in end_jumps {
         chunk.patch_jump(j);
     }
@@ -851,14 +877,15 @@ fn compile_when(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let condition = items
         .get(1)
         .ok_or_else(|| err("when requires a condition"))?;
     let body = &items[2..];
-    compile_expr(condition, ctx, chunk, comp, depth + 1)?;
+    compile_expr(condition, ctx, chunk, comp, depth + 1, false)?;
     let else_jump = chunk.emit_jump(Op::JumpIfFalse);
-    compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+    compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
     let end_jump = chunk.emit_jump(Op::Jump);
     chunk.patch_jump(else_jump);
     let idx = chunk.add_const(Const::Unspecified);
@@ -875,18 +902,19 @@ fn compile_unless(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let condition = items
         .get(1)
         .ok_or_else(|| err("unless requires a condition"))?;
     let body = &items[2..];
-    compile_expr(condition, ctx, chunk, comp, depth + 1)?;
+    compile_expr(condition, ctx, chunk, comp, depth + 1, false)?;
     let run_jump = chunk.emit_jump(Op::JumpIfFalse);
     let idx = chunk.add_const(Const::Unspecified);
     chunk.emit_const(idx);
     let end_jump = chunk.emit_jump(Op::Jump);
     chunk.patch_jump(run_jump);
-    compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+    compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
     chunk.patch_jump(end_jump);
     Ok(())
 }
@@ -901,6 +929,7 @@ fn compile_cond(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let clauses = &items[1..];
     let mut end_jumps = Vec::new();
@@ -915,7 +944,7 @@ fn compile_cond(
 
         let is_else = i == clauses.len() - 1 && matches!(test, Sexpr::Symbol(s) if s == "else");
         if is_else {
-            compile_sequence(rest, ctx, chunk, comp, depth + 1)?;
+            compile_sequence(rest, ctx, chunk, comp, depth + 1, tail)?;
             end_jumps.push(chunk.emit_jump(Op::Jump));
             continue;
         }
@@ -923,21 +952,25 @@ fn compile_cond(
         let is_arrow = rest.len() == 2 && matches!(&rest[0], Sexpr::Symbol(s) if s == "=>");
         if is_arrow {
             let func = &rest[1];
-            compile_expr(test, ctx, chunk, comp, depth + 1)?; // [t]
+            compile_expr(test, ctx, chunk, comp, depth + 1, false)?; // [t]
             chunk.emit_dup(); // [t, t]
             let skip = chunk.emit_jump(Op::JumpIfFalse); // pops one; falsy -> skip, leaves [t]
-            compile_expr(func, ctx, chunk, comp, depth + 1)?; // [t, f]
+            compile_expr(func, ctx, chunk, comp, depth + 1, false)?; // [t, f]
             chunk.emit_swap(); // [f, t]
-            chunk.emit_call(1); // [result]
+            if tail {
+                chunk.emit_tail_call(1);
+            } else {
+                chunk.emit_call(1); // [result]
+            }
             end_jumps.push(chunk.emit_jump(Op::Jump));
             chunk.patch_jump(skip);
             chunk.emit_pop(); // discard leftover t on the falsy path
             continue;
         }
 
-        compile_expr(test, ctx, chunk, comp, depth + 1)?;
+        compile_expr(test, ctx, chunk, comp, depth + 1, false)?;
         let skip = chunk.emit_jump(Op::JumpIfFalse);
-        compile_sequence(rest, ctx, chunk, comp, depth + 1)?;
+        compile_sequence(rest, ctx, chunk, comp, depth + 1, tail)?;
         end_jumps.push(chunk.emit_jump(Op::Jump));
         chunk.patch_jump(skip);
     }
@@ -960,13 +993,14 @@ fn compile_case(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     let key_expr = items
         .get(1)
         .ok_or_else(|| err("case requires a key expression"))?;
     let clauses = &items[2..];
 
-    compile_expr(key_expr, ctx, chunk, comp, depth + 1)?; // [k], kept live across every clause check
+    compile_expr(key_expr, ctx, chunk, comp, depth + 1, false)?; // [k], kept live across every clause check
 
     let mut end_jumps = Vec::new();
     let mut pending_next_clause: Vec<usize> = Vec::new();
@@ -985,7 +1019,7 @@ fn compile_case(
         let is_else = i == clauses.len() - 1 && matches!(selector, Sexpr::Symbol(s) if s == "else");
         if is_else {
             chunk.emit_pop(); // discard k, unused in the else body
-            compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+            compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
             end_jumps.push(chunk.emit_jump(Op::Jump));
             continue;
         }
@@ -1015,7 +1049,7 @@ fn compile_case(
             chunk.patch_jump(j);
         }
         chunk.emit_pop(); // discard k, unused in the body
-        compile_sequence(body, ctx, chunk, comp, depth + 1)?;
+        compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
         end_jumps.push(chunk.emit_jump(Op::Jump));
     }
 
@@ -1038,6 +1072,7 @@ fn compile_expr(
     chunk: &mut Chunk,
     comp: &mut Compilation,
     depth: usize,
+    tail: bool,
 ) -> Result<(), CompileError> {
     if depth > MAX_NESTING_DEPTH {
         return Err(too_deep());
@@ -1079,35 +1114,41 @@ fn compile_expr(
             if let Some(Sexpr::Symbol(op)) = items.first() {
                 match op.as_str() {
                     "quote" => return compile_quote(items, chunk),
-                    "if" => return compile_if(items, ctx, chunk, comp, depth),
+                    "if" => return compile_if(items, ctx, chunk, comp, depth, tail),
                     "define" => return compile_define(items, ctx, chunk, comp, depth),
                     "lambda" => return compile_lambda(items, ctx, chunk, comp, depth),
-                    "begin" => return compile_sequence(&items[1..], ctx, chunk, comp, depth + 1),
-                    "let" => return compile_let(items, ctx, chunk, comp, depth),
-                    "let*" => return compile_let_star(items, ctx, chunk, comp, depth),
-                    "letrec" => return compile_letrec(items, ctx, chunk, comp, depth),
+                    "begin" => {
+                        return compile_sequence(&items[1..], ctx, chunk, comp, depth + 1, tail);
+                    }
+                    "let" => return compile_let(items, ctx, chunk, comp, depth, tail),
+                    "let*" => return compile_let_star(items, ctx, chunk, comp, depth, tail),
+                    "letrec" => return compile_letrec(items, ctx, chunk, comp, depth, tail),
                     "set!" => return compile_set(items, ctx, chunk, comp, depth),
-                    "and" => return compile_and(items, ctx, chunk, comp, depth),
-                    "or" => return compile_or(items, ctx, chunk, comp, depth),
-                    "when" => return compile_when(items, ctx, chunk, comp, depth),
-                    "unless" => return compile_unless(items, ctx, chunk, comp, depth),
-                    "cond" => return compile_cond(items, ctx, chunk, comp, depth),
-                    "case" => return compile_case(items, ctx, chunk, comp, depth),
-                    "do" => return compile_do(items, ctx, chunk, comp, depth),
+                    "and" => return compile_and(items, ctx, chunk, comp, depth, tail),
+                    "or" => return compile_or(items, ctx, chunk, comp, depth, tail),
+                    "when" => return compile_when(items, ctx, chunk, comp, depth, tail),
+                    "unless" => return compile_unless(items, ctx, chunk, comp, depth, tail),
+                    "cond" => return compile_cond(items, ctx, chunk, comp, depth, tail),
+                    "case" => return compile_case(items, ctx, chunk, comp, depth, tail),
+                    "do" => return compile_do(items, ctx, chunk, comp, depth, tail),
                     _ => {}
                 }
             }
             let (callee, args) = items
                 .split_first()
                 .ok_or_else(|| err("cannot call the empty list ()"))?;
-            compile_expr(callee, ctx, chunk, comp, depth + 1)?;
+            compile_expr(callee, ctx, chunk, comp, depth + 1, false)?;
             for arg in args {
-                compile_expr(arg, ctx, chunk, comp, depth + 1)?;
+                compile_expr(arg, ctx, chunk, comp, depth + 1, false)?;
             }
             if args.len() > u8::MAX as usize {
                 return Err(err(format!("too many arguments in call: {}", args.len())));
             }
-            chunk.emit_call(args.len() as u8);
+            if tail {
+                chunk.emit_tail_call(args.len() as u8);
+            } else {
+                chunk.emit_call(args.len() as u8);
+            }
         }
     }
     Ok(())
@@ -1166,6 +1207,9 @@ mod tests {
             } else if op == Op::Call as u8 {
                 i += 1;
                 Op::Call
+            } else if op == Op::TailCall as u8 {
+                i += 1;
+                Op::TailCall
             } else if op == Op::Pop as u8 {
                 Op::Pop
             } else if op == Op::Return as u8 {
@@ -1531,13 +1575,14 @@ mod tests {
         let fn_chunk = &module.functions[0];
         assert_eq!(fn_chunk.arity, 2);
         assert!(!fn_chunk.has_rest);
+        // (+ a b) is add's own tail expression, so it's a TailCall (B6).
         assert_eq!(
             opcode_sequence(&fn_chunk.code),
             vec![
                 Op::GetGlobal,
                 Op::GetLocal,
                 Op::GetLocal,
-                Op::Call,
+                Op::TailCall,
                 Op::Return
             ]
         );
@@ -1713,10 +1758,11 @@ mod tests {
         let module = compile_program(&program).unwrap();
         assert_eq!(module.functions.len(), 2); // f's lambda body + entry
         let f_chunk = &module.functions[0];
-        // f's body calls itself: GET_GLOBAL(alias), GET_LOCAL(n), CALL, RETURN
+        // f's body calls itself in tail position: GET_GLOBAL(alias),
+        // GET_LOCAL(n), TAIL_CALL, RETURN (B6).
         assert_eq!(
             opcode_sequence(&f_chunk.code),
-            vec![Op::GetGlobal, Op::GetLocal, Op::Call, Op::Return]
+            vec![Op::GetGlobal, Op::GetLocal, Op::TailCall, Op::Return]
         );
         let entry = entry_of(&module);
         // the letrec body references f via the SAME alias (GET_GLOBAL, not GET_LOCAL)
@@ -2340,5 +2386,274 @@ mod tests {
                 list(vec![sym("else"), deep]),
             ])
         });
+    }
+
+    // B6: tail-call analysis. These tests pin down exactly which call sites
+    // become Op::TailCall (reusing the current native frame) versus
+    // Op::Call (a genuine, stack-consuming call) per spec 3.8's enumerated
+    // tail positions.
+
+    #[test]
+    fn top_level_call_is_never_a_tail_call() {
+        // Every top-level form is followed by its own POP (see
+        // compile_program), so none of them are ever in tail position, even
+        // though nothing textually follows the last one.
+        let program = [list(vec![sym("f")])];
+        let module = compile_program(&program).unwrap();
+        let entry = entry_of(&module);
+        assert_eq!(
+            opcode_sequence(&entry.code),
+            vec![Op::GetGlobal, Op::Call, Op::Pop, Op::Halt]
+        );
+    }
+
+    #[test]
+    fn if_condition_call_is_never_a_tail_call() {
+        // (lambda (n) (if (p n) 1 2)) -- the condition is never tail, even
+        // though the whole `if` is this function's own tail expression.
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("n")]),
+            list(vec![
+                sym("if"),
+                list(vec![sym("p"), sym("n")]),
+                Sexpr::Int(1),
+                Sexpr::Int(2),
+            ]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert!(ops.contains(&Op::Call));
+        assert!(!ops.contains(&Op::TailCall));
+    }
+
+    #[test]
+    fn if_branches_in_tail_position_emit_tail_call() {
+        // (lambda (n) (if n (f n) (g n))) -- the whole `if` is this
+        // function's own tail expression, so both branches' calls are
+        // tail calls.
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("n")]),
+            list(vec![
+                sym("if"),
+                sym("n"),
+                list(vec![sym("f"), sym("n")]),
+                list(vec![sym("g"), sym("n")]),
+            ]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::TailCall).count(),
+            2,
+            "both if-branches' calls should be tail calls: {ops:?}"
+        );
+        assert!(!ops.contains(&Op::Call));
+    }
+
+    #[test]
+    fn argument_position_call_is_never_a_tail_call() {
+        // (lambda (n) (h (f n))) -- the outer call to h IS this function's
+        // tail expression, but the inner (f n), being an argument, never is.
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("n")]),
+            list(vec![sym("h"), list(vec![sym("f"), sym("n")])]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::Call).count(),
+            1,
+            "inner (f n), an argument, must be a plain Call: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::TailCall).count(),
+            1,
+            "outer (h ...), the function's own tail expression, must be a TailCall: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn let_binding_init_call_is_never_tail_but_the_bodys_last_expr_is() {
+        // (lambda (n) (let ((x (g n))) (f x))) -- the binding init is never
+        // tail; the body's last expression inherits the let's own tail
+        // status, which here is the whole function's tail position.
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("n")]),
+            list(vec![
+                sym("let"),
+                list(vec![binding("x", list(vec![sym("g"), sym("n")]))]),
+                list(vec![sym("f"), sym("x")]),
+            ]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::Call).count(),
+            1,
+            "the binding init (g n) must be a plain Call: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::TailCall).count(),
+            1,
+            "the body's last expression (f x) must be a TailCall: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn named_let_loop_bodys_self_call_is_a_tail_call_regardless_of_the_named_lets_own_context() {
+        // (let loop ((i 0)) (loop i)) at the top level: the loop body's own
+        // self-call is ALWAYS a tail call (compile_function always starts a
+        // fresh tail context for a function's own body), even though the
+        // named-let expression itself sits in non-tail (top-level) context.
+        let program = [list(vec![
+            sym("let"),
+            sym("loop"),
+            list(vec![binding("i", Sexpr::Int(0))]),
+            list(vec![sym("loop"), sym("i")]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        assert_eq!(module.functions.len(), 2); // loop's body + entry
+        let loop_chunk = &module.functions[0];
+        assert_eq!(
+            opcode_sequence(&loop_chunk.code),
+            vec![Op::GetGlobal, Op::GetLocal, Op::TailCall, Op::Return],
+            "the loop body's own recursive self-call must be a TailCall"
+        );
+        // But the *initial* invocation, from this non-tail (top-level)
+        // context, must remain a plain Call.
+        let entry = entry_of(&module);
+        assert!(opcode_sequence(&entry.code).contains(&Op::Call));
+        assert!(!opcode_sequence(&entry.code).contains(&Op::TailCall));
+    }
+
+    #[test]
+    fn named_lets_initial_invocation_is_a_tail_call_when_the_named_let_itself_is_in_tail_position()
+    {
+        // (lambda () (let loop ((i 0)) i)) -- the named-let expression is
+        // this function's own tail expression, so its initial invocation
+        // (as opposed to the loop body's internal self-calls) is a
+        // TailCall too.
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![]),
+            list(vec![
+                sym("let"),
+                sym("loop"),
+                list(vec![binding("i", Sexpr::Int(0))]),
+                sym("i"),
+            ]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let outer_fn_chunk = &module.functions[1]; // loop's chunk is [0], the lambda's own chunk is [1]
+        let ops = opcode_sequence(&outer_fn_chunk.code);
+        assert!(
+            ops.contains(&Op::TailCall),
+            "the named-let's initial invocation must be a TailCall here: {ops:?}"
+        );
+        assert!(!ops.contains(&Op::Call));
+    }
+
+    #[test]
+    fn set_value_call_is_never_a_tail_call() {
+        // (lambda (x) (set! x (f x))) -- set!'s value expression is never
+        // in tail position, even though the whole set! is this function's
+        // own tail expression (its own result is Unspecified, not f's
+        // result).
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("x")]),
+            list(vec![sym("set!"), sym("x"), list(vec![sym("f"), sym("x")])]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert!(ops.contains(&Op::Call));
+        assert!(!ops.contains(&Op::TailCall));
+    }
+
+    #[test]
+    fn and_non_last_operand_call_is_never_tail_but_the_last_operand_is() {
+        // (lambda (n) (and (p n) (f n))) -- p's call, a non-last operand,
+        // is never tail; f's call, the last operand, inherits and's own
+        // tail status (here, the whole function's tail position).
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("n")]),
+            list(vec![
+                sym("and"),
+                list(vec![sym("p"), sym("n")]),
+                list(vec![sym("f"), sym("n")]),
+            ]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::Call).count(),
+            1,
+            "the non-last operand (p n) must be a plain Call: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::TailCall).count(),
+            1,
+            "the last operand (f n) must be a TailCall: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn cond_arrow_clause_application_is_a_tail_call_when_the_whole_cond_is() {
+        // (lambda (n) (cond (n => f))) -- the arrow clause's application of
+        // f to the test value inherits cond's own tail status.
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("n")]),
+            list(vec![sym("cond"), list(vec![sym("n"), sym("=>"), sym("f")])]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert!(
+            ops.contains(&Op::TailCall),
+            "the arrow clause's application must be a TailCall here: {ops:?}"
+        );
+        assert!(!ops.contains(&Op::Call));
+    }
+
+    #[test]
+    fn case_clause_body_call_is_a_tail_call_when_the_whole_case_is() {
+        // (lambda (n) (case n ((1) (f n)) (else (g n)))) -- both clause
+        // bodies inherit case's own tail status; the key expression itself
+        // never does (it's just an integer literal here, so it emits no
+        // call either way).
+        let program = [list(vec![
+            sym("lambda"),
+            list(vec![sym("n")]),
+            list(vec![
+                sym("case"),
+                sym("n"),
+                list(vec![
+                    list(vec![Sexpr::Int(1)]),
+                    list(vec![sym("f"), sym("n")]),
+                ]),
+                list(vec![sym("else"), list(vec![sym("g"), sym("n")])]),
+            ]),
+        ])];
+        let module = compile_program(&program).unwrap();
+        let fn_chunk = &module.functions[0];
+        let ops = opcode_sequence(&fn_chunk.code);
+        assert_eq!(
+            ops.iter().filter(|op| **op == Op::TailCall).count(),
+            2,
+            "both case-clause bodies must be tail calls: {ops:?}"
+        );
+        assert!(!ops.contains(&Op::Call));
     }
 }

@@ -31,6 +31,11 @@ pub enum Op {
     Eqv = 16,
     GetUpvalue = 17,
     SetUpvalue = 18,
+    /// Same operand format as `Call` (one `u8` argc), but tells the VM this
+    /// call is in tail position: reuse the current frame instead of
+    /// recursing, so a chain of tail calls runs in O(1) native stack space
+    /// regardless of length.
+    TailCall = 19,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +139,11 @@ impl Chunk {
 
     pub fn emit_call(&mut self, argc: u8) {
         self.code.push(Op::Call as u8);
+        self.code.push(argc);
+    }
+
+    pub fn emit_tail_call(&mut self, argc: u8) {
+        self.code.push(Op::TailCall as u8);
         self.code.push(argc);
     }
 

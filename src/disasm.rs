@@ -209,6 +209,17 @@ pub fn disassemble_chunk(chunk: &Chunk) -> String {
                     line
                 }
             },
+            op if op == Op::TailCall as u8 => match code.get(ip) {
+                Some(&argc) => {
+                    ip += 1;
+                    format!("TAIL_CALL     {argc}")
+                }
+                None => {
+                    let line = "TAIL_CALL     <truncated operand>".to_string();
+                    ip = code.len();
+                    line
+                }
+            },
             op if op == Op::Pop as u8 => "POP".to_string(),
             op if op == Op::Return as u8 => "RETURN".to_string(),
             op if op == Op::Halt as u8 => "HALT".to_string(),

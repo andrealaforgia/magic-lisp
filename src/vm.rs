@@ -93,23 +93,23 @@ fn symbol_name(c: &Const) -> Result<String, RuntimeError> {
     }
 }
 
-/// Caps native-Rust recursion depth across MagicLisp function calls (this
-/// language has no tail-call elimination yet, and every call is a real Rust
-/// stack frame — Value::Closure calling into Vm::exec calling back into
-/// Vm::call_value). Without this, ordinary, non-malicious recursive code
-/// (idiomatic recursion — including named-`let` iteration, B3's headline
-/// feature — can abort the whole process via native stack overflow instead
-/// of returning a clean RuntimeError (a security-review finding on B3).
+/// Caps native-Rust recursion depth across MagicLisp function calls made in
+/// non-tail position (B6 gave tail calls their own O(1)-space trampoline in
+/// `exec`, so only *genuine* non-tail recursion consumes native stack here —
+/// Value::Closure calling into Vm::exec calling back into Vm::call_value).
+/// Without this, ordinary, non-malicious deep recursion can abort the whole
+/// process via native stack overflow instead of returning a clean
+/// RuntimeError (a security-review finding on B3).
 ///
 /// Sized empirically, not guessed, against `run`'s dedicated `VM_STACK_SIZE`
-/// thread (see below): a debug build recursing with no depth guard at all
-/// natively overflows that 64 MiB stack at a call depth of roughly
-/// 7000-8000 (measured by bisection). 4000 keeps a healthy safety margin
-/// under that measured worst case while still giving ordinary recursive
-/// programs real headroom — e.g. a named-`let` loop summing 1..=1000 (which
-/// used to fail outright against this crate's old 512/128 limits, before
-/// `run` gave the VM its own generous stack) comfortably succeeds.
-const MAX_CALL_DEPTH: usize = 4000;
+/// thread (see below): with that stack, a debug build recursing with no
+/// depth guard at all natively overflows at a call depth of roughly
+/// 295,000-300,000 (measured by bisection: a non-tail-recursive sum,
+/// `(+ n (sum (- n 1)))`, run at increasing depths until it crashes).
+/// 150,000 keeps very close to a 2x safety margin under that measured worst
+/// case while comfortably clearing B6's requirement of correctly completing
+/// genuine (non-tail) recursion "on the order of 100,000" levels deep.
+const MAX_CALL_DEPTH: usize = 150_000;
 
 struct Vm<'m> {
     module: &'m Module,
@@ -157,192 +157,237 @@ fn upvalue_cell(
 impl<'m> Vm<'m> {
     fn exec(
         &mut self,
-        chunk: &Chunk,
-        locals: &mut Vec<Rc<RefCell<Value>>>,
-        env: Option<&Rc<Env>>,
+        mut chunk: &'m Chunk,
+        mut locals: Vec<Rc<RefCell<Value>>>,
+        mut env: Option<Rc<Env>>,
         out: &mut impl Write,
     ) -> Result<Value, RuntimeError> {
-        let mut stack: Vec<Value> = Vec::new();
-        let code = &chunk.code;
-        let mut ip = 0usize;
+        // A tail call (see Op::TailCall below) reassigns chunk/locals/env and
+        // `continue`s this outer loop instead of recursing into `exec`
+        // again, so a chain of tail calls of any length reuses this single
+        // native stack frame — the whole point of tail-call optimization.
+        'trampoline: loop {
+            let mut stack: Vec<Value> = Vec::new();
+            let code = &chunk.code;
+            let mut ip = 0usize;
 
-        // Every instruction is at least 1 byte and (for this language, which
-        // has no backward jumps yet) ip only ever moves forward within a
-        // single exec() call, so no correct program executes more than
-        // code.len() instructions here. This bounds total loop iterations
-        // independently of ip's own bookkeeping, so a broken operand-advance
-        // can never hang the interpreter — it fails cleanly instead.
-        let mut remaining_steps = step_budget_for(code.len());
+            // Every instruction is at least 1 byte and (for this language,
+            // which has no backward jumps yet) ip only ever moves forward
+            // within a single pass of this loop, so no correct program
+            // executes more than code.len() instructions here. This bounds
+            // total loop iterations independently of ip's own bookkeeping,
+            // so a broken operand-advance can never hang the interpreter —
+            // it fails cleanly instead.
+            let mut remaining_steps = step_budget_for(code.len());
 
-        loop {
-            if remaining_steps == 0 {
-                return Err(error(
-                    "exceeded the maximum instruction step budget (possible decoder bug)",
-                ));
-            }
-            remaining_steps = consume_step(remaining_steps);
+            loop {
+                if remaining_steps == 0 {
+                    return Err(error(
+                        "exceeded the maximum instruction step budget (possible decoder bug)",
+                    ));
+                }
+                remaining_steps = consume_step(remaining_steps);
 
-            let opcode = *code
-                .get(ip)
-                .ok_or_else(|| error("ran off the end of the instruction stream"))?;
-            ip += 1;
+                let opcode = *code
+                    .get(ip)
+                    .ok_or_else(|| error("ran off the end of the instruction stream"))?;
+                ip += 1;
 
-            match opcode {
-                op if op == Op::Const as u8 => {
-                    let idx = read_u32(code, &mut ip)?;
-                    stack.push(const_to_value(constant_at(chunk, idx)?));
-                }
-                op if op == Op::GetGlobal as u8 => {
-                    let idx = read_u32(code, &mut ip)?;
-                    let name = symbol_name(constant_at(chunk, idx)?)?;
-                    let value = self
-                        .globals
-                        .get(&name)
-                        .cloned()
-                        .ok_or_else(|| error(format!("unbound global: {name}")))?;
-                    stack.push(value);
-                }
-                op if op == Op::DefGlobal as u8 => {
-                    let idx = read_u32(code, &mut ip)?;
-                    let name = symbol_name(constant_at(chunk, idx)?)?;
-                    let value = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during DEF_GLOBAL"))?;
-                    self.globals.insert(name, value);
-                    stack.push(Value::Unspecified);
-                }
-                op if op == Op::GetLocal as u8 => {
-                    let slot = read_u8(code, &mut ip)? as usize;
-                    let cell = locals
-                        .get(slot)
-                        .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
-                    stack.push(cell.borrow().clone());
-                }
-                op if op == Op::SetLocal as u8 => {
-                    let slot = read_u8(code, &mut ip)? as usize;
-                    let value = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during SET_LOCAL"))?;
-                    let cell = locals
-                        .get(slot)
-                        .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
-                    *cell.borrow_mut() = value;
-                    stack.push(Value::Unspecified);
-                }
-                op if op == Op::GetUpvalue as u8 => {
-                    let depth = read_u8(code, &mut ip)?;
-                    let slot = read_u8(code, &mut ip)?;
-                    let cell = upvalue_cell(env, depth, slot)?;
-                    let value = cell.borrow().clone();
-                    stack.push(value);
-                }
-                op if op == Op::SetUpvalue as u8 => {
-                    let depth = read_u8(code, &mut ip)?;
-                    let slot = read_u8(code, &mut ip)?;
-                    let value = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during SET_UPVALUE"))?;
-                    let cell = upvalue_cell(env, depth, slot)?;
-                    *cell.borrow_mut() = value;
-                    stack.push(Value::Unspecified);
-                }
-                op if op == Op::SetGlobal as u8 => {
-                    let idx = read_u32(code, &mut ip)?;
-                    let name = symbol_name(constant_at(chunk, idx)?)?;
-                    let value = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during SET_GLOBAL"))?;
-                    if !self.globals.contains_key(&name) {
-                        return Err(error(format!("cannot set! undefined variable: {name}")));
+                match opcode {
+                    op if op == Op::Const as u8 => {
+                        let idx = read_u32(code, &mut ip)?;
+                        stack.push(const_to_value(constant_at(chunk, idx)?));
                     }
-                    self.globals.insert(name, value);
-                    stack.push(Value::Unspecified);
-                }
-                op if op == Op::PushLocal as u8 => {
-                    let value = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during PUSH_LOCAL"))?;
-                    locals.push(Rc::new(RefCell::new(value)));
-                }
-                op if op == Op::Dup as u8 => {
-                    let value = stack
-                        .last()
-                        .cloned()
-                        .ok_or_else(|| error("stack underflow during DUP"))?;
-                    stack.push(value);
-                }
-                op if op == Op::Swap as u8 => {
-                    let len = stack.len();
-                    if len < 2 {
-                        return Err(error("stack underflow during SWAP"));
+                    op if op == Op::GetGlobal as u8 => {
+                        let idx = read_u32(code, &mut ip)?;
+                        let name = symbol_name(constant_at(chunk, idx)?)?;
+                        let value = self
+                            .globals
+                            .get(&name)
+                            .cloned()
+                            .ok_or_else(|| error(format!("unbound global: {name}")))?;
+                        stack.push(value);
                     }
-                    stack.swap(len - 1, len - 2);
-                }
-                op if op == Op::Eqv as u8 => {
-                    let b = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during EQV"))?;
-                    let a = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during EQV"))?;
-                    stack.push(Value::Bool(a == b));
-                }
-                op if op == Op::MakeFunction as u8 => {
-                    let idx = read_u32(code, &mut ip)?;
-                    if idx as usize >= self.module.functions.len() {
-                        return Err(error(format!("function index {idx} out of range")));
+                    op if op == Op::DefGlobal as u8 => {
+                        let idx = read_u32(code, &mut ip)?;
+                        let name = symbol_name(constant_at(chunk, idx)?)?;
+                        let value = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during DEF_GLOBAL"))?;
+                        self.globals.insert(name, value);
+                        stack.push(Value::Unspecified);
                     }
-                    // Every function value closes over whatever this frame
-                    // currently has: its own locals (shared cells, not
-                    // copies — mutations after this point are still visible
-                    // through the closure) and whatever this frame itself
-                    // closed over, so nesting captures transitively. A
-                    // top-level define captures an empty, parentless
-                    // environment, which is indistinguishable from "no
-                    // captures" since nothing can ever resolve an upvalue
-                    // into it.
-                    let captured = Rc::new(Env {
-                        locals: locals.clone(),
-                        parent: env.cloned(),
-                    });
-                    stack.push(Value::Closure(idx, captured));
-                }
-                op if op == Op::Jump as u8 => {
-                    let target = read_u32(code, &mut ip)? as usize;
-                    ip = target;
-                }
-                op if op == Op::JumpIfFalse as u8 => {
-                    let target = read_u32(code, &mut ip)? as usize;
-                    let cond = stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during JUMP_IF_FALSE"))?;
-                    if !is_truthy(&cond) {
+                    op if op == Op::GetLocal as u8 => {
+                        let slot = read_u8(code, &mut ip)? as usize;
+                        let cell = locals
+                            .get(slot)
+                            .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
+                        stack.push(cell.borrow().clone());
+                    }
+                    op if op == Op::SetLocal as u8 => {
+                        let slot = read_u8(code, &mut ip)? as usize;
+                        let value = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during SET_LOCAL"))?;
+                        let cell = locals
+                            .get(slot)
+                            .ok_or_else(|| error(format!("local slot {slot} out of range")))?;
+                        *cell.borrow_mut() = value;
+                        stack.push(Value::Unspecified);
+                    }
+                    op if op == Op::GetUpvalue as u8 => {
+                        let depth = read_u8(code, &mut ip)?;
+                        let slot = read_u8(code, &mut ip)?;
+                        let cell = upvalue_cell(env.as_ref(), depth, slot)?;
+                        let value = cell.borrow().clone();
+                        stack.push(value);
+                    }
+                    op if op == Op::SetUpvalue as u8 => {
+                        let depth = read_u8(code, &mut ip)?;
+                        let slot = read_u8(code, &mut ip)?;
+                        let value = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during SET_UPVALUE"))?;
+                        let cell = upvalue_cell(env.as_ref(), depth, slot)?;
+                        *cell.borrow_mut() = value;
+                        stack.push(Value::Unspecified);
+                    }
+                    op if op == Op::SetGlobal as u8 => {
+                        let idx = read_u32(code, &mut ip)?;
+                        let name = symbol_name(constant_at(chunk, idx)?)?;
+                        let value = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during SET_GLOBAL"))?;
+                        if !self.globals.contains_key(&name) {
+                            return Err(error(format!("cannot set! undefined variable: {name}")));
+                        }
+                        self.globals.insert(name, value);
+                        stack.push(Value::Unspecified);
+                    }
+                    op if op == Op::PushLocal as u8 => {
+                        let value = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during PUSH_LOCAL"))?;
+                        locals.push(Rc::new(RefCell::new(value)));
+                    }
+                    op if op == Op::Dup as u8 => {
+                        let value = stack
+                            .last()
+                            .cloned()
+                            .ok_or_else(|| error("stack underflow during DUP"))?;
+                        stack.push(value);
+                    }
+                    op if op == Op::Swap as u8 => {
+                        let len = stack.len();
+                        if len < 2 {
+                            return Err(error("stack underflow during SWAP"));
+                        }
+                        stack.swap(len - 1, len - 2);
+                    }
+                    op if op == Op::Eqv as u8 => {
+                        let b = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during EQV"))?;
+                        let a = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during EQV"))?;
+                        stack.push(Value::Bool(a == b));
+                    }
+                    op if op == Op::MakeFunction as u8 => {
+                        let idx = read_u32(code, &mut ip)?;
+                        if idx as usize >= self.module.functions.len() {
+                            return Err(error(format!("function index {idx} out of range")));
+                        }
+                        // Every function value closes over whatever this frame
+                        // currently has: its own locals (shared cells, not
+                        // copies — mutations after this point are still visible
+                        // through the closure) and whatever this frame itself
+                        // closed over, so nesting captures transitively. A
+                        // top-level define captures an empty, parentless
+                        // environment, which is indistinguishable from "no
+                        // captures" since nothing can ever resolve an upvalue
+                        // into it.
+                        let captured = Rc::new(Env {
+                            locals: locals.clone(),
+                            parent: env.clone(),
+                        });
+                        stack.push(Value::Closure(idx, captured));
+                    }
+                    op if op == Op::Jump as u8 => {
+                        let target = read_u32(code, &mut ip)? as usize;
                         ip = target;
                     }
-                }
-                op if op == Op::Call as u8 => {
-                    let argc = read_u8(code, &mut ip)? as usize;
-                    if stack.len() < argc + 1 {
-                        return Err(error("stack underflow during CALL"));
+                    op if op == Op::JumpIfFalse as u8 => {
+                        let target = read_u32(code, &mut ip)? as usize;
+                        let cond = stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during JUMP_IF_FALSE"))?;
+                        if !is_truthy(&cond) {
+                            ip = target;
+                        }
                     }
-                    let args = stack.split_off(stack.len() - argc);
-                    let callee = stack.pop().unwrap();
-                    let result = self.call_value(&callee, args, out)?;
-                    stack.push(result);
+                    op if op == Op::Call as u8 => {
+                        let argc = read_u8(code, &mut ip)? as usize;
+                        if stack.len() < argc + 1 {
+                            return Err(error("stack underflow during CALL"));
+                        }
+                        let args = stack.split_off(stack.len() - argc);
+                        let callee = stack.pop().unwrap();
+                        let result = self.call_value(&callee, args, out)?;
+                        stack.push(result);
+                    }
+                    op if op == Op::TailCall as u8 => {
+                        let argc = read_u8(code, &mut ip)? as usize;
+                        if stack.len() < argc + 1 {
+                            return Err(error("stack underflow during TAIL_CALL"));
+                        }
+                        let args = stack.split_off(stack.len() - argc);
+                        let callee = stack.pop().unwrap();
+                        match callee {
+                            Value::Closure(idx, closure_env) => {
+                                // Reuse this native frame instead of recursing:
+                                // reassign the frame state and loop, rather than
+                                // calling exec() again. call_depth deliberately
+                                // stays untouched -- a tail call doesn't grow the
+                                // native stack, so it must not count against the
+                                // depth guard that exists to bound native
+                                // recursion.
+                                let next_chunk =
+                                    self.module.functions.get(idx as usize).ok_or_else(|| {
+                                        error(format!("function index {idx} out of range"))
+                                    })?;
+                                locals = bind_arguments(next_chunk, args)?;
+                                chunk = next_chunk;
+                                env = Some(closure_env);
+                                continue 'trampoline;
+                            }
+                            Value::Native(name) => {
+                                // A tail call to a native has no further
+                                // MagicLisp code following it by construction,
+                                // so its result is exec's own result.
+                                return call_native(&name, &args, out);
+                            }
+                            other => {
+                                return Err(error(format!(
+                                    "cannot call a non-procedure value: {other}"
+                                )));
+                            }
+                        }
+                    }
+                    op if op == Op::Pop as u8 => {
+                        stack
+                            .pop()
+                            .ok_or_else(|| error("stack underflow during POP"))?;
+                    }
+                    op if op == Op::Return as u8 => {
+                        return Ok(stack.pop().unwrap_or(Value::Unspecified));
+                    }
+                    op if op == Op::Halt as u8 => {
+                        out.flush().map_err(|e| error(e.to_string()))?;
+                        return Ok(Value::Unspecified);
+                    }
+                    other => return Err(error(format!("undefined opcode: {other}"))),
                 }
-                op if op == Op::Pop as u8 => {
-                    stack
-                        .pop()
-                        .ok_or_else(|| error("stack underflow during POP"))?;
-                }
-                op if op == Op::Return as u8 => {
-                    return Ok(stack.pop().unwrap_or(Value::Unspecified));
-                }
-                op if op == Op::Halt as u8 => {
-                    out.flush().map_err(|e| error(e.to_string()))?;
-                    return Ok(Value::Unspecified);
-                }
-                other => return Err(error(format!("undefined opcode: {other}"))),
             }
         }
     }
@@ -366,9 +411,9 @@ impl<'m> Vm<'m> {
                     .functions
                     .get(*idx as usize)
                     .ok_or_else(|| error(format!("function index {idx} out of range")))?;
-                let mut locals = bind_arguments(chunk, args)?;
+                let locals = bind_arguments(chunk, args)?;
                 self.call_depth += 1;
-                let result = self.exec(chunk, &mut locals, Some(closure_env), out);
+                let result = self.exec(chunk, locals, Some(closure_env.clone()), out);
                 self.call_depth -= 1;
                 result
             }
@@ -414,12 +459,14 @@ fn bind_arguments(
 /// rather than whatever stack the caller happens to be running on (which
 /// might be a constrained default, e.g. 2 MiB on a spawned thread). This
 /// makes MAX_CALL_DEPTH's safety margin a property of the interpreter
-/// itself instead of an accident of the caller's environment, and gives
-/// ordinary non-tail-recursive MagicLisp programs (this language has no
-/// TCO yet, so idiomatic recursion — including named-`let` iteration,
-/// B3's headline feature — burns one native frame per call) real, usable
-/// headroom instead of failing on loops of only a few hundred iterations.
-const VM_STACK_SIZE: usize = 64 * 1024 * 1024;
+/// itself instead of an accident of the caller's environment. Tail-recursive
+/// MagicLisp code (B6) runs in O(1) native stack regardless of length, but
+/// genuine non-tail recursion still burns one native frame per call, and
+/// B6 requires that to reach on the order of 100,000 levels deep — this
+/// stack size (raised from B3-era's 64 MiB) is what makes a MAX_CALL_DEPTH
+/// that high survivable without ever reaching real hardware stack overflow;
+/// see MAX_CALL_DEPTH's own doc comment for the bisected numbers.
+const VM_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
 
 /// Runs `module` to completion on a dedicated `VM_STACK_SIZE` thread.
 ///
@@ -473,8 +520,7 @@ fn run_on_this_thread(module: &Module, out: &mut impl Write) -> Result<(), Runti
         .functions
         .get(module.entry_index as usize)
         .ok_or_else(|| error("entry function index out of range"))?;
-    let mut locals = Vec::new();
-    vm.exec(entry, &mut locals, None, out)?;
+    vm.exec(entry, Vec::new(), None, out)?;
     Ok(())
 }
 
@@ -932,6 +978,15 @@ mod tests {
         assert!(run(&module_of(chunk), &mut out).is_err());
     }
 
+    // These count-down tests wrap the recursive call as `(+ 0 (count-down
+    // ...))` rather than calling it directly in tail position: since B6
+    // gave the compiler tail-call optimization, a bare tail self-call would
+    // compile to Op::TailCall and run in O(1) native stack regardless of
+    // depth, never touching call_depth at all -- defeating the point of
+    // these tests. Wrapping the call as a `+` argument keeps it in
+    // non-tail position, so it still compiles to a real, stack-consuming
+    // Op::Call and genuinely exercises the call_depth guard.
+
     #[test]
     fn recursion_up_to_the_call_depth_limit_still_succeeds() {
         // MAX_CALL_DEPTH - 1 recursive steps plus the initial call is
@@ -940,7 +995,7 @@ mod tests {
         // the limit *before* incrementing), so this is the deepest
         // recursion the guard is supposed to still allow.
         let src = format!(
-            "(define (count-down n) (if (= n 0) 0 (count-down (- n 1)))) \
+            "(define (count-down n) (if (= n 0) 0 (+ 0 (count-down (- n 1))))) \
              (display (count-down {}))",
             MAX_CALL_DEPTH - 1
         );
@@ -955,7 +1010,7 @@ mod tests {
         // whole test process via native stack overflow instead of failing
         // a single test (a security-review finding on B3).
         let src = format!(
-            "(define (count-down n) (if (= n 0) 0 (count-down (- n 1)))) \
+            "(define (count-down n) (if (= n 0) 0 (+ 0 (count-down (- n 1))))) \
              (display (count-down {}))",
             MAX_CALL_DEPTH
         );
@@ -976,7 +1031,7 @@ mod tests {
         // passes if the first call's depth accounting is fully unwound
         // before the second one starts.
         let src = format!(
-            "(define (count-down n) (if (= n 0) 0 (count-down (- n 1)))) \
+            "(define (count-down n) (if (= n 0) 0 (+ 0 (count-down (- n 1))))) \
              (display (count-down {n})) (display (count-down {n}))",
             n = MAX_CALL_DEPTH - 10
         );
@@ -1001,8 +1056,13 @@ mod tests {
         // into call_value here bypasses that wrapper, so this test spawns
         // its own equivalently-sized thread rather than relying on the
         // ambient (possibly much smaller) test-thread stack.
+        // As in the tests above, the recursive call is wrapped in `(+ 0 ...)`
+        // to keep it out of tail position -- otherwise B6's tail-call
+        // optimization would compile it to a stack-reusing Op::TailCall
+        // that never touches call_depth at all.
         let forms =
-            read_program("(define (count-down n) (if (= n 0) 0 (count-down (- n 1))))").unwrap();
+            read_program("(define (count-down n) (if (= n 0) 0 (+ 0 (count-down (- n 1)))))")
+                .unwrap();
         let module = compile_program(&forms).unwrap();
         std::thread::scope(|scope| {
             std::thread::Builder::new()
@@ -1015,7 +1075,7 @@ mod tests {
                     };
                     let mut out = Vec::new();
                     let entry = &module.functions[module.entry_index as usize];
-                    vm.exec(entry, &mut Vec::new(), None, &mut out).unwrap();
+                    vm.exec(entry, Vec::new(), None, &mut out).unwrap();
                     let count_down = vm.globals.get("count-down").cloned().unwrap();
 
                     let over_limit = vm.call_value(
@@ -1097,6 +1157,29 @@ mod tests {
         let err = run(&module_of(chunk), &mut out).unwrap_err();
         assert!(
             err.message.contains("stack underflow during CALL"),
+            "expected a stack-underflow error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_tail_call_with_exactly_argc_items_and_no_callee_underneath_is_a_clean_error_not_a_panic() {
+        // Same shape and same reasoning as the CALL test just above, but for
+        // Op::TailCall's own, separately-implemented underflow check (a
+        // mutation-testing gap: TailCall's `stack.len() < argc + 1` guard is
+        // never exercised by any compiler-emitted program, since the
+        // compiler only ever emits it with a well-formed stack -- only a
+        // hand-built chunk like this one can drive it).
+        use crate::bytecode::Const;
+        let mut chunk = Chunk::new();
+        let one = chunk.add_const(Const::Int(1));
+        chunk.emit_const(one);
+        chunk.emit_tail_call(1);
+        chunk.emit_halt();
+        let mut out = Vec::new();
+        let err = run(&module_of(chunk), &mut out).unwrap_err();
+        assert!(
+            err.message.contains("stack underflow during TAIL_CALL"),
             "expected a stack-underflow error, got: {}",
             err.message
         );
@@ -1497,5 +1580,95 @@ mod tests {
         chunk.emit_pop();
         chunk.emit_halt();
         assert_eq!(run_to_string(chunk).unwrap(), "#t#f");
+    }
+
+    // B6: tail-call trampoline. These tests exercise the VM's own O(1)-space
+    // reuse of the current native frame for Op::TailCall, as distinct from
+    // the compiler-level tests (in compiler.rs) that pin down *which* call
+    // sites become TailCall in the first place.
+
+    #[test]
+    fn a_self_tail_recursive_loop_runs_far_beyond_max_call_depth_without_error() {
+        // If TailCall recursed into exec() like an ordinary Call instead of
+        // trampolining, this would either hit the MAX_CALL_DEPTH guard or
+        // overflow the native stack. Running well past MAX_CALL_DEPTH
+        // iterations and getting the correct answer proves the loop body's
+        // self-call never grows the call stack at all.
+        let src = format!(
+            "(define (loop n limit) (if (= n limit) n (loop (+ n 1) limit))) \
+             (display (loop 0 {}))",
+            MAX_CALL_DEPTH * 5
+        );
+        assert_eq!(eval(&src).unwrap(), (MAX_CALL_DEPTH * 5).to_string());
+    }
+
+    #[test]
+    fn mutual_tail_recursion_runs_far_beyond_max_call_depth_without_error() {
+        // Same guarantee as the self-recursive case above, but for two
+        // functions calling each other back and forth, each time as the
+        // last action (B6's DEMO 2 shape).
+        let src = format!(
+            "(define (ev? n) (if (= n 0) #t (od? (- n 1)))) \
+             (define (od? n) (if (= n 0) #f (ev? (- n 1)))) \
+             (display (ev? {}))",
+            MAX_CALL_DEPTH * 5
+        );
+        assert_eq!(eval(&src).unwrap(), "#t");
+    }
+
+    #[test]
+    fn call_depth_does_not_grow_across_a_tail_recursive_chain() {
+        // White-box check on the same guarantee as the test above, from the
+        // other direction: after a self-tail-recursive loop of many more
+        // iterations than MAX_CALL_DEPTH returns, call_depth must be back
+        // to exactly 0 -- the single non-tail invocation from call_value
+        // below is the only thing that ever incremented it; every iteration
+        // inside the loop reused that one frame via Op::TailCall.
+        let forms = read_program("(define (loop n limit) (if (= n limit) n (loop (+ n 1) limit)))")
+            .unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut vm = Vm {
+            module: &module,
+            globals: default_globals(),
+            call_depth: 0,
+        };
+        let mut out = Vec::new();
+        let entry = &module.functions[module.entry_index as usize];
+        vm.exec(entry, Vec::new(), None, &mut out).unwrap();
+        let loop_fn = vm.globals.get("loop").cloned().unwrap();
+
+        let limit = (MAX_CALL_DEPTH * 5) as i64;
+        let result = vm
+            .call_value(&loop_fn, vec![Value::Int(0), Value::Int(limit)], &mut out)
+            .unwrap();
+
+        assert_eq!(result, Value::Int(limit));
+        assert_eq!(
+            vm.call_depth, 0,
+            "call_depth must be fully unwound after a tail-recursive call returns, \
+             not left elevated by iterations that should have reused one frame"
+        );
+    }
+
+    #[test]
+    fn disassembly_distinguishes_tail_call_from_an_ordinary_call() {
+        // (define (add a b) (+ a b)) -- add's own tail expression is a
+        // TailCall; ensure the disassembler labels it distinctly rather
+        // than folding it into the same mnemonic as an ordinary CALL.
+        let forms = read_program("(define (add a b) (+ a b))").unwrap();
+        let module = compile_program(&forms).unwrap();
+        let add_chunk = &module.functions[0];
+        let listing = crate::disasm::disassemble_chunk(add_chunk);
+        assert!(
+            listing.contains("TAIL_CALL"),
+            "expected a TAIL_CALL mnemonic in: {listing}"
+        );
+        let has_bare_call = listing
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some("CALL"));
+        assert!(
+            !has_bare_call,
+            "add's body has exactly one call, and it's a tail call, not a plain CALL: {listing}"
+        );
     }
 }
