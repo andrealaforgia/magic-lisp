@@ -29,6 +29,8 @@ mod steps_b6;
 mod steps_b7;
 #[path = "features/steps_b8.rs"]
 mod steps_b8;
+#[path = "features/steps_b9.rs"]
+mod steps_b9;
 
 #[test]
 fn b1_walking_skeleton() {
@@ -92,4 +94,10 @@ fn b8_type_predicates_and_equality() {
         src,
         &steps_b8::registry(),
     );
+}
+
+#[test]
+fn b9_pairs_and_lists() {
+    let src = include_str!("../features/B9-pairs-and-lists.feature");
+    registry::run_feature("B9-pairs-and-lists", src, &steps_b9::registry());
 }
