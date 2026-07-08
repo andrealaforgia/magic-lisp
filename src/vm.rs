@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 99] = [
+const NATIVE_NAMES: [&str; 106] = [
     "display",
     "newline",
     "+",
@@ -130,6 +130,13 @@ const NATIVE_NAMES: [&str; 99] = [
     "string->list",
     "string-upcase",
     "string-downcase",
+    "char->integer",
+    "integer->char",
+    "char=?",
+    "char<?",
+    "char-alphabetic?",
+    "char-numeric?",
+    "char-whitespace?",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -786,6 +793,47 @@ fn call_native(
                 "string-downcase expects a string, found {other}"
             ))),
         }),
+        "char->integer" => native_unary("char->integer", args, |v| match v {
+            Value::Char(c) => Ok(Value::Int(*c as i64)),
+            other => Err(error(format!(
+                "char->integer expects a character, found {other}"
+            ))),
+        }),
+        "integer->char" => native_unary("integer->char", args, |v| match v {
+            Value::Int(n) => u32::try_from(*n)
+                .ok()
+                .and_then(char::from_u32)
+                .map(Value::Char)
+                .ok_or_else(|| error(format!("integer->char: {n} is not a valid character code"))),
+            other => Err(error(format!(
+                "integer->char expects an integer, found {other}"
+            ))),
+        }),
+        "char=?" => native_binary_predicate(
+            "char=?",
+            args,
+            |a, b| matches!((a, b), (Value::Char(x), Value::Char(y)) if x == y),
+        ),
+        "char<?" => native_binary_predicate(
+            "char<?",
+            args,
+            |a, b| matches!((a, b), (Value::Char(x), Value::Char(y)) if x < y),
+        ),
+        "char-alphabetic?" => native_type_predicate(
+            "char-alphabetic?",
+            args,
+            |v| matches!(v, Value::Char(c) if c.is_alphabetic()),
+        ),
+        "char-numeric?" => native_type_predicate(
+            "char-numeric?",
+            args,
+            |v| matches!(v, Value::Char(c) if c.is_numeric()),
+        ),
+        "char-whitespace?" => native_type_predicate(
+            "char-whitespace?",
+            args,
+            |v| matches!(v, Value::Char(c) if c.is_whitespace()),
+        ),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -4482,5 +4530,47 @@ mod tests {
     #[test]
     fn string_downcase_converts_to_all_lowercase() {
         assert_eq!(eval("(display (string-downcase \"ABC\"))").unwrap(), "abc");
+    }
+
+    // --- B10 E5: char<->integer, char=?/char<?, char predicates (spec 6.2) ---
+
+    #[test]
+    fn char_to_integer_of_a_gives_its_code_point() {
+        assert_eq!(eval("(display (char->integer #\\A))").unwrap(), "65");
+    }
+
+    #[test]
+    fn integer_to_char_of_66_gives_b() {
+        assert_eq!(eval("(display (integer->char 66))").unwrap(), "B");
+    }
+
+    #[test]
+    fn char_equal_is_shown_both_true_and_false() {
+        assert_eq!(eval("(display (char=? #\\a #\\a))").unwrap(), "#t");
+        assert_eq!(eval("(display (char=? #\\a #\\b))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn char_less_than_is_shown_both_true_and_false() {
+        assert_eq!(eval("(display (char<? #\\a #\\b))").unwrap(), "#t");
+        assert_eq!(eval("(display (char<? #\\b #\\a))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn char_alphabetic_is_shown_both_true_and_false() {
+        assert_eq!(eval("(display (char-alphabetic? #\\a))").unwrap(), "#t");
+        assert_eq!(eval("(display (char-alphabetic? #\\5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn char_numeric_is_shown_both_true_and_false() {
+        assert_eq!(eval("(display (char-numeric? #\\5))").unwrap(), "#t");
+        assert_eq!(eval("(display (char-numeric? #\\a))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn char_whitespace_is_shown_both_true_and_false() {
+        assert_eq!(eval("(display (char-whitespace? #\\space))").unwrap(), "#t");
+        assert_eq!(eval("(display (char-whitespace? #\\a))").unwrap(), "#f");
     }
 }
