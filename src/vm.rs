@@ -3901,4 +3901,31 @@ mod tests {
         assert_eq!(eval("(display (quote (1 2 . 3)))").unwrap(), "(1 2 . 3)");
         assert_eq!(eval("(display (list? (quote (1 2 . 3))))").unwrap(), "#f");
     }
+
+    // --- B9 E9: integration: all fourteen demo expressions in one program ---
+
+    #[test]
+    fn all_fourteen_demo_expressions_produce_exactly_the_prescribed_output() {
+        assert_eq!(
+            eval(
+                "(display (car (quote (1 2 3)))) (newline) \
+                 (display (cadr (quote (1 2 3)))) (newline) \
+                 (display (length (quote (a b c)))) (newline) \
+                 (display (append (list 1 2) (list 3 4))) (newline) \
+                 (display (reverse (list 1 2 3))) (newline) \
+                 (display (map (lambda (x) (* x x)) (list 1 2 3))) (newline) \
+                 (display (map + (list 1 2 3) (list 10 20 30))) (newline) \
+                 (display (filter odd? (list 1 2 3 4 5))) (newline) \
+                 (display (fold-left + 0 (list 1 2 3 4))) (newline) \
+                 (display (fold-right cons (quote ()) (list 1 2 3))) (newline) \
+                 (display (reduce + 0 (list 1 2 3 4))) (newline) \
+                 (display (apply + 1 2 (list 3 4))) (newline) \
+                 (display (assoc 2 (list (cons 1 (quote a)) (cons 2 (quote b))))) (newline) \
+                 (display (member 2 (list 1 2 3))) (newline)"
+            )
+            .unwrap(),
+            "1\n2\n3\n(1 2 3 4)\n(3 2 1)\n(1 4 9)\n(11 22 33)\n(1 3 5)\n\
+             10\n(1 2 3)\n10\n10\n(2 . b)\n(2 3)\n"
+        );
+    }
 }
