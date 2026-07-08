@@ -5897,6 +5897,30 @@ mod tests {
         assert_eq!(eval("(display `())").unwrap(), "()");
     }
 
+    #[test]
+    fn quasiquoting_a_dotted_pair_template_produces_the_literal_pair() {
+        // Regression test for warden security review msg #221: the
+        // DottedList arm previously routed through `append`, which
+        // requires both arguments to be proper lists -- a dotted
+        // template's tail is exactly the value that isn't one, so this
+        // used to crash at runtime instead of producing the literal pair
+        // `(quote (a . b))` correctly does.
+        assert_eq!(eval("(display `(a . b))").unwrap(), "(a . b)");
+    }
+
+    #[test]
+    fn quasiquoting_a_multi_element_dotted_list_template_produces_the_literal_dotted_list() {
+        assert_eq!(eval("(display `(a b . c))").unwrap(), "(a b . c)");
+    }
+
+    #[test]
+    fn quasiquoting_a_dotted_pair_template_with_an_unquoted_tail() {
+        assert_eq!(
+            eval("(define x 10) (display `(a . ,x))").unwrap(),
+            "(a . 10)"
+        );
+    }
+
     // --- B13 E5: both markers work inside a vector template too ---
 
     #[test]

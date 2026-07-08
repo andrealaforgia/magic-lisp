@@ -609,9 +609,22 @@ fn expand_quasiquote(template: &Sexpr, level: u32) -> Result<Sexpr, CompileError
             ]))
         }
         Sexpr::DottedList(items, tail) => {
+            // NOT `append`: `append`'s second argument must itself be a
+            // proper list (spec 5.1), but a dotted template's tail is
+            // exactly the value that ISN'T one. `(fold-right cons tail
+            // head-list)` builds the correct cons chain ending in
+            // whatever `tail` evaluates to, proper list or not, reusing
+            // two more already-existing natives (warden security review
+            // msg #221: this previously crashed at runtime with an
+            // "append expects a proper list" error for e.g. `` `(a . b) ``).
             let head = expand_qq_sequence(items, level)?;
             let expanded_tail = expand_quasiquote(tail, level)?;
-            Ok(qq_append(head, expanded_tail))
+            Ok(Sexpr::List(vec![
+                Sexpr::Symbol("fold-right".to_string()),
+                Sexpr::Symbol("cons".to_string()),
+                expanded_tail,
+                head,
+            ]))
         }
         // An atomic/self-evaluating datum (or a plain symbol -- data here,
         // not a variable reference): literal, unchanged regardless of level.
