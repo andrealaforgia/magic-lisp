@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 86] = [
+const NATIVE_NAMES: [&str; 90] = [
     "display",
     "newline",
     "+",
@@ -116,6 +116,11 @@ const NATIVE_NAMES: [&str; 86] = [
     "fold-right",
     "reduce",
     "apply",
+    // B10: strings and characters (spec 6.1, 6.2).
+    "string-length",
+    "string-ref",
+    "substring",
+    "string-append",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -749,6 +754,10 @@ fn call_native(
         "fold-right" => native_fold_right(vm, args, out),
         "reduce" => native_reduce(vm, args, out),
         "apply" => native_apply(vm, args, out),
+        "string-length" => native_string_length(args),
+        "string-ref" => native_string_ref(args),
+        "substring" => native_substring(args),
+        "string-append" => native_string_append(args),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -1237,6 +1246,74 @@ fn native_apply(vm: &mut Vm, args: &[Value], out: &mut impl Write) -> Result<Val
     let mut call_args = direct.to_vec();
     call_args.extend(list_to_vec("apply", trailing)?);
     vm.call_value(proc, call_args, out)
+}
+
+/// Counts by displayed character, not by underlying UTF-8 byte -- a
+/// multi-byte character still counts as exactly one position (spec 6.1's
+/// own BOUNDARIES: internal string encoding isn't observable).
+fn native_string_length(args: &[Value]) -> Result<Value, RuntimeError> {
+    native_unary("string-length", args, |v| match v {
+        Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+        other => Err(error(format!(
+            "string-length expects a string, found {other}"
+        ))),
+    })
+}
+
+fn native_string_ref(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [Value::Str(s), Value::Int(idx)] = args else {
+        return Err(error(format!(
+            "string-ref expects a string and an integer index, got {} argument(s)",
+            args.len()
+        )));
+    };
+    usize::try_from(*idx)
+        .ok()
+        .and_then(|i| s.chars().nth(i))
+        .map(Value::Char)
+        .ok_or_else(|| error(format!("string-ref index {idx} is out of range")))
+}
+
+/// `start` inclusive, `end` exclusive, both counted by character.
+fn native_substring(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [Value::Str(s), Value::Int(start), Value::Int(end)] = args else {
+        return Err(error(format!(
+            "substring expects a string and two integer indices, got {} argument(s)",
+            args.len()
+        )));
+    };
+    let (start, end) = match (usize::try_from(*start), usize::try_from(*end)) {
+        (Ok(start), Ok(end)) if start <= end => (start, end),
+        _ => {
+            return Err(error(format!("substring range {start}..{end} is invalid")));
+        }
+    };
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .get(start..end)
+        .map(|slice| Value::Str(Rc::new(slice.iter().collect())))
+        .ok_or_else(|| error(format!("substring range {start}..{end} is out of bounds")))
+}
+
+fn native_string_append(args: &[Value]) -> Result<Value, RuntimeError> {
+    if args.len() < 2 {
+        return Err(error(format!(
+            "string-append expects at least 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let mut result = String::new();
+    for arg in args {
+        match arg {
+            Value::Str(s) => result.push_str(s),
+            other => {
+                return Err(error(format!(
+                    "string-append expects a string, found {other}"
+                )));
+            }
+        }
+    }
+    Ok(Value::Str(Rc::new(result)))
 }
 
 /// A non-empty list is, per real Scheme semantics, built from pairs -- so
@@ -4189,5 +4266,48 @@ mod tests {
     #[test]
     fn last_pair_on_a_trivially_short_cyclic_pair_is_a_clean_error_not_a_hang() {
         assert!(eval("(define p (cons 1 2)) (set-cdr! p p) (display (last-pair p))").is_err());
+    }
+
+    // --- B10 E1: string length, ref, substring, append (spec 6.1) ---
+
+    #[test]
+    fn string_length_of_hello_is_five() {
+        assert_eq!(eval("(display (string-length \"hello\"))").unwrap(), "5");
+    }
+
+    #[test]
+    fn string_ref_at_position_one_of_hello_is_e() {
+        assert_eq!(eval("(display (string-ref \"hello\" 1))").unwrap(), "e");
+    }
+
+    #[test]
+    fn substring_from_one_to_four_of_hello_is_ell() {
+        assert_eq!(eval("(display (substring \"hello\" 1 4))").unwrap(), "ell");
+    }
+
+    #[test]
+    fn string_append_joins_three_or_more_strings() {
+        assert_eq!(
+            eval("(display (string-append \"foo\" \"bar\" \"baz\"))").unwrap(),
+            "foobarbaz"
+        );
+    }
+
+    #[test]
+    fn string_append_joins_two_strings() {
+        assert_eq!(
+            eval("(display (string-append \"foo\" \"bar\"))").unwrap(),
+            "foobar"
+        );
+    }
+
+    #[test]
+    fn string_ref_out_of_bounds_is_a_clean_runtime_error() {
+        assert!(eval("(display (string-ref \"hello\" 5))").is_err());
+    }
+
+    #[test]
+    fn substring_out_of_bounds_is_a_clean_runtime_error() {
+        assert!(eval("(display (substring \"hello\" 1 10))").is_err());
     }
 }
