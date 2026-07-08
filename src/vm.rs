@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 79] = [
+const NATIVE_NAMES: [&str; 82] = [
     "display",
     "newline",
     "+",
@@ -109,6 +109,9 @@ const NATIVE_NAMES: [&str; 79] = [
     "assoc",
     "assv",
     "assq",
+    "map",
+    "for-each",
+    "filter",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -451,7 +454,7 @@ impl<'m> Vm<'m> {
                                 // A tail call to a native has no further
                                 // MagicLisp code following it by construction,
                                 // so its result is exec's own result.
-                                return call_native(&name, &args, out);
+                                return call_native(self, &name, &args, out);
                             }
                             other => {
                                 return Err(error(format!(
@@ -485,7 +488,7 @@ impl<'m> Vm<'m> {
         out: &mut impl Write,
     ) -> Result<Value, RuntimeError> {
         match callee {
-            Value::Native(name) => call_native(name, &args, out),
+            Value::Native(name) => call_native(self, name, &args, out),
             Value::Closure(idx, closure_env) => {
                 if self.call_depth >= MAX_CALL_DEPTH {
                     return Err(error(format!(
@@ -610,7 +613,12 @@ fn run_on_this_thread(module: &Module, out: &mut impl Write) -> Result<(), Runti
     Ok(())
 }
 
-fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value, RuntimeError> {
+fn call_native(
+    vm: &mut Vm,
+    name: &str,
+    args: &[Value],
+    out: &mut impl Write,
+) -> Result<Value, RuntimeError> {
     match name {
         "display" => {
             let value = args
@@ -706,6 +714,9 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
         "assoc" => native_assoc("assoc", args, value_equal),
         "assv" => native_assoc("assv", args, value_eqv),
         "assq" => native_assoc("assq", args, value_eqv),
+        "map" => native_map(vm, args, out),
+        "for-each" => native_for_each(vm, args, out),
+        "filter" => native_filter(vm, args, out),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -981,6 +992,81 @@ fn native_assoc(
         }
     }
     Ok(Value::Bool(false))
+}
+
+/// Flattens `map`/`for-each`'s trailing list arguments into one `Vec` of
+/// equal-length `Vec<Value>` rows, erroring if any of them differ in
+/// length -- both natives call an N-ary procedure once per position across
+/// all of them in parallel, so a length mismatch has no sensible pairing.
+fn parallel_list_rows(opname: &str, lists: &[Value]) -> Result<Vec<Vec<Value>>, RuntimeError> {
+    let columns = lists
+        .iter()
+        .map(|l| list_to_vec(opname, l))
+        .collect::<Result<Vec<_>, _>>()?;
+    let len = columns[0].len();
+    if columns.iter().any(|c| c.len() != len) {
+        return Err(error(format!(
+            "{opname} requires all list arguments to have the same length"
+        )));
+    }
+    Ok((0..len)
+        .map(|i| columns.iter().map(|c| c[i].clone()).collect())
+        .collect())
+}
+
+/// Applies `proc` to corresponding elements of one or more equal-length
+/// lists in parallel, collecting the results into a new list (spec 5.1).
+fn native_map(vm: &mut Vm, args: &[Value], out: &mut impl Write) -> Result<Value, RuntimeError> {
+    let [proc, lists @ ..] = args else {
+        return Err(error("map expects a procedure and at least one list"));
+    };
+    if lists.is_empty() {
+        return Err(error("map expects at least one list argument"));
+    }
+    let rows = parallel_list_rows("map", lists)?;
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        results.push(vm.call_value(proc, row, out)?);
+    }
+    Ok(vec_to_list(results))
+}
+
+/// Like [`native_map`], but for the side-effect-only variant: calls `proc`
+/// for its effects and discards every result, itself evaluating to
+/// `Unspecified` rather than a transformed list (spec 5.1).
+fn native_for_each(
+    vm: &mut Vm,
+    args: &[Value],
+    out: &mut impl Write,
+) -> Result<Value, RuntimeError> {
+    let [proc, lists @ ..] = args else {
+        return Err(error("for-each expects a procedure and at least one list"));
+    };
+    if lists.is_empty() {
+        return Err(error("for-each expects at least one list argument"));
+    }
+    for row in parallel_list_rows("for-each", lists)? {
+        vm.call_value(proc, row, out)?;
+    }
+    Ok(Value::Unspecified)
+}
+
+/// Keeps only the elements of `list` for which `proc` returns a truthy
+/// value (spec 5.1).
+fn native_filter(vm: &mut Vm, args: &[Value], out: &mut impl Write) -> Result<Value, RuntimeError> {
+    let [proc, list] = args else {
+        return Err(error(format!(
+            "filter expects exactly 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    let mut results = Vec::new();
+    for item in list_to_vec("filter", list)? {
+        if is_truthy(&vm.call_value(proc, vec![item.clone()], out)?) {
+            results.push(item);
+        }
+    }
+    Ok(vec_to_list(results))
 }
 
 /// A non-empty list is, per real Scheme semantics, built from pairs -- so
@@ -3576,6 +3662,61 @@ mod tests {
         assert_eq!(
             eval("(display (assq (list 1 2) (list (cons (list 1 2) (quote a)))))").unwrap(),
             "#f"
+        );
+    }
+
+    // --- B9 E5: map/for-each/filter (spec 5.1) ---
+
+    #[test]
+    fn map_squares_every_element_of_a_single_list() {
+        assert_eq!(
+            eval(
+                "(define (square x) (* x x)) \
+                  (display (map square (list 1 2 3)))"
+            )
+            .unwrap(),
+            "(1 4 9)"
+        );
+    }
+
+    #[test]
+    fn map_over_two_equal_length_lists_in_parallel() {
+        assert_eq!(
+            eval("(display (map + (list 1 2 3) (list 10 20 30)))").unwrap(),
+            "(11 22 33)"
+        );
+    }
+
+    #[test]
+    fn filter_keeps_only_elements_satisfying_the_predicate() {
+        assert_eq!(
+            eval("(display (filter odd? (list 1 2 3 4 5)))").unwrap(),
+            "(1 3 5)"
+        );
+    }
+
+    #[test]
+    fn for_each_performs_a_side_effect_and_its_own_value_is_not_a_transformed_list() {
+        assert_eq!(
+            eval(
+                "(define (square x) (* x x)) \
+                  (for-each (lambda (x) (display (square x))) (list 1 2 3))"
+            )
+            .unwrap(),
+            "149"
+        );
+    }
+
+    #[test]
+    fn for_each_and_map_contrasted_on_the_same_input() {
+        assert_eq!(
+            eval(
+                "(define (square x) (* x x)) \
+                  (display (map square (list 1 2 3))) (newline) \
+                  (for-each (lambda (x) (display (square x))) (list 1 2 3))"
+            )
+            .unwrap(),
+            "(1 4 9)\n149"
         );
     }
 }
