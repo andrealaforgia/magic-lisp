@@ -70,8 +70,8 @@ Feature: B1 — Walking skeleton: a MagicLisp CLI that reads, compiles, saves, a
       line one
       line two	tabbed"quoted"\backslash
       45
-      true
-      false
+      #t
+      #f
       """
     And the process exits with code 0
     And disassembling the compiled form shows two distinct CALL 2 instructions for the
@@ -80,13 +80,21 @@ Feature: B1 — Walking skeleton: a MagicLisp CLI that reads, compiles, saves, a
       disassemble to a single "CALL 3"
     And the leading ";" comment line produces no output and no read error, proving it was
       skipped as a comment rather than treated as code
+    # Corrected post hoc (E-RUN green-run pass): B1's spec only requires the READER to
+    # accept the true/false source tokens (point 5) — it never mandated a display format
+    # for booleans. The original evidence below showed "true"/"false" because that was
+    # this system's incidental display choice at B1 time; B2's E12 later specified #t/#f
+    # as the settled, deliberate, repeatedly-reconfirmed display convention (also B4).
+    # This is the scenario's expected output catching up to a later, correct specification
+    # decision, not a system defect — the source text (display true)/(display false) is
+    # unchanged; only the expected stdout below is corrected.
     # Evidence: $ cat kitchen-sink.ml (shown above)
     #   $ magiclisp eval kitchen-sink.ml
     #   line one
     #   line two	tabbed"quoted"\backslash
     #   45
-    #   true
-    #   false
+    #   #t
+    #   #f
     #   exit code: 0
     #   $ magiclisp compile kitchen-sink.ml -o kitchen-sink.mlbc
     #   $ magiclisp disasm kitchen-sink.mlbc (relevant excerpt):
