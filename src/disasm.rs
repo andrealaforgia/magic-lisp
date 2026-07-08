@@ -40,6 +40,13 @@ fn describe_const_value(c: &Const) -> String {
             let inner: Vec<String> = items.iter().map(describe_const_value).collect();
             format!("#({})", inner.join(" "))
         }
+        Const::Pair(car, cdr) => {
+            format!(
+                "({} . {})",
+                describe_const_value(car),
+                describe_const_value(cdr)
+            )
+        }
         Const::Unspecified => "<unspecified>".to_string(),
     }
 }

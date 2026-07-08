@@ -137,6 +137,10 @@ fn const_to_value(c: &Const) -> Value {
         Const::Vector(items) => Value::Vector(Rc::new(RefCell::new(
             items.iter().map(const_to_value).collect(),
         ))),
+        Const::Pair(car, cdr) => Value::Pair(Rc::new(RefCell::new((
+            const_to_value(car),
+            const_to_value(cdr),
+        )))),
         Const::Unspecified => Value::Unspecified,
     }
 }
@@ -3861,5 +3865,40 @@ mod tests {
     #[test]
     fn apply_with_an_empty_trailing_list_is_just_the_direct_arguments() {
         assert_eq!(eval("(display (apply + 1 2 (list)))").unwrap(), "3");
+    }
+
+    // --- B9 E8: quoted list literals read to exactly the structure written ---
+
+    #[test]
+    fn a_nested_list_literal_is_structurally_equal_to_an_independently_built_equivalent() {
+        assert_eq!(
+            eval(
+                "(display (equal? (quote (1 (2 3) 4)) \
+                                  (cons 1 (cons (cons 2 (cons 3 (quote ()))) (cons 4 (quote ()))))))"
+            )
+            .unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn a_nested_list_literal_is_reachable_via_accessors() {
+        assert_eq!(
+            eval("(display (car (cadr (quote (1 (2 3) 4)))))").unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn a_simple_dotted_pair_literal_reads_as_a_genuine_dotted_structure() {
+        assert_eq!(eval("(display (quote (a . b)))").unwrap(), "(a . b)");
+        assert_eq!(eval("(display (car (quote (a . b))))").unwrap(), "a");
+        assert_eq!(eval("(display (cdr (quote (a . b))))").unwrap(), "b");
+    }
+
+    #[test]
+    fn a_longer_improper_list_literal_is_not_silently_coerced_into_a_proper_list() {
+        assert_eq!(eval("(display (quote (1 2 . 3)))").unwrap(), "(1 2 . 3)");
+        assert_eq!(eval("(display (list? (quote (1 2 . 3))))").unwrap(), "#f");
     }
 }

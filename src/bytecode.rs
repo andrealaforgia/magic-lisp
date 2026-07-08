@@ -48,6 +48,10 @@ pub enum Const {
     Symbol(String),
     List(Vec<Const>),
     Vector(Vec<Const>),
+    /// A dotted (improper) pair literal (spec 5.1), e.g. `(a . b)` or the
+    /// tail of `(1 2 . 3)` -- distinct from `List`, which only ever
+    /// represents a proper list.
+    Pair(Box<Const>, Box<Const>),
     Unspecified,
 }
 
@@ -252,6 +256,11 @@ fn encode_const(out: &mut Vec<u8>, c: &Const) {
                 encode_const(out, item);
             }
         }
+        Const::Pair(car, cdr) => {
+            out.push(9);
+            encode_const(out, car);
+            encode_const(out, cdr);
+        }
     }
 }
 
@@ -363,6 +372,11 @@ fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
                 items.push(decode_const(r, depth + 1)?);
             }
             Const::Vector(items)
+        }
+        9 => {
+            let car = decode_const(r, depth + 1)?;
+            let cdr = decode_const(r, depth + 1)?;
+            Const::Pair(Box::new(car), Box::new(cdr))
         }
         _ => return Err(BytecodeError::Truncated),
     })
@@ -673,6 +687,46 @@ mod tests {
         // for this variant would let pathologically deep vector literals
         // blow the native stack instead of failing cleanly.
         let module = module_with_const(nested_vector_const(MAX_CONST_NESTING_DEPTH + 1));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+    }
+
+    #[test]
+    fn round_trips_a_dotted_pair_constant_byte_for_byte() {
+        let mut chunk = Chunk::new();
+        let idx = chunk.add_const(Const::Pair(
+            Box::new(Const::Symbol("a".to_string())),
+            Box::new(Const::Symbol("b".to_string())),
+        ));
+        chunk.emit_const(idx);
+        chunk.emit_halt();
+        let module = Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        };
+        let bytes = encode(&module);
+        let decoded = decode(&bytes).expect("valid module should decode");
+        assert_eq!(decoded, module);
+    }
+
+    fn nested_pair_const(depth: usize) -> Const {
+        let mut c = Const::Int(0);
+        for _ in 0..depth {
+            c = Const::Pair(Box::new(c), Box::new(Const::Int(0)));
+        }
+        c
+    }
+
+    #[test]
+    fn round_trips_a_constant_pair_nested_to_exactly_the_configured_maximum_depth() {
+        let module = module_with_const(nested_pair_const(MAX_CONST_NESTING_DEPTH));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Ok(module));
+    }
+
+    #[test]
+    fn rejects_a_constant_pair_nested_one_deeper_than_the_configured_maximum() {
+        let module = module_with_const(nested_pair_const(MAX_CONST_NESTING_DEPTH + 1));
         let bytes = encode(&module);
         assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
     }

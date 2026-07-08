@@ -221,17 +221,31 @@ pub fn value_eqv(a: &Value, b: &Value) -> bool {
 /// Plain structural recursion with no cycle detection -- terminates on
 /// acyclic data, as required; behaviour on cyclic data is
 /// implementation-defined per spec, so no special handling is needed for it.
+/// Decomposes any non-empty proper-or-improper-list-shaped value into its
+/// car/cdr, regardless of whether it's backed by a `Pair` chain or a flat
+/// `List` -- so `value_equal` can recurse into a list uniformly without
+/// caring which representation either side happens to use (spec 5.1's own
+/// BOUNDARIES: that choice isn't observable).
+fn as_pair_parts(v: &Value) -> Option<(Value, Value)> {
+    match v {
+        Value::Pair(cell) => {
+            let borrowed = cell.borrow();
+            Some((borrowed.0.clone(), borrowed.1.clone()))
+        }
+        Value::List(items) if !items.is_empty() => {
+            Some((items[0].clone(), Value::List(Rc::new(items[1..].to_vec()))))
+        }
+        _ => None,
+    }
+}
+
 pub fn value_equal(a: &Value, b: &Value) -> bool {
+    if let (Some((a0, a1)), Some((b0, b1))) = (as_pair_parts(a), as_pair_parts(b)) {
+        return value_equal(&a0, &b0) && value_equal(&a1, &b1);
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Pair(x), Value::Pair(y)) => {
-            let x = x.borrow();
-            let y = y.borrow();
-            value_equal(&x.0, &y.0) && value_equal(&x.1, &y.1)
-        }
-        (Value::List(x), Value::List(y)) => {
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_equal(a, b))
-        }
+        (Value::List(x), Value::List(y)) if x.is_empty() && y.is_empty() => true,
         (Value::Vector(x), Value::Vector(y)) => {
             let x = x.borrow();
             let y = y.borrow();

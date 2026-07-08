@@ -259,8 +259,12 @@ fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
                 .map(sexpr_to_const)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Sexpr::DottedList(..) => {
-            return Err(err("dotted-pair data cannot be quoted"));
+        Sexpr::DottedList(items, tail) => {
+            let mut acc = sexpr_to_const(tail)?;
+            for item in items.iter().rev() {
+                acc = Const::Pair(Box::new(sexpr_to_const(item)?), Box::new(acc));
+            }
+            acc
         }
     })
 }
@@ -1682,12 +1686,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_quoting_dotted_pair_data() {
+    fn compiles_a_quoted_dotted_pair_into_a_pair_constant() {
         let program = [list(vec![
             sym("quote"),
             Sexpr::DottedList(vec![sym("a")], Box::new(sym("b"))),
         ])];
-        assert!(compile_program(&program).is_err());
+        let module = compile_program(&program).expect("quoting a dotted pair should compile");
+        assert_eq!(
+            module.functions[module.entry_index as usize].constants,
+            vec![Const::Pair(
+                Box::new(Const::Symbol("a".to_string())),
+                Box::new(Const::Symbol("b".to_string()))
+            )]
+        );
     }
 
     // --- B3: local bindings, mutation, conditional/sequencing forms ---
