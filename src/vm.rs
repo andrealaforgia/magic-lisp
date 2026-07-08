@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 85] = [
+const NATIVE_NAMES: [&str; 86] = [
     "display",
     "newline",
     "+",
@@ -115,6 +115,7 @@ const NATIVE_NAMES: [&str; 85] = [
     "fold-left",
     "fold-right",
     "reduce",
+    "apply",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -723,6 +724,7 @@ fn call_native(
         "fold-left" => native_fold_left(vm, args, out),
         "fold-right" => native_fold_right(vm, args, out),
         "reduce" => native_reduce(vm, args, out),
+        "apply" => native_apply(vm, args, out),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -1136,6 +1138,21 @@ fn native_reduce(vm: &mut Vm, args: &[Value], out: &mut impl Write) -> Result<Va
         acc = vm.call_value(proc, vec![acc, item.clone()], out)?;
     }
     Ok(acc)
+}
+
+/// Calls `proc` with `direct` arguments plus a final trailing list
+/// flattened into one argument set (spec 5.1) -- `apply` always requires
+/// that trailing list, even when it's empty.
+fn native_apply(vm: &mut Vm, args: &[Value], out: &mut impl Write) -> Result<Value, RuntimeError> {
+    let [proc, rest @ ..] = args else {
+        return Err(error("apply expects a procedure and a trailing list"));
+    };
+    let Some((trailing, direct)) = rest.split_last() else {
+        return Err(error("apply expects a trailing list argument"));
+    };
+    let mut call_args = direct.to_vec();
+    call_args.extend(list_to_vec("apply", trailing)?);
+    vm.call_value(proc, call_args, out)
 }
 
 /// A non-empty list is, per real Scheme semantics, built from pairs -- so
@@ -3827,5 +3844,22 @@ mod tests {
     #[test]
     fn reduce_falls_back_to_the_given_initial_value_on_an_empty_list() {
         assert_eq!(eval("(display (reduce + 99 (quote ())))").unwrap(), "99");
+    }
+
+    // --- B9 E7: apply flattens direct arguments plus a trailing list ---
+
+    #[test]
+    fn apply_flattens_direct_arguments_plus_a_trailing_list() {
+        assert_eq!(eval("(display (apply + 1 2 (list 3 4)))").unwrap(), "10");
+    }
+
+    #[test]
+    fn apply_with_zero_direct_arguments_is_just_the_trailing_list() {
+        assert_eq!(eval("(display (apply + (list 1 2 3)))").unwrap(), "6");
+    }
+
+    #[test]
+    fn apply_with_an_empty_trailing_list_is_just_the_direct_arguments() {
+        assert_eq!(eval("(display (apply + 1 2 (list)))").unwrap(), "3");
     }
 }
