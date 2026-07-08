@@ -285,9 +285,25 @@ fn encode_const(out: &mut Vec<u8>, c: &Const) {
             // dotted-list literal `(1 2 3 ... N . tail)` is one flat pair
             // of parens (nesting depth 1, never touching the reader's
             // MAX_NESTING_DEPTH), but produces a `Const::Pair` chain N
-            // deep -- chain length is program data, not nesting depth, so
-            // it has no bound. Only each car (bounded by ordinary nesting
-            // depth, like `List`/`Vector` items) still recurses.
+            // deep. Only each car (bounded by ordinary nesting depth, like
+            // `List`/`Vector` items) still recurses.
+            //
+            // Known asymmetry (qa test-design review, msg #160): this
+            // encode side doesn't cap cdr-chain length at all, but
+            // `decode_const` still enforces `MAX_CONST_NESTING_DEPTH`
+            // uniformly across car and cdr -- so a dotted-list literal
+            // longer than that limit encodes fine but fails to decode its
+            // own freshly-written bytes with a "truncated" error. A fix
+            // (making `decode_const`'s cdr walk cap-exempt and iterative
+            // too, matching this side) was attempted and reverted: it
+            // requires every recursive call in `decode_const_body` to call
+            // itself directly rather than through the `decode_const`
+            // wrapper, and even after correcting that, the existing
+            // *car*-nesting boundary tests (unrelated to this change)
+            // started overflowing the stack in an unoptimized build for a
+            // reason not fully root-caused in the time available. Left as
+            // a known, documented inconsistency rather than risk shipping
+            // an unverified change to this file's recursion structure.
             out.push(9);
             encode_const(out, car);
             let mut tail: &Const = cdr;
