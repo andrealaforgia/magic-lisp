@@ -1,0 +1,258 @@
+//! Per-scenario state and process-spawning helpers, mirroring
+//! `tests/cli_integration/helpers.rs`'s process-level rigor (spawn the
+//! real compiled binary, assert on its real stdout/stderr/exit code) but
+//! kept in this separate test binary since `tests/features.rs` and
+//! `tests/cli_integration.rs` are independent crates.
+
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn temp_path(label: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        "magiclisp-features-{}-{n}-{label}",
+        std::process::id()
+    ))
+}
+
+pub(crate) fn write_source(label: &str, content: &str) -> PathBuf {
+    let path = temp_path(label);
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+fn magiclisp() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+}
+
+pub(crate) fn run(args: &[&str]) -> Output {
+    magiclisp().args(args).output().expect("binary should run")
+}
+
+pub(crate) fn run_with_stdin(args: &[&str], stdin_data: &[u8]) -> Output {
+    let mut child = magiclisp()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+    child.stdin.take().unwrap().write_all(stdin_data).unwrap();
+    child.wait_with_output().expect("binary should run")
+}
+
+pub(crate) fn stdout_of(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+pub(crate) fn stderr_of(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).unwrap()
+}
+
+/// Runs `src` via `eval` and returns its stdout, panicking with the
+/// process's stderr if it didn't exit successfully — for the many steps
+/// that only care about a program's displayed output.
+pub(crate) fn eval_ok(label: &str, src: &str) -> String {
+    let file = write_source(label, src);
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "expected {label} to succeed, stderr: {}",
+        stderr_of(&output)
+    );
+    stdout_of(&output)
+}
+
+/// Wraps `src` in `(display ...)` unless it already contains a `display`
+/// call somewhere (i.e. it's already a complete program that prints its
+/// own result, typically because it also needs to prove a side effect
+/// happened or didn't). Several scenarios queue a bare expression via a
+/// shared, generically-worded When step ("it is evaluated", "each is
+/// evaluated") that doesn't know in advance which shape it'll get.
+pub(crate) fn maybe_wrap_display(src: &str) -> String {
+    if src.contains("(display") {
+        src.to_string()
+    } else {
+        format!("(display {src})")
+    }
+}
+
+/// Runs every pending MagicLisp snippet queued in `world.pending` (via
+/// [`maybe_wrap_display`]), appending each result to `world.notes` — the
+/// shared implementation behind the several generically-worded When steps
+/// ("it is evaluated", "each is evaluated", "the function is called",
+/// "each is run") that different scenarios reuse verbatim with different
+/// Givens.
+pub(crate) fn run_pending(world: &mut World, label_prefix: &str) {
+    let pending = std::mem::take(&mut world.pending);
+    for (i, src) in pending.iter().enumerate() {
+        let program = maybe_wrap_display(src);
+        world
+            .notes
+            .push(eval_ok(&format!("{label_prefix}-{i}.ml"), &program));
+    }
+}
+
+/// Per-scenario state, reset fresh for each scenario the runner executes.
+/// Steps stash whatever the *next* step needs here — e.g. a Given writes a
+/// source file and records its path, the following When runs it and
+/// records the Output, the following Then reads that Output back out.
+#[derive(Default)]
+pub(crate) struct World {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) artifacts: Vec<PathBuf>,
+    pub(crate) outputs: Vec<Output>,
+    /// Named outputs, for scenarios that need to keep several distinctly
+    /// labeled results straight (e.g. one per CLI verb) rather than just a
+    /// "most recent" stack.
+    pub(crate) labeled: Vec<(String, Output)>,
+    /// Scratch string storage for steps that need to hand a value (e.g. an
+    /// expected-output string parsed out of a Given) to a later step.
+    pub(crate) notes: Vec<String>,
+    /// MagicLisp source snippets a Given step wants a shared, generically-
+    /// worded When step (e.g. "each is evaluated") to run — several
+    /// scenarios reuse the exact same When wording with different Givens,
+    /// so the When step can't hardcode what to run; it runs whatever's
+    /// queued here instead.
+    pub(crate) pending: Vec<String>,
+}
+
+impl World {
+    pub(crate) fn last_output(&self) -> &Output {
+        self.outputs
+            .last()
+            .expect("a When step should have run something before this assertion")
+    }
+
+    pub(crate) fn last_file(&self) -> &PathBuf {
+        self.files
+            .last()
+            .expect("a Given step should have created a source file before this")
+    }
+
+    pub(crate) fn last_artifact(&self) -> &PathBuf {
+        self.artifacts
+            .last()
+            .expect("a prior step should have produced a compiled artifact before this")
+    }
+
+    pub(crate) fn labeled(&self, name: &str) -> &Output {
+        self.labeled
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, o)| o)
+            .unwrap_or_else(|| panic!("no output was recorded under the label {name:?}"))
+    }
+}
+
+/// Un-escapes the small set of backslash escapes the feature files use
+/// inside inline double-quoted step arguments (mirroring the reader's own
+/// string-escape support), since Gherkin step text itself carries no
+/// escaping convention of its own.
+pub(crate) fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Extracts the content of the first `"..."`-quoted segment in `text`,
+/// unescaping it the same way the reader would. Used by steps whose
+/// wording embeds a literal MagicLisp snippet or expected-output string.
+pub(crate) fn first_quoted(text: &str) -> Option<String> {
+    let start = text.find('"')?;
+    let rest = &text[start + 1..];
+    let mut end = None;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            end = Some(i);
+            break;
+        }
+    }
+    let end = end?;
+    Some(unescape(&rest[..end]))
+}
+
+/// Like [`first_quoted`], but returns every `"..."`-quoted segment in
+/// order — for steps that embed more than one literal (e.g. two source
+/// snippets in the same Given).
+pub(crate) fn all_quoted(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(q) = first_quoted(rest) {
+        out.push(q.clone());
+        let Some(start) = rest.find('"') else { break };
+        let after_open = &rest[start + 1..];
+        let Some(relative_end) = find_unescaped_quote(after_open) else {
+            break;
+        };
+        rest = &after_open[relative_end + 1..];
+    }
+    out
+}
+
+fn find_unescaped_quote(s: &str) -> Option<usize> {
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unescape_handles_the_readers_escape_set() {
+        assert_eq!(unescape(r#"a\nb\tc\rd\"e\\f"#), "a\nb\tc\rd\"e\\f");
+    }
+
+    #[test]
+    fn first_quoted_extracts_a_single_literal() {
+        assert_eq!(
+            first_quoted(r#"Given "(display 1)" is evaluated"#),
+            Some("(display 1)".to_string())
+        );
+    }
+
+    #[test]
+    fn all_quoted_extracts_every_literal_in_order() {
+        assert_eq!(
+            all_quoted(r#"the expressions "(a)" and "(b)""#),
+            vec!["(a)".to_string(), "(b)".to_string()]
+        );
+    }
+}
