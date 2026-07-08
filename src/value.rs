@@ -72,6 +72,11 @@ pub enum Value {
     /// hash-table procedure library (`hash-set!`, `hash-ref`, ...) is a
     /// later behaviour.
     Hash(Rc<RefCell<Vec<(Value, Value)>>>),
+    /// The end-of-input marker returned by `read`/`read-line` (spec 4.8)
+    /// once standard input is exhausted. A simple value, not a compound
+    /// one: there is conceptually only one eof object, so it compares
+    /// equal to itself under every equality relation.
+    Eof,
     Unspecified,
 }
 
@@ -121,47 +126,104 @@ fn format_float(n: f64) -> String {
 const PAIR_TAG: u8 = 0;
 const VECTOR_TAG: u8 = 1;
 
-/// The single entry point for printing any `Value`, threading one shared
-/// `ancestors` set through every recursive/iterative descent -- into a
-/// pair's car, a pair's cdr chain, a list's elements, and a vector's
-/// elements alike. This exists so cycle detection composes ACROSS container
-/// types: a vector holding a pair whose cdr was set back to that same
-/// vector (or any other Pair/Vector mixture) is caught exactly the same way
-/// a same-type cycle is, because both sides check and update the identical
-/// set rather than each container type keeping its own independent,
-/// freshly-seeded local state (warden security reviews msgs #144, #146,
-/// #147, #191, #192 -- an earlier fix that gave `Vector` its own isolated
-/// cycle guard, mirroring `Pair`'s in isolation, closed the same-type case
-/// but left this cross-type case open, confirmed via a 4-line reproduction
-/// that still crashed with a native stack overflow).
+/// The two textual output forms (spec 3.2): `Display` prints raw,
+/// human-readable text (a string's own characters, a character as itself);
+/// `Write` prints machine-readable, re-readable text (a string quoted with
+/// escapes, a character in its `#\` literal form). Every other value type
+/// looks identical under both styles, so only the `Value::Str`/`Value::Char`
+/// arms of [`fmt_value`] branch on this; everything else ignores it.
+#[derive(Clone, Copy, PartialEq)]
+enum Style {
+    Display,
+    Write,
+}
+
+/// Escapes a string's special characters the same way the reader's own
+/// string-literal escapes read back (spec 3.2's `write` form): the exact
+/// inverse of [`crate::reader`]'s string-escape handling, so a value
+/// written out and read back reproduces the original string exactly.
+fn write_escaped_string(f: &mut impl fmt::Write, s: &str) -> fmt::Result {
+    write!(f, "\"")?;
+    for c in s.chars() {
+        match c {
+            '"' => write!(f, "\\\"")?,
+            '\\' => write!(f, "\\\\")?,
+            '\n' => write!(f, "\\n")?,
+            '\t' => write!(f, "\\t")?,
+            '\r' => write!(f, "\\r")?,
+            other => write!(f, "{other}")?,
+        }
+    }
+    write!(f, "\"")
+}
+
+/// Prints a character in its `#\` literal form (spec 3.1/3.2): the named
+/// forms for space/newline/tab, matching exactly the three named literals
+/// the reader accepts back (`#\space`, `#\newline`, `#\tab`), or the bare
+/// character itself for everything else.
+fn write_char_literal(f: &mut impl fmt::Write, c: char) -> fmt::Result {
+    match c {
+        ' ' => write!(f, "#\\space"),
+        '\n' => write!(f, "#\\newline"),
+        '\t' => write!(f, "#\\tab"),
+        other => write!(f, "#\\{other}"),
+    }
+}
+
+/// The single entry point for printing any `Value` in either style,
+/// threading one shared `ancestors` set through every recursive/iterative
+/// descent -- into a pair's car, a pair's cdr chain, a list's elements, and
+/// a vector's elements alike. This exists so cycle detection composes
+/// ACROSS container types: a vector holding a pair whose cdr was set back
+/// to that same vector (or any other Pair/Vector mixture) is caught exactly
+/// the same way a same-type cycle is, because both sides check and update
+/// the identical set rather than each container type keeping its own
+/// independent, freshly-seeded local state (warden security reviews msgs
+/// #144, #146, #147, #191, #192 -- an earlier fix that gave `Vector` its own
+/// isolated cycle guard, mirroring `Pair`'s in isolation, closed the
+/// same-type case but left this cross-type case open, confirmed via a
+/// 4-line reproduction that still crashed with a native stack overflow).
+///
+/// Generic over `W: fmt::Write` (not hardcoded to `fmt::Formatter`) so the
+/// same logic backs both `Display`'s `fmt` (writing into a real formatter)
+/// and [`write_repr`] (writing into a plain `String`) without duplicating
+/// the traversal.
 fn fmt_value(
-    f: &mut fmt::Formatter<'_>,
+    f: &mut impl fmt::Write,
     value: &Value,
     ancestors: &mut HashSet<(u8, usize)>,
+    style: Style,
 ) -> fmt::Result {
     match value {
         Value::Int(n) => write!(f, "{n}"),
         Value::Float(n) => write!(f, "{}", format_float(*n)),
         Value::Bool(true) => write!(f, "#t"),
         Value::Bool(false) => write!(f, "#f"),
-        Value::Char(c) => write!(f, "{c}"),
-        Value::Str(s) => write!(f, "{s}"),
+        Value::Char(c) => match style {
+            Style::Display => write!(f, "{c}"),
+            Style::Write => write_char_literal(f, *c),
+        },
+        Value::Str(s) => match style {
+            Style::Display => write!(f, "{s}"),
+            Style::Write => write_escaped_string(f, s),
+        },
         Value::Symbol(s) => write!(f, "{s}"),
         Value::Native(name) => write!(f, "#<procedure:{name}>"),
         Value::Closure(idx, _) => write!(f, "#<procedure:{idx}>"),
-        Value::Pair(cell) => fmt_pair_chain(f, cell, ancestors),
+        Value::Pair(cell) => fmt_pair_chain(f, cell, ancestors, style),
         Value::List(items) => {
             write!(f, "(")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     write!(f, " ")?;
                 }
-                fmt_value(f, item, ancestors)?;
+                fmt_value(f, item, ancestors, style)?;
             }
             write!(f, ")")
         }
-        Value::Vector(items) => fmt_vector(f, items, ancestors),
+        Value::Vector(items) => fmt_vector(f, items, ancestors, style),
         Value::Hash(_) => write!(f, "#<hash>"),
+        Value::Eof => write!(f, "#<eof>"),
         Value::Unspecified => Ok(()),
     }
 }
@@ -180,9 +242,10 @@ fn fmt_value(
 /// `(...)` in place of the whole pair, since its contents can't be printed
 /// without recursing forever) are both caught, instead of only the former.
 fn fmt_pair_chain(
-    f: &mut fmt::Formatter<'_>,
+    f: &mut impl fmt::Write,
     cell: &Rc<RefCell<(Value, Value)>>,
     ancestors: &mut HashSet<(u8, usize)>,
+    style: Style,
 ) -> fmt::Result {
     let start = (PAIR_TAG, Rc::as_ptr(cell) as usize);
     if !ancestors.insert(start) {
@@ -193,7 +256,7 @@ fn fmt_pair_chain(
     let result = (|| {
         write!(f, "(")?;
         let first = cell.borrow().0.clone();
-        fmt_value(f, &first, ancestors)?;
+        fmt_value(f, &first, ancestors, style)?;
         let mut current = cell.borrow().1.clone();
         loop {
             match &current {
@@ -209,7 +272,7 @@ fn fmt_pair_chain(
                         (borrowed.0.clone(), borrowed.1.clone())
                     };
                     write!(f, " ")?;
-                    fmt_value(f, &car, ancestors)?;
+                    fmt_value(f, &car, ancestors, style)?;
                     current = cdr;
                 }
                 // This guard is unobservable: dropping it entirely would
@@ -221,13 +284,13 @@ fn fmt_pair_chain(
                 Value::List(items) => {
                     for item in items.iter() {
                         write!(f, " ")?;
-                        fmt_value(f, item, ancestors)?;
+                        fmt_value(f, item, ancestors, style)?;
                     }
                     break;
                 }
                 other => {
                     write!(f, " . ")?;
-                    fmt_value(f, other, ancestors)?;
+                    fmt_value(f, other, ancestors, style)?;
                     break;
                 }
             }
@@ -244,9 +307,10 @@ fn fmt_pair_chain(
 /// Prints a vector, `#(a b c)`. See [`fmt_pair_chain`] for the shared
 /// `ancestors` set this composes cycle detection with.
 fn fmt_vector(
-    f: &mut fmt::Formatter<'_>,
+    f: &mut impl fmt::Write,
     items: &Rc<RefCell<Vec<Value>>>,
     ancestors: &mut HashSet<(u8, usize)>,
+    style: Style,
 ) -> fmt::Result {
     let addr = (VECTOR_TAG, Rc::as_ptr(items) as usize);
     if !ancestors.insert(addr) {
@@ -258,7 +322,7 @@ fn fmt_vector(
             if i > 0 {
                 write!(f, " ")?;
             }
-            fmt_value(f, item, ancestors)?;
+            fmt_value(f, item, ancestors, style)?;
         }
         write!(f, ")")
     })();
@@ -268,8 +332,22 @@ fn fmt_vector(
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_value(f, self, &mut HashSet::new())
+        fmt_value(f, self, &mut HashSet::new(), Style::Display)
     }
+}
+
+/// The machine-readable/re-readable output form (spec 3.2's `write`
+/// procedure, spec 4.8): identical to [`Display`](fmt::Display) for every
+/// value type except strings (quoted, with escapes) and characters (`#\`
+/// literal form).
+pub fn write_repr(value: &Value) -> String {
+    let mut out = String::new();
+    // A `String`'s `fmt::Write` impl never fails (it can only run out of
+    // memory, which aborts the process before this could return `Err`), so
+    // discarding the `Result` here is safe -- unlike `Display`'s own `fmt`,
+    // which must propagate errors from a real, fallible `Formatter` sink.
+    let _ = fmt_value(&mut out, value, &mut HashSet::new(), Style::Write);
+    out
 }
 
 pub fn is_truthy(value: &Value) -> bool {
@@ -310,6 +388,7 @@ pub fn value_eqv(a: &Value, b: &Value) -> bool {
             idx1 == idx2 && Rc::ptr_eq(env1, env2)
         }
         (Value::Unspecified, Value::Unspecified) => true,
+        (Value::Eof, Value::Eof) => true,
         _ => false,
     }
 }
