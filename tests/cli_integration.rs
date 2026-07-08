@@ -17,6 +17,8 @@ mod b1;
 mod b10;
 #[path = "cli_integration/b11.rs"]
 mod b11;
+#[path = "cli_integration/b12.rs"]
+mod b12;
 #[path = "cli_integration/b2.rs"]
 mod b2;
 #[path = "cli_integration/b3.rs"]
