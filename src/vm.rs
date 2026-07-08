@@ -4445,6 +4445,32 @@ mod tests {
         assert!(eval("(display (substring \"hello\" 1 10))").is_err());
     }
 
+    #[test]
+    fn substring_from_start_to_itself_is_the_empty_string() {
+        assert_eq!(eval("(display (substring \"hello\" 2 2))").unwrap(), "");
+    }
+
+    #[test]
+    fn substring_to_the_length_is_the_suffix_to_the_end() {
+        assert_eq!(eval("(display (substring \"hello\" 2 5))").unwrap(), "llo");
+    }
+
+    #[test]
+    fn string_length_counts_a_multi_byte_character_as_one_position_not_two_bytes() {
+        // qa test-design review (msg #167): all of E1's original tests were
+        // pure ASCII, where char-count and byte-count are numerically
+        // identical -- none could fail if `.chars().count()` regressed to
+        // `.len()` (byte count). "héllo" is 5 characters but 6 UTF-8 bytes
+        // (é is 2 bytes), so this genuinely distinguishes the two.
+        assert_eq!(eval("(display (string-length \"héllo\"))").unwrap(), "5");
+    }
+
+    #[test]
+    fn string_ref_reaches_a_multi_byte_character_by_position_not_byte_offset() {
+        assert_eq!(eval("(display (string-ref \"héllo\" 1))").unwrap(), "é");
+        assert_eq!(eval("(display (string-ref \"héllo\" 2))").unwrap(), "l");
+    }
+
     // --- B10 E2: string=?/string<?/string>? (spec 6.1) ---
 
     #[test]
