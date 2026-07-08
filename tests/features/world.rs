@@ -45,6 +45,30 @@ pub(crate) fn run_with_stdin(args: &[&str], stdin_data: &[u8]) -> Output {
     child.wait_with_output().expect("binary should run")
 }
 
+/// Runs the real binary under `/usr/bin/time -l` (macOS/BSD), returning its
+/// own `Output` (stdout/stderr/exit code all pass through untouched) plus
+/// the peak resident-set-size `time` reports, in bytes — real measured
+/// memory, not an inference from "it didn't crash". Used by B6's flat-
+/// memory scenarios, which need to prove O(1) space, not just completion.
+pub(crate) fn run_with_peak_rss(args: &[&str]) -> (Output, u64) {
+    let output = Command::new("/usr/bin/time")
+        .arg("-l")
+        .arg(env!("CARGO_BIN_EXE_magiclisp"))
+        .args(args)
+        .output()
+        .expect("/usr/bin/time should run");
+    let time_report = String::from_utf8_lossy(&output.stderr);
+    let rss = time_report
+        .lines()
+        .find(|line| line.contains("maximum resident set size"))
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            panic!("could not find peak RSS in `/usr/bin/time -l` output: {time_report}")
+        });
+    (output, rss)
+}
+
 pub(crate) fn stdout_of(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
@@ -119,6 +143,10 @@ pub(crate) struct World {
     /// so the When step can't hardcode what to run; it runs whatever's
     /// queued here instead.
     pub(crate) pending: Vec<String>,
+    /// (small-run peak RSS, full-run peak RSS) pairs recorded by a flat-
+    /// memory When step (B6 E1/E2), read back by the following "peak
+    /// memory usage stays flat" Then/And step.
+    pub(crate) rss_pairs: Vec<(u64, u64)>,
 }
 
 impl World {

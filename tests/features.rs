@@ -23,6 +23,8 @@ mod steps_b3;
 mod steps_b4;
 #[path = "features/steps_b5.rs"]
 mod steps_b5;
+#[path = "features/steps_b6.rs"]
+mod steps_b6;
 
 #[test]
 fn b1_walking_skeleton() {
@@ -64,4 +66,10 @@ fn b4_iteration_and_numeric_semantics() {
 fn b5_closures() {
     let src = include_str!("../features/B5-closures.feature");
     registry::run_feature("B5-closures", src, &steps_b5::registry());
+}
+
+#[test]
+fn b6_tail_and_deep_recursion() {
+    let src = include_str!("../features/B6-tail-and-deep-recursion.feature");
+    registry::run_feature("B6-tail-and-deep-recursion", src, &steps_b6::registry());
 }
