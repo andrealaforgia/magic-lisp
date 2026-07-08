@@ -239,7 +239,7 @@ fn parse_formals(sexpr: &Sexpr) -> Result<Formals, CompileError> {
     }
 }
 
-fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
+pub(crate) fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
     Ok(match sexpr {
         Sexpr::Int(n) => Const::Int(*n),
         Sexpr::Float(n) => Const::Float(*n),

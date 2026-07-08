@@ -61,17 +61,17 @@ pub fn parse_args(args: &[String]) -> Result<Command, UsageError> {
 
 pub fn execute(
     command: Command,
-    input: impl BufRead,
+    mut input: impl BufRead,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> i32 {
     match command {
-        Command::Eval { input: path } => run_eval(&path, out, err),
+        Command::Eval { input: path } => run_eval(&path, &mut input, out, err),
         Command::Compile {
             input: path,
             output,
         } => run_compile(&path, &output, err),
-        Command::Run { artifact } => run_run(&artifact, out, err),
+        Command::Run { artifact } => run_run(&artifact, &mut input, out, err),
         Command::Disasm { artifact } => run_disasm(&artifact, out, err),
         Command::Repl => repl::run(input, out, err),
     }
@@ -82,7 +82,12 @@ fn compile_source(src: &str) -> Result<bytecode::Module, String> {
     compiler::compile_program(&forms).map_err(|e| e.to_string())
 }
 
-fn run_eval(path: &Path, out: &mut impl Write, err: &mut impl Write) -> i32 {
+fn run_eval(
+    path: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> i32 {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -97,7 +102,7 @@ fn run_eval(path: &Path, out: &mut impl Write, err: &mut impl Write) -> i32 {
             return exitcode::SOURCE_ERROR;
         }
     };
-    match vm::run(&module, out) {
+    match vm::run_with_stdin(&module, out, input) {
         Ok(()) => exitcode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
@@ -141,12 +146,17 @@ fn load_artifact(artifact: &Path, err: &mut impl Write) -> Result<bytecode::Modu
     })
 }
 
-fn run_run(artifact: &Path, out: &mut impl Write, err: &mut impl Write) -> i32 {
+fn run_run(
+    artifact: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> i32 {
     let module = match load_artifact(artifact, err) {
         Ok(m) => m,
         Err(code) => return code,
     };
-    match vm::run(&module, out) {
+    match vm::run_with_stdin(&module, out, input) {
         Ok(()) => exitcode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");

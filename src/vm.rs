@@ -2,12 +2,14 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::rc::Rc;
+use std::sync::mpsc;
 
 use crate::bytecode::{Chunk, Const, Module, Op};
-use crate::reader::Sexpr;
-use crate::value::{Env, Value, is_truthy, value_equal, value_eqv};
+use crate::compiler::sexpr_to_const;
+use crate::reader::{self, Sexpr};
+use crate::value::{Env, Value, is_truthy, value_equal, value_eqv, write_repr};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -26,7 +28,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 120] = [
+const NATIVE_NAMES: [&str; 124] = [
     "display",
     "newline",
     "+",
@@ -152,6 +154,12 @@ const NATIVE_NAMES: [&str; 120] = [
     "hash-count",
     "hash-keys",
     "hash-has-key?",
+    // B12: input reading and the write/display output distinction (spec
+    // 3.2, 4.8).
+    "read",
+    "read-line",
+    "eof-object?",
+    "write",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -268,6 +276,50 @@ struct Vm<'m> {
     module: &'m Module,
     globals: HashMap<String, Value>,
     call_depth: usize,
+    /// Text pulled from stdin but not yet consumed by `read`/`read-line`
+    /// (spec 4.8) -- refilled one raw chunk at a time via `stdin_channel`
+    /// only when there isn't already enough buffered to satisfy the
+    /// current call, so a program that never calls `read`/`read-line`
+    /// never touches stdin at all.
+    stdin_buffer: String,
+    stdin_channel: StdinChannel,
+}
+
+/// A lazy, on-demand relay to the real stdin reader living on the thread
+/// that called [`run_with_stdin`], used because that reader (e.g. a locked
+/// stdout handle, or any generic `&mut impl BufRead`) isn't necessarily
+/// `Send` and so can't be moved into the VM's own dedicated execution
+/// thread directly -- unlike eagerly reading everything up front (blocking
+/// until the ENTIRE stream reaches end-of-input before the VM even starts),
+/// this only blocks waiting for one line at a time, and only when the
+/// running program actually calls `read`/`read-line`, so a program that
+/// never reads stdin never touches it -- critical when stdin is an
+/// interactive terminal or an otherwise-still-open stream rather than a
+/// short, already-closed pipe.
+struct StdinChannel {
+    request: mpsc::Sender<()>,
+    response: mpsc::Receiver<Option<String>>,
+}
+
+impl StdinChannel {
+    /// Requests and returns the next raw chunk (one line, including its
+    /// trailing newline if the underlying stream had one), or `None` once
+    /// the underlying stream is genuinely exhausted (or, for [`Self::none`],
+    /// unconditionally).
+    fn next_chunk(&self) -> Option<String> {
+        self.request.send(()).ok()?;
+        self.response.recv().ok().flatten()
+    }
+
+    /// A relay-less stand-in for callers (plain [`run`]) that supply no
+    /// stdin at all: both channel halves are dropped immediately, so the
+    /// very first (and only) send in [`Self::next_chunk`] fails right away
+    /// without ever needing a servicing thread on the other end.
+    fn none() -> Self {
+        let (request, _) = mpsc::channel();
+        let (_, response) = mpsc::channel();
+        StdinChannel { request, response }
+    }
 }
 
 /// Walks `depth - 1` parent links from `env` (depth 1 = `env` itself, the
@@ -631,12 +683,50 @@ const VM_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
 /// overflow, never an ordinary bug. This is deliberate defense in depth,
 /// not a substitute for the guarded error paths elsewhere in this file.
 pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
-    // `out` (e.g. a locked stdout handle) isn't necessarily Send, so it
-    // can't be captured directly by the spawned thread's closure below.
-    // Buffering into a plain (Send) Vec<u8> on that thread and flushing it
-    // to the real `out` here, after the thread has been joined, sidesteps
-    // that without requiring every caller's writer to be Send.
+    // No relay to service: `StdinChannel::none()` fails every request
+    // instantly on its own, so this can spawn and join exactly like before
+    // stdin support existed at all.
     let mut buffer = Vec::new();
+    let vm_result: Result<(), RuntimeError> = std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .stack_size(VM_STACK_SIZE)
+            .spawn_scoped(scope, || {
+                run_on_this_thread(module, &mut buffer, StdinChannel::none())
+            })
+            .map_err(|e| error(format!("failed to spawn VM thread: {e}")))?;
+        handle
+            .join()
+            .unwrap_or_else(|_| Err(error("internal error: VM thread panicked")))
+    });
+    let flush_result = out
+        .write_all(&buffer)
+        .map_err(|e| error(format!("failed to write output: {e}")));
+    vm_result.and(flush_result)
+}
+
+/// Like [`run`], but also makes `input` available to the `read`/`read-line`
+/// natives (spec 4.8), lazily: `input` (e.g. a locked stdin handle) isn't
+/// necessarily `Send`, so it can't be moved into the VM's own dedicated
+/// execution thread directly the way `out`'s owned `Vec<u8>` buffer is
+/// below. Instead, the VM thread requests one line at a time over a
+/// channel, serviced by THIS thread (which does own `input`) in the loop
+/// below, so a program that never calls `read`/`read-line` never blocks on
+/// `input` at all -- unlike eagerly reading the entire stream to its end
+/// before the VM even starts, which would hang indefinitely on an
+/// interactive terminal or any other still-open stream a program has no
+/// intention of ever reading from.
+pub fn run_with_stdin(
+    module: &Module,
+    out: &mut impl Write,
+    input: &mut impl BufRead,
+) -> Result<(), RuntimeError> {
+    let mut buffer = Vec::new();
+    let (req_tx, req_rx) = mpsc::channel::<()>();
+    let (resp_tx, resp_rx) = mpsc::channel::<Option<String>>();
+    let stdin_channel = StdinChannel {
+        request: req_tx,
+        response: resp_rx,
+    };
     let vm_result: Result<(), RuntimeError> = std::thread::scope(|scope| {
         // An OS-level spawn failure (e.g. thread/memory exhaustion) is rare
         // but, like a joined-out panic, must still surface as a clean
@@ -644,8 +734,24 @@ pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
         // above promises no crash except a genuine native stack overflow.
         let handle = std::thread::Builder::new()
             .stack_size(VM_STACK_SIZE)
-            .spawn_scoped(scope, || run_on_this_thread(module, &mut buffer))
+            .spawn_scoped(scope, || {
+                run_on_this_thread(module, &mut buffer, stdin_channel)
+            })
             .map_err(|e| error(format!("failed to spawn VM thread: {e}")))?;
+        // Services stdin requests one at a time, exactly as they're made.
+        // The VM thread finishing (or panicking) drops its sender, which
+        // ends this loop on its own via a plain `Err` from `recv` -- no
+        // polling or timeout needed.
+        while let Ok(()) = req_rx.recv() {
+            let mut line = String::new();
+            let chunk = match input.read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(line),
+            };
+            if resp_tx.send(chunk).is_err() {
+                break;
+            }
+        }
         handle
             .join()
             .unwrap_or_else(|_| Err(error("internal error: VM thread panicked")))
@@ -663,11 +769,17 @@ pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
     vm_result.and(flush_result)
 }
 
-fn run_on_this_thread(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
+fn run_on_this_thread(
+    module: &Module,
+    out: &mut impl Write,
+    stdin_channel: StdinChannel,
+) -> Result<(), RuntimeError> {
     let mut vm = Vm {
         module,
         globals: default_globals(),
         call_depth: 0,
+        stdin_buffer: String::new(),
+        stdin_channel,
     };
     let entry = module
         .functions
@@ -1036,6 +1148,28 @@ fn call_native(
                 args.len()
             ))),
         },
+        "read" => match args {
+            [] => native_read(vm),
+            _ => Err(error(format!(
+                "read expects no arguments, got {}",
+                args.len()
+            ))),
+        },
+        "read-line" => match args {
+            [] => native_read_line(vm),
+            _ => Err(error(format!(
+                "read-line expects no arguments, got {}",
+                args.len()
+            ))),
+        },
+        "eof-object?" => native_type_predicate("eof-object?", args, |v| matches!(v, Value::Eof)),
+        "write" => {
+            let value = args
+                .first()
+                .ok_or_else(|| error("write expects exactly 1 argument"))?;
+            write!(out, "{}", write_repr(value)).map_err(|e| error(e.to_string()))?;
+            Ok(Value::Unspecified)
+        }
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
 }
@@ -1216,6 +1350,65 @@ fn find_hash_value(entries: &Rc<RefCell<Vec<(Value, Value)>>>, key: &Value) -> O
         .iter()
         .find(|(k, _)| value_equal(k, key))
         .map(|(_, v)| v.clone())
+}
+
+/// Reads one complete datum from standard input as DATA, not code -- the
+/// result is never evaluated (spec 4.8), only parsed and converted the same
+/// way a quoted literal is at compile time (`sexpr_to_const`, then
+/// `const_to_value`), so `(+ 1 2)` on stdin reads back as the 3-element
+/// list `(+ 1 2)`, not the number `3`. Consumes exactly one datum's worth
+/// of `vm.stdin`, leaving the rest for a subsequent `read`/`read-line` call
+/// to continue from.
+fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
+    loop {
+        match reader::read_one(&vm.stdin_buffer) {
+            Ok((Some(sexpr), remaining)) => {
+                vm.stdin_buffer = remaining;
+                let c = sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
+                return Ok(const_to_value(&c));
+            }
+            // Either nothing parseable yet (just whitespace so far) or a
+            // genuine parse error (e.g. an unterminated list) -- both are
+            // ambiguous until we know whether more input is still coming,
+            // since a multi-line datum looks identical to malformed input
+            // until its closing delimiter actually arrives. Pull one more
+            // chunk and retry; only once the stream is truly exhausted
+            // (below) is either outcome treated as final.
+            Ok((None, _)) | Err(_) => match vm.stdin_channel.next_chunk() {
+                Some(chunk) => vm.stdin_buffer.push_str(&chunk),
+                None => {
+                    return match reader::read_one(&vm.stdin_buffer) {
+                        Ok((Some(sexpr), _)) => {
+                            let c =
+                                sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
+                            Ok(const_to_value(&c))
+                        }
+                        Ok((None, _)) => Ok(Value::Eof),
+                        Err(e) => Err(error(format!("read: {e}"))),
+                    };
+                }
+            },
+        }
+    }
+}
+
+/// Reads one line from standard input as a string, with the line-ending
+/// removed (spec 4.8) -- a final line with no trailing newline still reads
+/// as that line's text; only a call with nothing at all left to read
+/// returns the end-of-input marker.
+fn native_read_line(vm: &mut Vm) -> Result<Value, RuntimeError> {
+    loop {
+        if let Some(i) = vm.stdin_buffer.find('\n') {
+            let line = vm.stdin_buffer[..i].to_string();
+            vm.stdin_buffer = vm.stdin_buffer[i + 1..].to_string();
+            return Ok(Value::Str(Rc::new(line)));
+        }
+        match vm.stdin_channel.next_chunk() {
+            Some(chunk) => vm.stdin_buffer.push_str(&chunk),
+            None if vm.stdin_buffer.is_empty() => return Ok(Value::Eof),
+            None => return Ok(Value::Str(Rc::new(std::mem::take(&mut vm.stdin_buffer)))),
+        }
+    }
 }
 
 /// Builds a proper list back out of a `Vec`, as a genuine `Pair` chain (not
@@ -2225,6 +2418,15 @@ mod tests {
         Ok(String::from_utf8(out).unwrap())
     }
 
+    fn eval_with_stdin(src: &str, stdin: &str) -> Result<String, RuntimeError> {
+        let forms = read_program(src).expect("valid source for this test");
+        let module = compile_program(&forms).expect("compilable source for this test");
+        let mut out = Vec::new();
+        let mut input = stdin.as_bytes();
+        run_with_stdin(&module, &mut out, &mut input)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
     fn module_of(chunk: Chunk) -> Module {
         Module {
             entry_index: 0,
@@ -2466,6 +2668,8 @@ mod tests {
                         module: &module,
                         globals: default_globals(),
                         call_depth: 0,
+                        stdin_buffer: String::new(),
+                        stdin_channel: StdinChannel::none(),
                     };
                     let mut out = Vec::new();
                     let entry = &module.functions[module.entry_index as usize];
@@ -3944,6 +4148,8 @@ mod tests {
             module: &module,
             globals: default_globals(),
             call_depth: 0,
+            stdin_buffer: String::new(),
+            stdin_channel: StdinChannel::none(),
         };
         let mut out = Vec::new();
         let entry = &module.functions[module.entry_index as usize];
@@ -5283,5 +5489,157 @@ mod tests {
             .unwrap(),
             "#f"
         );
+    }
+
+    // --- B12 E1: read returns data unevaluated, advances, EOF both ways
+    // (spec 4.8) ---
+
+    #[test]
+    fn read_returns_data_unevaluated_not_the_computed_result() {
+        let out = eval_with_stdin(
+            "(define d (read)) (write d) (newline) (display (+ 1 2))",
+            "(+ 1 2)",
+        )
+        .unwrap();
+        assert_eq!(out, "(+ 1 2)\n3");
+    }
+
+    #[test]
+    fn read_advances_across_two_consecutive_calls_not_single_shot() {
+        let out = eval_with_stdin("(display (read)) (display (read))", "1 2").unwrap();
+        assert_eq!(out, "12");
+    }
+
+    #[test]
+    fn eof_object_predicate_is_true_for_the_eof_marker_and_false_for_an_ordinary_value() {
+        let out = eval_with_stdin(
+            "(display (eof-object? (read))) (display (eof-object? (read)))",
+            "1",
+        )
+        .unwrap();
+        assert_eq!(out, "#f#t");
+    }
+
+    // --- B12 E2: read-line, terminator genuinely stripped (spec 4.8) ---
+
+    #[test]
+    fn read_line_reads_successive_lines_then_the_eof_marker() {
+        let out = eval_with_stdin(
+            "(display (read-line)) (newline) (display (read-line)) (newline) \
+             (display (eof-object? (read-line))) (newline)",
+            "hello\nworld\n",
+        )
+        .unwrap();
+        assert_eq!(out, "hello\nworld\n#t\n");
+    }
+
+    #[test]
+    fn read_line_strips_the_line_terminator_genuinely_not_just_invisibly() {
+        // 5, not 6 -- confirms the '\n' itself was removed, not merely
+        // unprinted at the end of an otherwise-untouched 6-character string.
+        assert_eq!(
+            eval_with_stdin("(display (string-length (read-line)))", "hello\n").unwrap(),
+            "5"
+        );
+    }
+
+    #[test]
+    fn read_line_returns_a_final_line_with_no_trailing_newline_then_eof_next() {
+        // Distinguishes "nothing left to read" (EOF) from "one more line,
+        // just not newline-terminated" -- both look like "no '\n' found in
+        // the buffer" internally, but must produce different results.
+        let out = eval_with_stdin(
+            "(display (read-line)) (newline) (display (eof-object? (read-line)))",
+            "last",
+        )
+        .unwrap();
+        assert_eq!(out, "last\n#t");
+    }
+
+    // --- B12 E3: display prints raw text (spec 3.2) ---
+
+    #[test]
+    fn display_prints_a_strings_embedded_newline_as_a_real_line_break() {
+        assert_eq!(eval("(display \"a\\nb\")").unwrap(), "a\nb");
+    }
+
+    #[test]
+    fn display_prints_a_character_as_the_bare_character_itself() {
+        assert_eq!(eval("(display #\\a)").unwrap(), "a");
+        assert_eq!(eval("(display #\\space)").unwrap(), " ");
+    }
+
+    // --- B12 E4: write prints machine-readable, re-readable text; ordinary
+    // values look identical under both styles (spec 3.2) ---
+
+    #[test]
+    fn write_prints_a_strings_embedded_newline_as_a_literal_backslash_n() {
+        assert_eq!(eval("(write \"a\\nb\")").unwrap(), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn write_prints_a_symbol_bare_with_no_quoting() {
+        assert_eq!(eval("(write (quote sym))").unwrap(), "sym");
+    }
+
+    #[test]
+    fn write_prints_a_non_printing_character_named_contrasted_with_displays_bare_form() {
+        assert_eq!(eval("(write #\\space)").unwrap(), "#\\space");
+        assert_eq!(eval("(display #\\space)").unwrap(), " ");
+    }
+
+    #[test]
+    fn write_and_display_produce_identical_output_for_ordinary_values() {
+        assert_eq!(eval("(write 42)").unwrap(), eval("(display 42)").unwrap());
+        assert_eq!(
+            eval("(write (list 1 2 3))").unwrap(),
+            eval("(display (list 1 2 3))").unwrap()
+        );
+    }
+
+    // --- B12 E5: all output flushed, none dropped, even interleaved with
+    // reads (spec 4.8) ---
+
+    #[test]
+    fn all_output_is_present_and_in_order_when_reads_and_writes_are_interleaved() {
+        let out = eval_with_stdin(
+            "(display \"start\") (newline) (display (read-line)) (newline) (display \"end\")",
+            "middle\n",
+        )
+        .unwrap();
+        assert_eq!(out, "start\nmiddle\nend");
+    }
+
+    // --- B12 E6: integration, all three DEMO scenarios verbatim ---
+
+    #[test]
+    fn case_a_read_returns_unevaluated_data_alongside_the_separately_computed_result() {
+        let out = eval_with_stdin(
+            "(define d (read)) (write d) (newline) (display (+ 1 2)) (newline)",
+            "(+ 1 2)\n",
+        )
+        .unwrap();
+        assert_eq!(out, "(+ 1 2)\n3\n");
+    }
+
+    #[test]
+    fn case_b_two_lines_then_an_eof_check_matches_the_spec_exactly() {
+        let out = eval_with_stdin(
+            "(display (read-line)) (newline) (display (read-line)) (newline) \
+             (display (eof-object? (read-line))) (newline)",
+            "hello\nworld\n",
+        )
+        .unwrap();
+        assert_eq!(out, "hello\nworld\n#t\n");
+    }
+
+    #[test]
+    fn case_c_write_versus_display_matches_the_spec_exactly() {
+        let out = eval(
+            "(write \"a\\nb\") (newline) (display \"a\\nb\") (newline) \
+             (write (quote sym)) (newline)",
+        )
+        .unwrap();
+        assert_eq!(out, "\"a\\nb\"\na\nb\nsym\n");
     }
 }
