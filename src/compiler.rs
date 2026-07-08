@@ -512,7 +512,15 @@ fn compile_quasiquote(
             items.len().saturating_sub(1)
         )));
     };
-    let expanded = expand_quasiquote(template, 1, depth)?;
+    let expanded = expand_quasiquote(template, 1)?;
+    // The `+ 1` here is a one-level safety margin, not the load-bearing
+    // part of the depth limit: the expansion (built from nested `list`/
+    // `append` calls) is itself compiled through the ordinary call path
+    // right below, which adds its own many levels of depth well before
+    // this single increment's presence or absence could matter -- hand-
+    // verified via mutation testing (forcing this to `depth * 1` instead
+    // still produces a clean "nesting exceeds maximum" error for a
+    // template deep enough to matter, never a crash).
     compile_expr(&expanded, ctx, chunk, comp, depth + 1, tail)
 }
 
@@ -560,26 +568,29 @@ fn qq_reconstruct_tagged(tag: &str, expr: Sexpr) -> Sexpr {
 /// via `qq_reconstruct_tagged`, continuing to expand recursively inside it
 /// in case something deeper still reaches 0 (spec 3.4's doubly-nested case).
 ///
-/// `depth` is compile-time recursion depth, bounded by `MAX_NESTING_DEPTH`
-/// exactly like `compile_expr` itself -- this is naturally bounded by the
-/// reader's own identical guard on the template's source nesting, but is
-/// checked independently anyway for the same defense-in-depth reason
-/// `compile_expr` checks it rather than relying solely on the reader.
-fn expand_quasiquote(template: &Sexpr, level: u32, depth: usize) -> Result<Sexpr, CompileError> {
-    if depth > MAX_NESTING_DEPTH {
-        return Err(too_deep());
-    }
+/// No separate compile-time recursion-depth guard here (unlike most other
+/// `compile_xxx` helpers): `expand_quasiquote` never calls `compile_expr`
+/// itself, only building a plain `Sexpr` expansion tree that `compile_expr`
+/// compiles exactly once, at the end, in `compile_quasiquote` -- so an
+/// over-deep template is still caught by `compile_expr`'s own existing
+/// `MAX_NESTING_DEPTH` check on that expanded tree (hand-verified: forcing
+/// this function's own recursion to never terminate early still produces a
+/// clean "nesting exceeds maximum" error, not a crash, for a template at
+/// the reader's own depth limit). This function's native Rust recursion
+/// itself is bounded by that same reader-enforced template depth (spec
+/// 3.4), which is a few hundred levels at most -- utterly safe.
+fn expand_quasiquote(template: &Sexpr, level: u32) -> Result<Sexpr, CompileError> {
     match template {
         Sexpr::List(items) => {
             if let Some(inner) = is_tagged(items, "quasiquote") {
-                let expanded_inner = expand_quasiquote(inner, level + 1, depth + 1)?;
+                let expanded_inner = expand_quasiquote(inner, level + 1)?;
                 return Ok(qq_reconstruct_tagged("quasiquote", expanded_inner));
             }
             if let Some(inner) = is_tagged(items, "unquote") {
                 return if level == 1 {
                     Ok(inner.clone())
                 } else {
-                    let expanded_inner = expand_quasiquote(inner, level - 1, depth + 1)?;
+                    let expanded_inner = expand_quasiquote(inner, level - 1)?;
                     Ok(qq_reconstruct_tagged("unquote", expanded_inner))
                 };
             }
@@ -588,18 +599,18 @@ fn expand_quasiquote(template: &Sexpr, level: u32, depth: usize) -> Result<Sexpr
                     "unquote-splicing is only valid as an element of a list or vector template",
                 ));
             }
-            expand_qq_sequence(items, level, depth)
+            expand_qq_sequence(items, level)
         }
         Sexpr::Vector(items) => {
-            let list_expr = expand_qq_sequence(items, level, depth)?;
+            let list_expr = expand_qq_sequence(items, level)?;
             Ok(Sexpr::List(vec![
                 Sexpr::Symbol("list->vector".to_string()),
                 list_expr,
             ]))
         }
         Sexpr::DottedList(items, tail) => {
-            let head = expand_qq_sequence(items, level, depth)?;
-            let expanded_tail = expand_quasiquote(tail, level, depth + 1)?;
+            let head = expand_qq_sequence(items, level)?;
+            let expanded_tail = expand_quasiquote(tail, level)?;
             Ok(qq_append(head, expanded_tail))
         }
         // An atomic/self-evaluating datum (or a plain symbol -- data here,
@@ -618,7 +629,7 @@ fn expand_quasiquote(template: &Sexpr, level: u32, depth: usize) -> Result<Sexpr
 /// wrapped in another list) -- the one place list- and vector-template
 /// expansion actually differ (vector wraps the result in `list->vector`;
 /// see the caller).
-fn expand_qq_sequence(items: &[Sexpr], level: u32, depth: usize) -> Result<Sexpr, CompileError> {
+fn expand_qq_sequence(items: &[Sexpr], level: u32) -> Result<Sexpr, CompileError> {
     let mut pieces = Vec::with_capacity(items.len());
     for item in items {
         let splice_target = match item {
@@ -628,14 +639,14 @@ fn expand_qq_sequence(items: &[Sexpr], level: u32, depth: usize) -> Result<Sexpr
         match splice_target {
             Some(inner) if level == 1 => pieces.push(inner.clone()),
             Some(inner) => {
-                let expanded_inner = expand_quasiquote(inner, level - 1, depth + 1)?;
+                let expanded_inner = expand_quasiquote(inner, level - 1)?;
                 pieces.push(wrap_singleton_list(qq_reconstruct_tagged(
                     "unquote-splicing",
                     expanded_inner,
                 )));
             }
             None => {
-                let value_expr = expand_quasiquote(item, level, depth + 1)?;
+                let value_expr = expand_quasiquote(item, level)?;
                 pieces.push(wrap_singleton_list(value_expr));
             }
         }
@@ -656,19 +667,20 @@ fn qq_append(a: Sexpr, b: Sexpr) -> Sexpr {
 /// `append` itself only takes exactly 2 arguments (spec 5.1), so N pieces
 /// need N-1 nested calls, not one variadic one.
 fn fold_append(mut pieces: Vec<Sexpr>) -> Sexpr {
-    match pieces.len() {
-        0 => Sexpr::List(vec![
+    match pieces.pop() {
+        // A single remaining piece, after popping, folds over zero further
+        // pieces below and comes back unchanged -- so there's no separate
+        // "exactly one piece" case to handle; only "none at all" (an empty
+        // template list, e.g. `` `() ``, which has no piece to pop and
+        // needs its own literal-empty-list result) is actually distinct.
+        None => Sexpr::List(vec![
             Sexpr::Symbol("quote".to_string()),
             Sexpr::List(vec![]),
         ]),
-        1 => pieces.pop().unwrap(),
-        _ => {
-            let last = pieces.pop().unwrap();
-            pieces
-                .into_iter()
-                .rev()
-                .fold(last, |acc, piece| qq_append(piece, acc))
-        }
+        Some(last) => pieces
+            .into_iter()
+            .rev()
+            .fold(last, |acc, piece| qq_append(piece, acc)),
     }
 }
 

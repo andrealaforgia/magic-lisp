@@ -5807,6 +5807,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unquote_splicing_nested_inside_a_second_backquote_does_not_prematurely_splice() {
+        // The splicing counterpart to the singly-unquoted case above: at
+        // level 2, a single `,@` doesn't reach level 0 either, so it must
+        // be reconstructed as literal (unquote-splicing ...) data instead
+        // of actually splicing in at this (wrong) level.
+        assert_eq!(
+            eval("(display `(a `(b ,@c)))").unwrap(),
+            "(a (quasiquote (b (unquote-splicing c))))"
+        );
+    }
+
+    #[test]
+    fn unquote_splicings_own_operand_correctly_lowers_to_the_next_level_down() {
+        // Distinguishes a correctly-computed "one level down" for
+        // unquote-splicing's operand (when the splice itself doesn't fire,
+        // since level != 1) from an incorrectly-computed one: only with
+        // the right level does the operand's OWN nested unquote (,@,w) in
+        // turn reach level 0 and get evaluated to 99, rather than staying
+        // literal as the unevaluated symbol w.
+        assert_eq!(
+            eval("(define w 99) (display `(a `(b ,@,w)))").unwrap(),
+            "(a (quasiquote (b (unquote-splicing 99))))"
+        );
+    }
+
+    #[test]
+    fn quasiquoting_an_empty_list_produces_the_empty_list() {
+        assert_eq!(eval("(display `())").unwrap(), "()");
+    }
+
     // --- B13 E5: both markers work inside a vector template too ---
 
     #[test]
