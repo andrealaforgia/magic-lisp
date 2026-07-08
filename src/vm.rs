@@ -1,7 +1,7 @@
 //! Bytecode virtual machine.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::rc::Rc;
 
@@ -137,10 +137,30 @@ fn const_to_value(c: &Const) -> Value {
         Const::Vector(items) => Value::Vector(Rc::new(RefCell::new(
             items.iter().map(const_to_value).collect(),
         ))),
-        Const::Pair(car, cdr) => Value::Pair(Rc::new(RefCell::new((
-            const_to_value(car),
-            const_to_value(cdr),
-        )))),
+        Const::Pair(car, cdr) => {
+            // Walks the cdr spine iteratively, then folds the result back
+            // into a Pair chain from the tail outward: a dotted-list
+            // literal's `Const::Pair` chain length is program data, not
+            // nesting depth, so recursing here once per element would
+            // crash on an ordinary large literal (warden security review,
+            // msg #146) even though the source is a single flat form.
+            let mut cars = vec![const_to_value(car)];
+            let mut tail: &Const = cdr;
+            let final_tail = loop {
+                match tail {
+                    Const::Pair(next_car, next_cdr) => {
+                        cars.push(const_to_value(next_car));
+                        tail = next_cdr;
+                    }
+                    other => break const_to_value(other),
+                }
+            };
+            let mut acc = final_tail;
+            for car in cars.into_iter().rev() {
+                acc = Value::Pair(Rc::new(RefCell::new((car, acc))));
+            }
+            acc
+        }
         Const::Unspecified => Value::Unspecified,
     }
 }
@@ -889,9 +909,16 @@ fn native_set_half(
 /// `List`, or a `List` outright) into a plain `Vec` -- the shared traversal
 /// behind every B9 list operation, so each one doesn't have to walk both
 /// representations itself.
+///
+/// Tracks visited `Pair` addresses so a circular list (constructible via
+/// `set-cdr!`) is a clean error instead of spinning forever at 100% CPU
+/// (warden security review, msg #146) -- every caller here already treats
+/// an ordinary non-list value as a clean error, so a circular one erroring
+/// too is the same kind of boundary, not a new one.
 fn list_to_vec(opname: &str, v: &Value) -> Result<Vec<Value>, RuntimeError> {
     let mut out = Vec::new();
     let mut current = v.clone();
+    let mut seen = HashSet::new();
     loop {
         match current {
             Value::List(items) => {
@@ -899,6 +926,11 @@ fn list_to_vec(opname: &str, v: &Value) -> Result<Vec<Value>, RuntimeError> {
                 return Ok(out);
             }
             Value::Pair(cell) => {
+                if !seen.insert(Rc::as_ptr(&cell) as usize) {
+                    return Err(error(format!(
+                        "{opname} expects an acyclic list, found a circular list"
+                    )));
+                }
                 let (car, cdr) = {
                     let borrowed = cell.borrow();
                     (borrowed.0.clone(), borrowed.1.clone())
@@ -976,6 +1008,11 @@ fn native_member(
         )));
     };
     let mut current = haystack.clone();
+    // Tracks visited Pair addresses so a circular haystack (via set-cdr!)
+    // is a clean "not found" instead of spinning forever (warden security
+    // review, msg #146) -- once a pair repeats, every element reachable
+    // from the haystack has already been checked against needle.
+    let mut seen = HashSet::new();
     loop {
         match current {
             Value::List(items) => {
@@ -985,6 +1022,9 @@ fn native_member(
                 return Ok(vec_to_list(items[pos..].to_vec()));
             }
             Value::Pair(cell) => {
+                if !seen.insert(Rc::as_ptr(&cell) as usize) {
+                    return Ok(Value::Bool(false));
+                }
                 let (car, cdr) = {
                     let borrowed = cell.borrow();
                     (borrowed.0.clone(), borrowed.1.clone())
@@ -3576,6 +3616,23 @@ mod tests {
     }
 
     #[test]
+    fn mutating_a_pair_through_one_binding_is_observed_through_an_aliased_binding() {
+        // qa test-design review (msg #145): pair-mutation tests only
+        // verified through the same binding that performed the mutation --
+        // this checks the mutation is observed via a SEPARATE binding to
+        // the same underlying pair (the same "shared vs. copied" property
+        // this project has verified since B5's closures).
+        assert_eq!(
+            eval("(define p (cons 1 2)) (define q p) (set-car! p 99) (display (car q))").unwrap(),
+            "99"
+        );
+        assert_eq!(
+            eval("(define p (cons 1 2)) (define q p) (set-cdr! q 99) (display (cdr p))").unwrap(),
+            "99"
+        );
+    }
+
+    #[test]
     fn cadr_reaches_the_second_element() {
         assert_eq!(eval("(display (cadr (cons 1 (cons 2 3))))").unwrap(), "2");
     }
@@ -3601,6 +3658,19 @@ mod tests {
             eval("(display (caddr (cons 1 (cons 2 (cons 3 4)))))").unwrap(),
             "3"
         );
+    }
+
+    #[test]
+    fn composed_cxr_accessors_are_clean_runtime_errors_on_malformed_input() {
+        // qa test-design review (msg #145): only the base car/cdr had an
+        // error-path test; cadr/caar/cdar/cddr/caddr compose car_of/cdr_of
+        // but hadn't been checked to fail cleanly (not panic) when an
+        // intermediate step isn't a pair.
+        assert!(eval("(display (cadr (cons 1 2)))").is_err());
+        assert!(eval("(display (caar (cons 1 2)))").is_err());
+        assert!(eval("(display (cdar (cons 1 2)))").is_err());
+        assert!(eval("(display (cddr (cons 1 2)))").is_err());
+        assert!(eval("(display (caddr (cons 1 2)))").is_err());
     }
 
     #[test]
@@ -3856,6 +3926,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn map_filter_and_for_each_on_the_empty_list() {
+        // qa test-design review (msg #145): only reduce covered the
+        // empty-list edge case among this iteration's higher-order
+        // procedures.
+        assert_eq!(
+            eval("(display (map (lambda (x) (* x x)) (quote ())))").unwrap(),
+            "()"
+        );
+        assert_eq!(eval("(display (filter odd? (quote ())))").unwrap(), "()");
+        assert_eq!(
+            eval("(for-each (lambda (x) (display x)) (quote ()))").unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn map_and_filter_on_a_single_element_list() {
+        assert_eq!(
+            eval("(display (map (lambda (x) (* x x)) (list 5)))").unwrap(),
+            "(25)"
+        );
+        assert_eq!(eval("(display (filter odd? (list 5)))").unwrap(), "(5)");
+        assert_eq!(eval("(display (filter odd? (list 4)))").unwrap(), "()");
+    }
+
     // --- B9 E6: fold-left/fold-right/reduce (spec 5.1) ---
 
     #[test]
@@ -3883,6 +3979,15 @@ mod tests {
         assert_eq!(
             eval("(display (fold-right - 0 (list 1 2 3)))").unwrap(),
             "2"
+        );
+    }
+
+    #[test]
+    fn fold_left_and_fold_right_on_the_empty_list_return_the_initial_value() {
+        assert_eq!(eval("(display (fold-left + 0 (quote ())))").unwrap(), "0");
+        assert_eq!(
+            eval("(display (fold-right cons (quote ()) (quote ())))").unwrap(),
+            "()"
         );
     }
 
@@ -4015,5 +4120,33 @@ mod tests {
                    (display (list? a)) (newline) \
                    (display (car (last-pair a)))";
         assert_eq!(eval(src).unwrap(), "#t\n#t\n8000000");
+    }
+
+    // --- qa/warden msg #146: list operations must not hang forever on a
+    // circular list (constructible via set-cdr! since this iteration) ---
+
+    #[test]
+    fn length_on_a_circular_list_is_a_clean_error_not_a_hang() {
+        assert!(
+            eval("(define p (list 1 2 3)) (set-cdr! (last-pair p) p) (display (length p))")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn member_on_a_circular_list_with_no_match_returns_false_not_a_hang() {
+        assert_eq!(
+            eval("(define p (list 1 2 3)) (set-cdr! (last-pair p) p) (display (member 99 p))")
+                .unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn displaying_a_circular_list_terminates_with_an_ellipsis_not_a_hang() {
+        assert_eq!(
+            eval("(define p (list 1 2 3)) (set-cdr! (last-pair p) p) (display p)").unwrap(),
+            "(1 2 3 ...)"
+        );
     }
 }

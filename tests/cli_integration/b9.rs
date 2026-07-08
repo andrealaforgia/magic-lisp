@@ -1,6 +1,7 @@
 //! B9: pairs and lists (spec 5.1).
 
-use super::helpers::{eval_ok, run_demo};
+use super::helpers::{eval_ok, run, run_demo, write_source};
+use magiclisp::exitcode::SUCCESS;
 
 #[test]
 fn b9_e1_pair_mutation_and_cxr_accessors() {
@@ -259,4 +260,27 @@ fn b9_e9_all_fourteen_demo_expressions_produce_exactly_the_prescribed_output() {
         run_demo("b9-e9-14.ml", "(display (member 2 (list 1 2 3)))"),
         "(2 3)\n"
     );
+}
+
+#[test]
+fn a_large_dotted_list_literal_evaluates_cleanly_instead_of_crashing_the_process() {
+    // Regression test for warden security review msg #146: a dotted-list
+    // literal `(1 2 3 ... N . tail)` is one flat pair of parens (nesting
+    // depth 1), so it never hits the reader's own nesting-depth guard, but
+    // its element count has no bound -- large enough, this used to abort
+    // the whole process (a real crash, not a clean error) with no set-cdr!,
+    // no loop, and no runtime construction at all: just this literal.
+    let n = 1_000_000;
+    let items: String = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
+    let src = format!("(display (car (quote ({items} . 0))))");
+    let file = write_source("b9-large-dotted.ml", &src);
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "expected a clean exit, got: {:?} (stderr: {})",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "0");
 }

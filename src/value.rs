@@ -110,9 +110,18 @@ fn display_pair_chain(
     let first = cell.borrow().0.clone();
     write!(f, "{first}")?;
     let mut current = cell.borrow().1.clone();
+    // Tracks visited Pair addresses so a circular list (via set-cdr!)
+    // prints `...` and stops instead of printing forever (warden security
+    // review, msg #146).
+    let mut seen = HashSet::new();
+    seen.insert(Rc::as_ptr(cell) as usize);
     loop {
         match current {
             Value::Pair(next) => {
+                if !seen.insert(Rc::as_ptr(&next) as usize) {
+                    write!(f, " ...")?;
+                    break;
+                }
                 let (car, cdr) = {
                     let borrowed = next.borrow();
                     (borrowed.0.clone(), borrowed.1.clone())

@@ -41,11 +41,21 @@ fn describe_const_value(c: &Const) -> String {
             format!("#({})", inner.join(" "))
         }
         Const::Pair(car, cdr) => {
-            format!(
-                "({} . {})",
-                describe_const_value(car),
-                describe_const_value(cdr)
-            )
+            // Walks the cdr spine iteratively, not recursively -- same
+            // unbounded-chain-length reason as bytecode.rs's encode_const.
+            let mut parts = vec![describe_const_value(car)];
+            let mut tail: &Const = cdr;
+            loop {
+                match tail {
+                    Const::Pair(next_car, next_cdr) => {
+                        parts.push(describe_const_value(next_car));
+                        tail = next_cdr;
+                    }
+                    other => {
+                        return format!("({} . {})", parts.join(" "), describe_const_value(other));
+                    }
+                }
+            }
         }
         Const::Unspecified => "<unspecified>".to_string(),
     }

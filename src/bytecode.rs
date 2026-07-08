@@ -55,6 +55,30 @@ pub enum Const {
     Unspecified,
 }
 
+impl Drop for Const {
+    /// Without this, dropping a long dotted-list literal's `Const::Pair`
+    /// chain would recurse once per element via Rust's default field-drop
+    /// glue -- a chain length with no bound (it's the literal's element
+    /// count, not nesting depth) -- crashing on the *compiling* thread's
+    /// ordinary-sized stack even though the literal is a single flat form
+    /// (warden security review, msg #146; confirmed to crash a plain
+    /// `eval` at ~500,000 elements despite `encode_const`/`const_to_value`
+    /// already being iterative, since the actual crash was here, at drop
+    /// time, not during either of those). Detaches and drops the cdr chain
+    /// with an explicit loop instead.
+    fn drop(&mut self) {
+        let Const::Pair(_, cdr) = self else {
+            return;
+        };
+        let mut pending = vec![std::mem::replace(cdr.as_mut(), Const::Unspecified)];
+        while let Some(mut current) = pending.pop() {
+            if let Const::Pair(_, cdr) = &mut current {
+                pending.push(std::mem::replace(cdr.as_mut(), Const::Unspecified));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Chunk {
     pub code: Vec<u8>,
@@ -257,9 +281,29 @@ fn encode_const(out: &mut Vec<u8>, c: &Const) {
             }
         }
         Const::Pair(car, cdr) => {
+            // Walks the cdr spine iteratively instead of recursing: a
+            // dotted-list literal `(1 2 3 ... N . tail)` is one flat pair
+            // of parens (nesting depth 1, never touching the reader's
+            // MAX_NESTING_DEPTH), but produces a `Const::Pair` chain N
+            // deep -- chain length is program data, not nesting depth, so
+            // it has no bound. Only each car (bounded by ordinary nesting
+            // depth, like `List`/`Vector` items) still recurses.
             out.push(9);
             encode_const(out, car);
-            encode_const(out, cdr);
+            let mut tail: &Const = cdr;
+            loop {
+                match tail {
+                    Const::Pair(next_car, next_cdr) => {
+                        out.push(9);
+                        encode_const(out, next_car);
+                        tail = next_cdr;
+                    }
+                    other => {
+                        encode_const(out, other);
+                        break;
+                    }
+                }
+            }
         }
     }
 }
