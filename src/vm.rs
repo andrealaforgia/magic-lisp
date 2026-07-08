@@ -4124,6 +4124,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy: ~60s and ~2.7GB RSS in a debug build (qa test-design \
+                review msg #148) -- run explicitly with `cargo test -- --ignored` \
+                rather than in the default fast suite. Deliberately this large: \
+                a smaller size (qa suggested 200-500k) wouldn't actually \
+                reproduce the pre-fix crash, which only manifested at \
+                8,000,000 elements (confirmed via manual reversion)."]
     fn value_equal_list_predicate_and_last_pair_complete_on_a_multi_million_element_pair_chain() {
         // Regression test for warden security review msg #144: equal?'s
         // Pair-chain walk, list?, and last-pair must each be iterative, not
