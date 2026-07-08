@@ -1109,6 +1109,32 @@ mod tests {
     }
 
     #[test]
+    fn unquote_shorthand_nesting_is_bounded_by_the_same_depth_limit_as_lists() {
+        // qa test-design review (msg #219): the backtick-repeated boundary
+        // test above doesn't, by itself, prove the SAME holds for `,` and
+        // `,@` -- structurally identical in the code, but not directly
+        // tested until now.
+        let src = format!("{}x", ",".repeat(MAX_NESTING_DEPTH + 1));
+        let err = read_program(&src).unwrap_err();
+        assert!(
+            err.message.contains("nesting") && err.message.contains("depth"),
+            "expected a nesting-depth error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn unquote_splicing_shorthand_nesting_is_bounded_by_the_same_depth_limit_as_lists() {
+        let src = format!("{}x", ",@".repeat(MAX_NESTING_DEPTH + 1));
+        let err = read_program(&src).unwrap_err();
+        assert!(
+            err.message.contains("nesting") && err.message.contains("depth"),
+            "expected a nesting-depth error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn unquote_with_no_following_datum_is_a_clean_read_error() {
         assert!(read_program(",").is_err());
         assert!(read_program(",@").is_err());

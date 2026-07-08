@@ -5638,13 +5638,26 @@ mod tests {
         // after every single new line, making a datum spread across N
         // lines cost O(N^2) -- confirmed pre-fix to still be running after
         // 60s at N=100,000. The exponential-backoff retry fix keeps total
-        // re-parse work linear in the final size; this completing well
-        // within the default test timeout (rather than hanging) is the
-        // actual regression signal, not a precise timing assertion.
+        // re-parse work linear in the final size.
+        //
+        // Explicit elapsed-time assertion (qa test-design review msg #217:
+        // without one, this project has no per-test timeout configured, so
+        // a reintroduced O(n^2) bug would only surface as an eventual,
+        // unattributed CI-job-level timeout instead of a clean, localized
+        // failure here) -- 10s is a generous multiple of this test's
+        // actual ~1s cost in an unoptimized debug build, comfortably below
+        // the 60+s the pre-fix quadratic behavior took at this same size.
         let stdin: String = (0..100_000).map(|i| format!("{i}\n")).collect();
         let stdin = format!("(\n{stdin})");
+        let start = std::time::Instant::now();
         let out = eval_with_stdin("(display (length (read)))", &stdin).unwrap();
+        let elapsed = start.elapsed();
         assert_eq!(out, "100000");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "expected well under 10s for a linear-time read, took {elapsed:?} \
+             -- likely a reintroduced O(n^2) regression"
+        );
     }
 
     #[test]
@@ -5875,6 +5888,19 @@ mod tests {
         assert_eq!(
             eval("(display `(a `(b ,@c)))").unwrap(),
             "(a (quasiquote (b (unquote-splicing c))))"
+        );
+    }
+
+    #[test]
+    fn unquote_splicing_as_the_sole_element_of_a_nested_template_reconstructs_correctly() {
+        // qa test-design review (msg #220): the compiler-level test for
+        // this exact template only asserted compile_program(...).is_ok(),
+        // which wouldn't catch a bug in the reconstructed literal shape
+        // (e.g. a missing wrapper list, or the splice firing prematurely).
+        // This checks the actual produced value.
+        assert_eq!(
+            eval("(display `(a `(,@b)))").unwrap(),
+            "(a (quasiquote ((unquote-splicing b))))"
         );
     }
 

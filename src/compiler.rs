@@ -2992,4 +2992,42 @@ mod tests {
             error.message
         );
     }
+
+    #[test]
+    fn bare_unquote_outside_quasiquote_is_not_a_compile_error_but_fails_cleanly_at_runtime() {
+        // qa test-design review (msg #220): a stray `,x` at the top level
+        // (outside any quasiquote template) isn't specially recognized by
+        // compile_expr's dispatch -- only expand_quasiquote's own internal
+        // matching knows about `unquote`/`unquote-splicing` -- so it falls
+        // through to ordinary function-call compilation against an
+        // undefined global `unquote`, failing at runtime rather than
+        // compile time. Pinned here as a deliberate, accepted design
+        // choice, so a future change to this behavior is a conscious
+        // decision, not an accidental regression.
+        let forms = crate::reader::read_program(",x").unwrap();
+        let module =
+            compile_program(&forms).expect("should compile (falls through to an ordinary call)");
+        let mut out = Vec::new();
+        assert!(crate::vm::run(&module, &mut out).is_err());
+    }
+
+    #[test]
+    fn quasiquote_compiles_to_only_already_existing_opcodes_no_new_bytecode() {
+        // qa test-design review (msg #220): the "no new bytecode" claim in
+        // quasiquote's own design doc comment was previously unverified --
+        // nothing would have caught a future change that special-cased
+        // quasiquote with a dedicated opcode (same output, different
+        // bytecode, every functional test still passing). `opcode_sequence`
+        // panics on any byte it doesn't recognize, so successfully decoding
+        // a compiled quasiquote expression's bytecode here IS the guard:
+        // a genuinely new opcode would make this test panic, not just the
+        // ones that happen to exercise it directly.
+        let forms = crate::reader::read_program("`(1 ,(+ 1 1) ,@(list 2 3) #(4 ,5) . ,6)").unwrap();
+        let module = compile_program(&forms).unwrap();
+        let entry = entry_of(&module);
+        // Doesn't panic => every opcode byte is one `opcode_sequence`
+        // already knows how to decode.
+        let ops = opcode_sequence(&entry.code);
+        assert!(!ops.is_empty());
+    }
 }
