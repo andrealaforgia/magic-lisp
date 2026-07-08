@@ -2,10 +2,11 @@
 //! slice's tests below. Kept in one place so each slice module only carries
 //! its own test bodies.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use magiclisp::exitcode::{BAD_ARTIFACT, SUCCESS};
 
@@ -33,6 +34,26 @@ pub(crate) fn run(args: &[&str]) -> Output {
     magiclisp().args(args).output().expect("binary should run")
 }
 
+/// The wall-clock ceiling for [`run_with_stdin`]'s child process. Every
+/// real scenario finishes in well under a second; this only exists to turn
+/// a genuine hang-class regression into a fast, clear test failure instead
+/// of blocking the whole suite indefinitely (qa test-design review msg
+/// #213) -- generous on purpose, mirroring this project's own established
+/// "the pre-fix bug never finished quickly, so any reasonable ceiling
+/// distinguishes fixed from broken" reasoning.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Spawns `magiclisp`, feeds it `stdin_data`, and returns its `Output`.
+///
+/// Writes stdin and drains stdout/stderr concurrently on separate threads
+/// rather than writing synchronously before waiting: a child that produces
+/// enough output to fill the OS pipe buffer (~64KB) while still blocked
+/// waiting for more stdin would otherwise deadlock the harness itself --
+/// `std::process`'s own docs warn against exactly this pattern. Also
+/// enforces `CHILD_TIMEOUT` via `try_wait` polling, since production code
+/// (`vm::run_with_stdin`) goes to real lengths to structurally rule out
+/// hangs and this harness testing it deserves the equivalent discipline,
+/// especially given this project's specific hang-class-bug history.
 pub(crate) fn run_with_stdin(args: &[&str], stdin_data: &[u8]) -> Output {
     let mut child = magiclisp()
         .args(args)
@@ -41,8 +62,69 @@ pub(crate) fn run_with_stdin(args: &[&str], stdin_data: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("binary should spawn");
-    child.stdin.take().unwrap().write_all(stdin_data).unwrap();
-    child.wait_with_output().expect("binary should run")
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stdin_data = stdin_data.to_vec();
+
+    let stdin_writer = std::thread::spawn(move || {
+        // A closed pipe (the child exited before consuming all of stdin,
+        // e.g. it never called read/read-line) is an expected outcome for
+        // some scenarios, not a harness bug.
+        let _ = stdin.write_all(&stdin_data);
+    });
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout
+            .read_to_end(&mut buf)
+            .expect("reading child stdout should not fail");
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr
+            .read_to_end(&mut buf)
+            .expect("reading child stderr should not fail");
+        buf
+    });
+
+    let status = wait_with_timeout(&mut child, CHILD_TIMEOUT);
+    let stdout = stdout_reader
+        .join()
+        .expect("stdout reader thread should not panic");
+    let stderr = stderr_reader
+        .join()
+        .expect("stderr reader thread should not panic");
+    stdin_writer
+        .join()
+        .expect("stdin writer thread should not panic");
+
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "magiclisp process did not exit within {timeout:?} -- likely a hang, not a slow test"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub(crate) fn stdout_of(output: &Output) -> String {
