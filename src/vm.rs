@@ -4637,4 +4637,33 @@ mod tests {
         assert_eq!(eval("(display (string-ref \"aé\" 0))").unwrap(), "a");
         assert_eq!(eval("(display (string-ref \"aé\" 1))").unwrap(), "é");
     }
+
+    // --- B10 E8: integration: all seventeen demo expressions in one program ---
+
+    #[test]
+    fn all_seventeen_demo_expressions_produce_exactly_the_prescribed_output() {
+        assert_eq!(
+            eval(
+                "(display (string-length \"hello\")) (newline) \
+                 (display (string-ref \"hello\" 1)) (newline) \
+                 (display (substring \"hello\" 1 4)) (newline) \
+                 (display (string-append \"foo\" \"bar\")) (newline) \
+                 (display (string=? \"abc\" \"abc\")) (newline) \
+                 (display (string<? \"abc\" \"abd\")) (newline) \
+                 (display (string-upcase \"abc\")) (newline) \
+                 (display (symbol->string (quote hello))) (newline) \
+                 (display (string->symbol \"world\")) (newline) \
+                 (display (char->integer #\\A)) (newline) \
+                 (display (integer->char 66)) (newline) \
+                 (display (char-alphabetic? #\\a)) (newline) \
+                 (display (char-numeric? #\\5)) (newline) \
+                 (display (list->string (list #\\h #\\i))) (newline) \
+                 (display (string->list \"ab\")) (newline) \
+                 (display (string-length \"aé\")) (newline) \
+                 (display (string-ref \"aé\" 1)) (newline)"
+            )
+            .unwrap(),
+            "5\ne\nell\nfoobar\n#t\n#t\nABC\nhello\nworld\n65\nB\n#t\n#t\nhi\n(a b)\n2\né\n"
+        );
+    }
 }
