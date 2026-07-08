@@ -4618,6 +4618,15 @@ mod tests {
     }
 
     #[test]
+    fn char_alphabetic_is_true_for_a_non_ascii_letter() {
+        // qa test-design review (msg #171): ASCII-only coverage of
+        // char-alphabetic?/char-numeric?/char-whitespace? can't catch a
+        // regression to ASCII-only predicates, since Rust's underlying
+        // is_alphabetic()/is_numeric()/is_whitespace() are Unicode-aware.
+        assert_eq!(eval("(display (char-alphabetic? #\\é))").unwrap(), "#t");
+    }
+
+    #[test]
     fn char_numeric_is_shown_both_true_and_false() {
         assert_eq!(eval("(display (char-numeric? #\\5))").unwrap(), "#t");
         assert_eq!(eval("(display (char-numeric? #\\a))").unwrap(), "#f");
