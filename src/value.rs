@@ -646,4 +646,71 @@ mod tests {
         assert!(is_truthy(&Value::Str(Rc::new(String::new()))));
         assert!(is_truthy(&Value::Unspecified));
     }
+
+    // --- qa test-design review (msg #204): write_repr/Display must
+    // genuinely differ for strings/characters, and Value::Eof needs direct
+    // coverage of its own Display/equality behavior, not just end-to-end
+    // coverage through eval() at the vm.rs layer ---
+
+    #[test]
+    fn write_repr_quotes_and_escapes_a_string_that_display_prints_raw() {
+        let s = Value::Str(Rc::new("a\nb".to_string()));
+        assert_eq!(s.to_string(), "a\nb");
+        assert_eq!(write_repr(&s), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn write_repr_escapes_every_special_character_the_reader_accepts_back() {
+        let s = Value::Str(Rc::new("\"\\\n\t\r".to_string()));
+        assert_eq!(write_repr(&s), "\"\\\"\\\\\\n\\t\\r\"");
+    }
+
+    #[test]
+    fn write_repr_names_a_non_printing_character_that_display_shows_bare() {
+        let space = Value::Char(' ');
+        assert_eq!(space.to_string(), " ");
+        assert_eq!(write_repr(&space), "#\\space");
+
+        let newline = Value::Char('\n');
+        assert_eq!(write_repr(&newline), "#\\newline");
+
+        let tab = Value::Char('\t');
+        assert_eq!(write_repr(&tab), "#\\tab");
+    }
+
+    #[test]
+    fn write_repr_shows_an_ordinary_character_the_same_bare_way_as_display() {
+        let a = Value::Char('a');
+        assert_eq!(a.to_string(), "a");
+        assert_eq!(write_repr(&a), "#\\a");
+    }
+
+    #[test]
+    fn write_repr_matches_display_exactly_for_non_string_non_character_values() {
+        assert_eq!(write_repr(&Value::Int(42)), Value::Int(42).to_string());
+        assert_eq!(
+            write_repr(&Value::Bool(true)),
+            Value::Bool(true).to_string()
+        );
+        let list = Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(write_repr(&list), list.to_string());
+    }
+
+    #[test]
+    fn eof_displays_as_a_dedicated_opaque_form() {
+        assert_eq!(Value::Eof.to_string(), "#<eof>");
+    }
+
+    #[test]
+    fn eof_is_eqv_to_itself_but_not_to_an_ordinary_value() {
+        assert!(value_eqv(&Value::Eof, &Value::Eof));
+        assert!(!value_eqv(&Value::Eof, &Value::Int(0)));
+        assert!(!value_eqv(&Value::Unspecified, &Value::Eof));
+    }
+
+    #[test]
+    fn eof_is_equal_to_itself_but_not_to_an_ordinary_value() {
+        assert!(value_equal(&Value::Eof, &Value::Eof));
+        assert!(!value_equal(&Value::Eof, &Value::Bool(false)));
+    }
 }

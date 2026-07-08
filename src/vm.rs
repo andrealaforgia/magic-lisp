@@ -5268,6 +5268,21 @@ mod tests {
     }
 
     #[test]
+    fn hash_ref_error_message_formats_a_cross_type_cyclic_missing_key_without_crashing() {
+        // qa test-design warning (msg #200): "key not found" error messages
+        // Display-format the missing key -- a second, previously
+        // undisclosed entry point to the cross-type Pair/Vector cycle
+        // crash, distinct from a direct `display` call in the user's own
+        // source. Regression-pins that this path stays cycle-safe.
+        let err = eval(
+            "(define p (cons 1 2)) (define v (vector p)) (set-cdr! p v) \
+             (hash-ref (make-hash) v)",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
     fn hash_has_key_reflects_removal() {
         assert_eq!(
             eval(
@@ -5428,15 +5443,27 @@ mod tests {
 
     #[test]
     fn make_vector_past_the_maximum_length_is_a_clean_runtime_error_not_an_allocation() {
-        let err = eval("(display (make-vector 999999999999))").unwrap_err();
+        // Exactly one past the limit, matching this codebase's own
+        // established boundary-test convention (MAX_CALL_DEPTH,
+        // MAX_NESTING_DEPTH) -- not just some arbitrarily huge number,
+        // which would leave the true boundary itself unverified (qa
+        // test-design review, msg #203).
+        let err = eval(&format!(
+            "(display (make-vector {}))",
+            MAX_VECTOR_LENGTH + 1
+        ))
+        .unwrap_err();
         assert!(err.message.contains("exceeds the maximum"));
     }
 
     #[test]
     fn make_vector_at_exactly_the_maximum_length_still_succeeds() {
         assert_eq!(
-            eval("(display (vector-length (make-vector 10000000)))").unwrap(),
-            "10000000"
+            eval(&format!(
+                "(display (vector-length (make-vector {MAX_VECTOR_LENGTH})))"
+            ))
+            .unwrap(),
+            MAX_VECTOR_LENGTH.to_string()
         );
     }
 

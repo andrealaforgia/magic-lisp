@@ -942,4 +942,34 @@ mod tests {
         assert_eq!(form, None);
         assert_eq!(rest, "");
     }
+
+    #[test]
+    fn read_one_on_an_unterminated_datum_is_a_clean_error_not_a_partial_success() {
+        // A malformed/incomplete list (e.g. streamed input that hasn't
+        // finished arriving yet) must error cleanly, not silently succeed
+        // with a truncated or corrupted `Sexpr` -- a caller (the `read`
+        // native) that retries once more input has arrived needs a clean
+        // signal to distinguish "not done yet" from "a real parse".
+        assert!(read_one("(1 2").is_err());
+    }
+
+    #[test]
+    fn a_caller_can_retry_read_one_with_growing_input_after_an_unterminated_error() {
+        // Confirms retrying against the SAME logical stream, once complete,
+        // still parses correctly -- an error on incomplete input doesn't
+        // leave any state that could corrupt a subsequent, complete attempt
+        // (read_one is stateless: each call is independent of any prior
+        // one, so this is really confirming that independence holds).
+        assert!(read_one("(1 2").is_err());
+        let (form, rest) = read_one("(1 2 3)").unwrap();
+        assert_eq!(
+            form,
+            Some(Sexpr::List(vec![
+                Sexpr::Int(1),
+                Sexpr::Int(2),
+                Sexpr::Int(3)
+            ]))
+        );
+        assert_eq!(rest, "");
+    }
 }
