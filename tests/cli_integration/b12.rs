@@ -178,3 +178,70 @@ fn read_completes_promptly_even_when_stdin_stays_open_after_a_complete_datum() {
     drop(stdin);
     assert!(status.success(), "expected a clean exit, got: {status:?}");
 }
+
+#[test]
+fn read_completes_promptly_for_a_datum_delivered_in_far_more_than_sixty_four_small_chunks() {
+    // Regression test for warden security review msg #226 and qa msg #227:
+    // the previous fix for the test above only retried eagerly for the
+    // first 64 chunks of a read, then fell back to size-based backoff --
+    // which merely moved the same interactive stall to any datum spread
+    // across MORE than 64 chunks, independently reproduced by both
+    // reviewers (152 and 100 one-byte-at-a-time writes respectively).
+    // Unlike that test's single `write_all` call (which the OS typically
+    // delivers to the reader as one chunk, so it could never have caught
+    // this), this one writes one byte at a time with a small delay after
+    // each -- forcing the child's underlying reads to actually happen in
+    // many separate small pieces -- for a datum comfortably past the old
+    // 64-chunk threshold, then keeps stdin open afterward and asserts
+    // completion anyway.
+    let file = write_source(
+        "b12-read-many-small-chunks.ml",
+        "(display (length (read)))",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let datum: String = (0..150).map(|i| format!(" {i}")).collect();
+    let bytes = format!("({datum})");
+    assert!(
+        bytes.len() > 150,
+        "datum must span well over 64 single-byte chunks"
+    );
+    for byte in bytes.as_bytes() {
+        stdin
+            .write_all(std::slice::from_ref(byte))
+            .and_then(|()| stdin.flush())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not complete within 5s of its datum finishing \
+                 while stdin stayed open, chunked into far more than 64 \
+                 pieces -- the interactive-stream stall regression"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(status.success(), "expected a clean exit, got: {status:?}");
+}

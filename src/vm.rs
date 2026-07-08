@@ -301,14 +301,23 @@ struct Vm<'m> {
 /// short, already-closed pipe.
 struct StdinChannel {
     request: mpsc::Sender<()>,
-    response: mpsc::Receiver<Option<Vec<u8>>>,
+    response: mpsc::Receiver<Option<(Vec<u8>, bool)>>,
 }
 
 impl StdinChannel {
     /// Requests and returns the next raw chunk -- however many bytes are
-    /// immediately available, not line-delimited -- or `None` once the
-    /// underlying stream is genuinely exhausted (or, for [`Self::none`],
-    /// unconditionally).
+    /// immediately available, not line-delimited -- alongside whether that
+    /// read was "full" (returned as many bytes as the relay's fixed-size
+    /// buffer could hold), or `None` once the underlying stream is
+    /// genuinely exhausted (or, for [`Self::none`], unconditionally).
+    ///
+    /// The `bool` is a short-read signal, not a chunk-count/size proxy: a
+    /// full read means the OS *might* already have more sitting in its
+    /// buffer, ready to hand over without blocking, so it's worth reading
+    /// again before spending time re-parsing; a short read (`false`) means
+    /// the source had no more to give RIGHT NOW, which is the caller's one
+    /// reliable, immediate signal that this is the moment to actually try
+    /// parsing what's accumulated so far, however many chunks that took.
     ///
     /// Deliberately NOT line-oriented (an earlier version used
     /// `BufRead::read_line`, one line per chunk): `read_line` blocks until
@@ -320,7 +329,7 @@ impl StdinChannel {
     /// (warden security review msg #218's interactive-stall finding).
     /// Reading whatever's already available, with no delimiter
     /// requirement, has no such gap.
-    fn next_chunk(&self) -> Option<Vec<u8>> {
+    fn next_chunk(&self) -> Option<(Vec<u8>, bool)> {
         self.request.send(()).ok()?;
         self.response.recv().ok().flatten()
     }
@@ -736,7 +745,7 @@ pub fn run_with_stdin(
 ) -> Result<(), RuntimeError> {
     let mut buffer = Vec::new();
     let (req_tx, req_rx) = mpsc::channel::<()>();
-    let (resp_tx, resp_rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let (resp_tx, resp_rx) = mpsc::channel::<Option<(Vec<u8>, bool)>>();
     let stdin_channel = StdinChannel {
         request: req_tx,
         response: resp_rx,
@@ -765,7 +774,7 @@ pub fn run_with_stdin(
             let mut buf = [0u8; 8192];
             let chunk = match input.read(&mut buf) {
                 Ok(0) | Err(_) => None,
-                Ok(n) => Some(buf[..n].to_vec()),
+                Ok(n) => Some((buf[..n].to_vec(), n == buf.len())),
             };
             if resp_tx.send(chunk).is_err() {
                 break;
@@ -1371,15 +1380,6 @@ fn find_hash_value(entries: &Rc<RefCell<Vec<(Value, Value)>>>, key: &Value) -> O
         .map(|(_, v)| v.clone())
 }
 
-/// How many chunks `native_read` retries `read_one` eagerly on -- after
-/// every single one -- before switching to the geometric-backoff gating
-/// that keeps a large multi-chunk datum's total re-parse cost linear (see
-/// `native_read`'s own doc comment). Generous margin above any realistic
-/// interactive line count (a human typing, a request/response protocol)
-/// while still bounding the "always eager" phase's own cost to a small,
-/// negligible constant (sum of 1..=64 re-scans of a still-small buffer).
-const READ_EAGER_CHUNK_LIMIT: u32 = 64;
-
 /// Reads one complete datum from standard input as DATA, not code -- the
 /// result is never evaluated (spec 4.8), only parsed and converted the same
 /// way a quoted literal is at compile time (`sexpr_to_const`, then
@@ -1392,31 +1392,34 @@ const READ_EAGER_CHUNK_LIMIT: u32 = 64;
 /// no state to resume from), so naively retrying it after every single new
 /// chunk pulled in for a datum spread across N chunks costs O(current
 /// size) per chunk x O(N) chunks = O(N^2) total (warden security review
-/// msg #208, confirmed with measured quadratic scaling). But gating every
-/// retry behind a large fixed/geometric threshold overcorrects: it can
-/// leave a datum that has ALREADY completely arrived unread, waiting on
-/// chunks that are no longer needed, for however long it takes unrelated
-/// future input to happen to cross the next threshold -- an indefinite
-/// stall on any stream that stays open after sending a complete message,
-/// which is exactly how an interactive terminal or a request/response
-/// protocol over a persistent pipe behaves (warden security review msg
-/// #218, confirmed with a live FIFO test: a complete 20-line datum sent
-/// then held open with no further data left the read stalled for
-/// multiple seconds).
+/// msg #208, confirmed with measured quadratic scaling). Two earlier fixes
+/// gated retries behind chunk-count/buffer-size thresholds instead, but
+/// both only relocated warden security review msg #218's interactive
+/// stall rather than fixing it: whatever proxy threshold is picked, a
+/// datum that finishes just short of it sits unread indefinitely on any
+/// stream that stays open afterward, since nothing else ever prompts
+/// another attempt (warden msg #226, qa msg #227, both independently
+/// reproducing the identical stall for datums spread across enough
+/// chunks).
 ///
-/// The fix applies geometric backoff only AFTER `READ_EAGER_CHUNK_LIMIT`
-/// chunks have arrived for this one read -- below that, every chunk gets
-/// an immediate retry, so a datum completing within any realistic
-/// interactive exchange is noticed the instant it finishes, never waiting
-/// on data that was never coming. Only once chunk count crosses that
-/// threshold (a strong signal this is a large batch datum, not
-/// interactive typing) does backoff kick in, keeping the total cost
-/// linear for that case exactly as before.
+/// The actual fix retries based on the one signal that reflects genuine
+/// stream state instead of guessing from chunk count or buffer size:
+/// whether the most recent read from the relay was "full" (returned as
+/// many bytes as its fixed-size buffer could hold) or "short" (fewer). A
+/// full read means the OS may already have more sitting in its buffer,
+/// essentially free to fetch, so it's worth pulling that in before paying
+/// for a re-parse; a short read means the source had nothing more to give
+/// at that instant -- which is exactly the moment to attempt a parse,
+/// regardless of how many chunks it took to get there. This keeps a
+/// large, fully-buffered datum's total cost close to linear (few, if any,
+/// short reads occur until its very end) while an interactive or
+/// segmented source -- which returns short reads almost every time, by
+/// definition -- gets retried after every single chunk, with no threshold
+/// to overshoot.
 fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
-    let mut next_attempt_at = 0;
-    let mut chunks_received: u32 = 0;
+    let mut should_attempt = true;
     loop {
-        if vm.stdin_buffer.len() >= next_attempt_at {
+        if should_attempt {
             // A chunk boundary can legitimately split a multi-byte UTF-8
             // character in the middle -- that decode failure is ambiguous
             // the same way "not enough to parse yet" already is, and is
@@ -1439,18 +1442,14 @@ fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
                     // looks identical to malformed input until its closing
                     // delimiter actually arrives. Only once the stream is
                     // truly exhausted (below) is either outcome final.
-                    Ok((None, _)) | Err(_) => {
-                        if chunks_received >= READ_EAGER_CHUNK_LIMIT {
-                            next_attempt_at = vm.stdin_buffer.len() * 2 + 1;
-                        }
-                    }
+                    Ok((None, _)) | Err(_) => {}
                 }
             }
         }
         match vm.stdin_channel.next_chunk() {
-            Some(chunk) => {
+            Some((chunk, was_full_read)) => {
                 vm.stdin_buffer.extend_from_slice(&chunk);
-                chunks_received += 1;
+                should_attempt = !was_full_read;
             }
             None => {
                 let text = std::str::from_utf8(&vm.stdin_buffer)
@@ -1485,7 +1484,7 @@ fn native_read_line(vm: &mut Vm) -> Result<Value, RuntimeError> {
             return Ok(Value::Str(Rc::new(line)));
         }
         match vm.stdin_channel.next_chunk() {
-            Some(chunk) => vm.stdin_buffer.extend_from_slice(&chunk),
+            Some((chunk, _)) => vm.stdin_buffer.extend_from_slice(&chunk),
             None if vm.stdin_buffer.is_empty() => return Ok(Value::Eof),
             None => {
                 let line_bytes = std::mem::take(&mut vm.stdin_buffer);
