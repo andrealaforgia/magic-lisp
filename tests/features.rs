@@ -19,6 +19,8 @@ mod steps_b1;
 mod steps_b10;
 #[path = "features/steps_b11.rs"]
 mod steps_b11;
+#[path = "features/steps_b12.rs"]
+mod steps_b12;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -116,4 +118,10 @@ fn b10_strings_and_characters() {
 fn b11_vectors_and_hash_tables() {
     let src = include_str!("../features/B11-vectors-and-hash-tables.feature");
     registry::run_feature("B11-vectors-and-hash-tables", src, &steps_b11::registry());
+}
+
+#[test]
+fn b12_io_read_write_display() {
+    let src = include_str!("../features/B12-io-read-write-display.feature");
+    registry::run_feature("B12-io-read-write-display", src, &steps_b12::registry());
 }
