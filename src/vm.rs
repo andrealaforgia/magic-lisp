@@ -825,11 +825,21 @@ fn is_proper_list(v: &Value) -> bool {
     // let an ordinary, non-malicious program crash the process outright
     // (warden security review, msg #144) -- the same class of bug this
     // project has already fixed for the reader and the VM's own call depth.
+    //
+    // Also tracks visited Pair addresses: a circular list (via set-cdr!)
+    // is never finite, so `#f` is the semantically correct answer for it,
+    // not just a hang-avoidance hack (warden security review, msg #147).
     let mut current = v.clone();
+    let mut seen = HashSet::new();
     loop {
         match current {
             Value::List(_) => return true,
-            Value::Pair(cell) => current = cell.borrow().1.clone(),
+            Value::Pair(cell) => {
+                if !seen.insert(Rc::as_ptr(&cell) as usize) {
+                    return false;
+                }
+                current = cell.borrow().1.clone();
+            }
             _ => return false,
         }
     }
@@ -977,9 +987,18 @@ fn last_pair(opname: &str, v: &Value) -> Result<Value, RuntimeError> {
         Value::List(items) if !items.is_empty() => vec_to_list(items.to_vec()),
         other => other.clone(),
     };
+    // Tracks visited Pair addresses: a circular list (via set-cdr!) has no
+    // final pair, so this must error instead of spinning forever (warden
+    // security review, msg #147).
+    let mut seen = HashSet::new();
     loop {
         match current {
             Value::Pair(cell) => {
+                if !seen.insert(Rc::as_ptr(&cell) as usize) {
+                    return Err(error(format!(
+                        "{opname} expects an acyclic list, found a circular list"
+                    )));
+                }
                 let cdr = cell.borrow().1.clone();
                 if matches!(cdr, Value::Pair(_)) {
                     current = cdr;
@@ -4148,5 +4167,21 @@ mod tests {
             eval("(define p (list 1 2 3)) (set-cdr! (last-pair p) p) (display p)").unwrap(),
             "(1 2 3 ...)"
         );
+    }
+
+    #[test]
+    fn list_predicate_on_a_trivially_short_cyclic_pair_is_false_not_a_hang() {
+        // warden security review, msg #147: a self-referential pair is
+        // never a finite list, so #f is the correct answer, not just a
+        // hang-avoidance fallback.
+        assert_eq!(
+            eval("(define p (cons 1 2)) (set-cdr! p p) (display (list? p))").unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn last_pair_on_a_trivially_short_cyclic_pair_is_a_clean_error_not_a_hang() {
+        assert!(eval("(define p (cons 1 2)) (set-cdr! p p) (display (last-pair p))").is_err());
     }
 }
