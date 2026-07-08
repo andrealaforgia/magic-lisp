@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 93] = [
+const NATIVE_NAMES: [&str; 97] = [
     "display",
     "newline",
     "+",
@@ -124,6 +124,10 @@ const NATIVE_NAMES: [&str; 93] = [
     "string=?",
     "string<?",
     "string>?",
+    "symbol->string",
+    "string->symbol",
+    "list->string",
+    "string->list",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -764,6 +768,10 @@ fn call_native(
         "string=?" => native_string_compare("string=?", args, |a, b| a == b),
         "string<?" => native_string_compare("string<?", args, |a, b| a < b),
         "string>?" => native_string_compare("string>?", args, |a, b| a > b),
+        "symbol->string" => native_symbol_to_string(args),
+        "string->symbol" => native_string_to_symbol(args),
+        "list->string" => native_list_to_string(args),
+        "string->list" => native_string_to_list(args),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -1334,6 +1342,50 @@ fn native_string_compare(
         )));
     };
     Ok(Value::Bool(holds(a, b)))
+}
+
+fn native_symbol_to_string(args: &[Value]) -> Result<Value, RuntimeError> {
+    native_unary("symbol->string", args, |v| match v {
+        Value::Symbol(s) => Ok(Value::Str(Rc::new(s.clone()))),
+        other => Err(error(format!(
+            "symbol->string expects a symbol, found {other}"
+        ))),
+    })
+}
+
+fn native_string_to_symbol(args: &[Value]) -> Result<Value, RuntimeError> {
+    native_unary("string->symbol", args, |v| match v {
+        Value::Str(s) => Ok(Value::Symbol(s.as_str().to_string())),
+        other => Err(error(format!(
+            "string->symbol expects a string, found {other}"
+        ))),
+    })
+}
+
+fn native_list_to_string(args: &[Value]) -> Result<Value, RuntimeError> {
+    native_unary("list->string", args, |v| {
+        let mut s = String::new();
+        for item in list_to_vec("list->string", v)? {
+            match item {
+                Value::Char(c) => s.push(c),
+                other => {
+                    return Err(error(format!(
+                        "list->string expects a list of characters, found {other}"
+                    )));
+                }
+            }
+        }
+        Ok(Value::Str(Rc::new(s)))
+    })
+}
+
+fn native_string_to_list(args: &[Value]) -> Result<Value, RuntimeError> {
+    native_unary("string->list", args, |v| match v {
+        Value::Str(s) => Ok(vec_to_list(s.chars().map(Value::Char).collect())),
+        other => Err(error(format!(
+            "string->list expects a string, found {other}"
+        ))),
+    })
 }
 
 /// A non-empty list is, per real Scheme semantics, built from pairs -- so
@@ -4357,5 +4409,52 @@ mod tests {
     fn string_greater_than_is_shown_both_true_and_false() {
         assert_eq!(eval("(display (string>? \"abd\" \"abc\"))").unwrap(), "#t");
         assert_eq!(eval("(display (string>? \"abc\" \"abd\"))").unwrap(), "#f");
+    }
+
+    // --- B10 E3: string/symbol/char-list conversions (spec 6.1, 6.2) ---
+
+    #[test]
+    fn symbol_to_string_converts_a_symbol_to_its_name() {
+        assert_eq!(
+            eval("(display (symbol->string (quote hello)))").unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn string_to_symbol_converts_a_string_to_a_symbol() {
+        assert_eq!(
+            eval("(display (string->symbol \"world\"))").unwrap(),
+            "world"
+        );
+    }
+
+    #[test]
+    fn list_to_string_builds_a_string_from_a_character_list() {
+        assert_eq!(
+            eval("(display (list->string (list #\\h #\\i)))").unwrap(),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn string_to_list_converts_a_string_to_a_character_list() {
+        assert_eq!(eval("(display (string->list \"ab\"))").unwrap(), "(a b)");
+    }
+
+    #[test]
+    fn symbol_string_round_trip_reproduces_the_original_string() {
+        assert_eq!(
+            eval("(display (symbol->string (string->symbol \"round-trip\")))").unwrap(),
+            "round-trip"
+        );
+    }
+
+    #[test]
+    fn string_list_round_trip_reproduces_the_original_string() {
+        assert_eq!(
+            eval("(display (list->string (string->list \"hello\")))").unwrap(),
+            "hello"
+        );
     }
 }
