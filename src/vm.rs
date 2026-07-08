@@ -4599,4 +4599,26 @@ mod tests {
         assert_eq!(eval("(display (char-whitespace? #\\space))").unwrap(), "#t");
         assert_eq!(eval("(display (char-whitespace? #\\a))").unwrap(), "#f");
     }
+
+    // --- B10 E6: character literals read correctly from source (spec 6.2) ---
+
+    #[test]
+    fn an_individual_character_literal_reads_as_itself() {
+        assert_eq!(eval("(display (char->integer #\\a))").unwrap(), "97");
+    }
+
+    #[test]
+    fn the_named_space_literal_has_code_point_thirty_two() {
+        assert_eq!(eval("(display (char->integer #\\space))").unwrap(), "32");
+    }
+
+    #[test]
+    fn the_named_newline_literal_has_code_point_ten() {
+        assert_eq!(eval("(display (char->integer #\\newline))").unwrap(), "10");
+    }
+
+    #[test]
+    fn the_named_tab_literal_has_code_point_nine() {
+        assert_eq!(eval("(display (char->integer #\\tab))").unwrap(), "9");
+    }
 }
