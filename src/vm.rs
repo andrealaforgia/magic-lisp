@@ -1039,13 +1039,34 @@ fn native_inexact_to_exact(args: &[Value]) -> Result<Value, RuntimeError> {
     match args {
         [Value::Int(n)] => Ok(Value::Int(*n)),
         [Value::Float(n)] => {
-            if !n.is_finite() {
+            // Rejecting only non-finite input isn't enough: a merely-large
+            // but still-finite float outside i64's representable range
+            // would silently saturate to i64::MAX/MIN via `as i64` (a
+            // value bearing no numerical relationship to the input)
+            // instead of erroring, contradicting the whole point of this
+            // guard (out-of-domain input is a clean error, not silent
+            // garbage).
+            //
+            // The valid range is the half-open [i64::MIN, 2^63). Comparing
+            // directly against `i64::MAX as f64` is a trap: i64::MAX
+            // (2^63 - 1) isn't exactly representable as an f64, so that
+            // cast silently rounds UP to 2^63 -- one past the true
+            // boundary, which would wrongly accept 2^63 itself (an
+            // out-of-range value that `as i64` would then saturate). Using
+            // `-(i64::MIN as f64)` instead is exact: negating an exactly
+            // representable power-of-two-magnitude value is itself exact,
+            // and it equals the true 2^63 boundary directly, with no
+            // rounding involved.
+            let truncated = n.trunc();
+            let min = i64::MIN as f64;
+            let exclusive_max = -min; // 2^63, exactly -- see above
+            if !(truncated >= min && truncated < exclusive_max) {
                 return Err(error(format!(
-                    "inexact->exact requires a finite number, found {}",
+                    "inexact->exact requires a number representable as an exact integer, found {}",
                     Value::Float(*n)
                 )));
             }
-            Ok(Value::Int(n.trunc() as i64))
+            Ok(Value::Int(truncated as i64))
         }
         [other] => Err(error(format!(
             "inexact->exact expects a number, found {other}"
@@ -2086,17 +2107,75 @@ mod tests {
 
     #[test]
     fn inexact_to_exact_on_positive_infinity_is_a_runtime_error() {
-        assert!(eval("(display (inexact->exact (/ 1.0 0.0)))").is_err());
+        // qa test-design review (msg #127): the feature file's evidence
+        // claims the error names the specific non-finite value -- assert
+        // on the message content, not just that it failed.
+        let err = eval("(display (inexact->exact (/ 1.0 0.0)))").unwrap_err();
+        assert!(
+            err.message.contains("+inf.0"),
+            "expected the error to name +inf.0, got: {}",
+            err.message
+        );
     }
 
     #[test]
     fn inexact_to_exact_on_negative_infinity_is_a_runtime_error() {
-        assert!(eval("(display (inexact->exact (/ -1.0 0.0)))").is_err());
+        let err = eval("(display (inexact->exact (/ -1.0 0.0)))").unwrap_err();
+        assert!(
+            err.message.contains("-inf.0"),
+            "expected the error to name -inf.0, got: {}",
+            err.message
+        );
     }
 
     #[test]
     fn inexact_to_exact_on_not_a_number_is_a_runtime_error() {
-        assert!(eval("(display (inexact->exact (/ 0.0 0.0)))").is_err());
+        let err = eval("(display (inexact->exact (/ 0.0 0.0)))").unwrap_err();
+        assert!(
+            err.message.contains("+nan.0"),
+            "expected the error to name +nan.0, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn inexact_to_exact_on_a_finite_float_outside_i64_range_is_a_runtime_error() {
+        // warden security review (msg #122): a merely-large, still-finite
+        // float like 1e300 used to pass the is_finite() guard and then
+        // silently saturate to i64::MAX via Rust's saturating float-to-int
+        // cast -- a value bearing no numerical relationship to the input,
+        // contradicting this function's own established intent (out-of-
+        // domain input is a clean error, not silent garbage).
+        assert!(eval("(display (inexact->exact 1e300))").is_err());
+    }
+
+    #[test]
+    fn inexact_to_exact_on_a_large_negative_out_of_range_float_is_a_runtime_error() {
+        assert!(eval("(display (inexact->exact -1e300))").is_err());
+    }
+
+    #[test]
+    fn inexact_to_exact_succeeds_exactly_at_the_i64_min_boundary() {
+        // i64::MIN (-2^63) is exactly representable as an f64 and IS a
+        // valid i64 -- must succeed, not be rejected as "out of range".
+        assert_eq!(
+            eval(&format!("(display (inexact->exact {}.0))", i64::MIN)).unwrap(),
+            i64::MIN.to_string()
+        );
+    }
+
+    #[test]
+    fn inexact_to_exact_rejects_the_value_exactly_one_past_the_i64_max_boundary() {
+        // i64::MAX (2^63 - 1) is NOT exactly representable as an f64 (the
+        // nearest representable value is 2^63, one past the true maximum);
+        // this pins down that 2^63 itself -- easy to get wrong by comparing
+        // against a rounded `i64::MAX as f64` constant -- is correctly
+        // rejected, not silently accepted as in-range. (The literal digits
+        // are written out by hand, not derived from f64's own Display,
+        // which renders this exact value without a decimal point at all --
+        // "9223372036854776000" -- and the reader would then misparse it
+        // as an out-of-range integer literal instead of this float.)
+        assert!(eval("(display (inexact->exact 9223372036854775808.0))").is_err());
     }
 
     #[test]

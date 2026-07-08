@@ -1,6 +1,6 @@
 //! B7: the numeric library (spec 4.1).
 
-use super::helpers::{eval_ok, run, run_demo, stdout_of, write_source};
+use super::helpers::{eval_ok, run, run_demo, stderr_of, stdout_of, write_source};
 
 #[test]
 fn b7_e1_quotient_remainder_modulo_demo_values() {
@@ -109,7 +109,13 @@ fn b7_e5_exact_inexact_conversions() {
 
 #[test]
 fn b7_e5_inexact_to_exact_errors_on_infinite_or_nan() {
-    for expr in ["(/ 1.0 0.0)", "(/ -1.0 0.0)", "(/ 0.0 0.0)"] {
+    // qa test-design review (msg #127): assert the error names the specific
+    // non-finite value, not just that it failed.
+    for (expr, label) in [
+        ("(/ 1.0 0.0)", "+inf.0"),
+        ("(/ -1.0 0.0)", "-inf.0"),
+        ("(/ 0.0 0.0)", "+nan.0"),
+    ] {
         let file = write_source(
             &format!("b7-e5-nonfinite-{}.ml", expr.len()),
             &format!("(display (inexact->exact {expr}))"),
@@ -118,6 +124,11 @@ fn b7_e5_inexact_to_exact_errors_on_infinite_or_nan() {
         assert!(
             !output.status.success(),
             "inexact->exact of {expr} should fail"
+        );
+        assert!(
+            stderr_of(&output).contains(label),
+            "expected the error to name {label}, got: {}",
+            stderr_of(&output)
         );
     }
 }
