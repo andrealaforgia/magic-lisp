@@ -5123,4 +5123,95 @@ mod tests {
             "2\n99\n3\n(1 99 3)\n#(0 0 0)\n#(1 2)\n#(1 2 3)\n2\n(a b)\nnope\n#t\n#f\n"
         );
     }
+
+    // --- qa test-design warning (msg #189): vectors became mutable via
+    // vector-set! in the same behaviour that added them, so a self-
+    // referential vector is constructible from ordinary source text --
+    // equal? must terminate (not hang) and display must print an ellipsis
+    // (not crash the process with a native stack overflow), mirroring the
+    // identical cycle-safety fixes this project already made for pairs. ---
+
+    #[test]
+    fn equal_terminates_on_a_vector_made_self_referential_via_vector_set() {
+        assert_eq!(
+            eval("(define v (vector 1 2 3)) (vector-set! v 0 v) (display (equal? v v))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn equal_terminates_comparing_two_separately_built_self_referential_vectors() {
+        assert_eq!(
+            eval(
+                "(define v (vector 1 2 3)) (vector-set! v 0 v) \
+                 (define w (vector 1 2 3)) (vector-set! w 0 w) \
+                 (display (equal? v w))"
+            )
+            .unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn displaying_a_self_referential_vector_terminates_with_an_ellipsis_not_a_crash() {
+        assert_eq!(
+            eval("(define v (vector 1 2 3)) (vector-set! v 0 v) (display v)").unwrap(),
+            "#(#(...) 2 3)"
+        );
+    }
+
+    #[test]
+    fn hash_has_key_terminates_on_a_self_referential_vector_key_not_a_hang() {
+        // The same unguarded value_equal call underlies hash-ref/hash-set!/
+        // hash-has-key?'s key comparison, so this bug was transparently
+        // reachable through hash tables too, with no equal? call visible in
+        // the user's source (qa test-design warning msg #189).
+        assert_eq!(
+            eval(
+                "(define v (vector 1 2 3)) (vector-set! v 0 v) \
+                 (define h (make-hash)) (hash-set! h v 1) \
+                 (display (hash-has-key? h v))"
+            )
+            .unwrap(),
+            "#t"
+        );
+    }
+
+    // --- qa test-design warning (msg #189): coverage gaps, lower severity ---
+
+    #[test]
+    fn a_vector_mutation_through_one_binding_is_visible_through_an_aliased_binding() {
+        // Mirrors the same aliasing gap already found and fixed once for
+        // pairs (qa msg #145): every existing vector-mutation test read
+        // back through the same binding that performed the write.
+        assert_eq!(
+            eval(
+                "(define v (vector 1 2 3)) (define alias v) \
+                 (vector-set! alias 0 99) (display (vector-ref v 0))"
+            )
+            .unwrap(),
+            "99"
+        );
+    }
+
+    #[test]
+    fn make_vector_with_a_negative_length_is_a_clean_runtime_error() {
+        assert!(eval("(display (make-vector -1))").is_err());
+    }
+
+    #[test]
+    fn equal_between_two_distinct_content_identical_hash_tables_is_false() {
+        // Hash tables compare by eq?-style reference identity for the table
+        // itself, not by deep content comparison (documented design) --
+        // this was implemented correctly but had no test confirming it.
+        assert_eq!(
+            eval(
+                "(define h1 (make-hash)) (hash-set! h1 (quote a) 1) \
+                 (define h2 (make-hash)) (hash-set! h2 (quote a) 1) \
+                 (display (equal? h1 h2))"
+            )
+            .unwrap(),
+            "#f"
+        );
+    }
 }

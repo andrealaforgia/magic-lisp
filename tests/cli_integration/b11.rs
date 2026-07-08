@@ -1,7 +1,7 @@
 //! B11: vectors and hash tables (spec 4.5, 4.6).
 
 use super::helpers::{eval_ok, run, run_demo, stderr_of, write_source};
-use magiclisp::exitcode::RUNTIME_ERROR;
+use magiclisp::exitcode::{RUNTIME_ERROR, SUCCESS};
 
 #[test]
 fn b11_e1_vector_construction_indexing_and_bounds_errors() {
@@ -258,4 +258,26 @@ fn b11_e6_all_twelve_demo_expressions_produce_exactly_the_prescribed_output() {
         ),
         "2\n99\n3\n(1 99 3)\n#(0 0 0)\n#(1 2)\n#(1 2 3)\n2\n(a b)\nnope\n#t\n#f\n"
     );
+}
+
+#[test]
+fn a_self_referential_vector_terminates_cleanly_through_the_real_cli_not_a_hang_or_a_crash() {
+    // Acceptance-level counterpart to the unit tests proving equal?/display
+    // both terminate on a vector made self-referential via vector-set!
+    // (qa test-design warning msg #189) -- verified through the actual CLI
+    // argument-parsing/process-exit path a real user would hit, mirroring
+    // B9's identical circular-list CLI test for pairs.
+    let src = "(define v (vector 1 2 3)) (vector-set! v 0 v) \
+               (display (equal? v v)) (newline) \
+               (display v)";
+    let file = write_source("b11-self-referential-vector.ml", src);
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "expected a clean exit, got: {:?} (stderr: {})",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "#t\n#(#(...) 2 3)");
 }

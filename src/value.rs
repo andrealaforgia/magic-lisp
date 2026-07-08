@@ -168,6 +168,48 @@ fn display_pair_chain(
     write!(f, ")")
 }
 
+/// Prints a vector, `#(a b c)`. `ancestors` tracks the chain of `Vector`
+/// addresses currently being printed on THIS path (removed again once their
+/// subtree finishes), not every vector ever seen -- so a vector referenced
+/// twice non-cyclically (a DAG, not a cycle) still prints in full both
+/// times, while an actual cycle (constructible via `vector-set!`, spec 4.5,
+/// since vectors became mutable in the same behaviour that added them)
+/// prints `#(...)` and stops instead of recursing until the native stack
+/// overflows and aborts the process -- the same class of defect this
+/// project already fixed for pairs (warden security reviews msgs #144,
+/// #146, #147; qa test-design warning msg #189 found the identical gap,
+/// reproduced, for the newly-mutable vector type).
+///
+/// Deliberately scoped to vector-to-vector nesting only, mirroring exactly
+/// what was reported: a cross-type cycle alternating through a mutable
+/// `Pair` (e.g. a vector holding a pair whose cdr is set back to that same
+/// vector) is not caught by this guard, since a `Pair` element still goes
+/// through its own independent, freshly-seeded `display_pair_chain` call.
+/// Tracked as a known, narrower-scope limitation, not fixed here.
+fn display_vector(
+    f: &mut fmt::Formatter<'_>,
+    items: &Rc<RefCell<Vec<Value>>>,
+    ancestors: &mut HashSet<usize>,
+) -> fmt::Result {
+    let addr = Rc::as_ptr(items) as usize;
+    if !ancestors.insert(addr) {
+        return write!(f, "#(...)");
+    }
+    write!(f, "#(")?;
+    for (i, item) in items.borrow().iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        match item {
+            Value::Vector(nested) => display_vector(f, nested, ancestors)?,
+            other => write!(f, "{other}")?,
+        }
+    }
+    write!(f, ")")?;
+    ancestors.remove(&addr);
+    Ok(())
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -191,16 +233,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Vector(items) => {
-                write!(f, "#(")?;
-                for (i, item) in items.borrow().iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{item}")?;
-                }
-                write!(f, ")")
-            }
+            Value::Vector(items) => display_vector(f, items, &mut HashSet::new()),
             Value::Hash(_) => write!(f, "#<hash>"),
             Value::Unspecified => Ok(()),
         }
@@ -289,6 +322,19 @@ pub fn value_equal(a: &Value, b: &Value) -> bool {
     while let Some((x, y)) = work.pop() {
         if let (Value::Pair(px), Value::Pair(py)) = (&x, &y) {
             let key = (Rc::as_ptr(px) as usize, Rc::as_ptr(py) as usize);
+            if !seen.insert(key) {
+                continue;
+            }
+        }
+        // Mirrors the `Pair` guard immediately above: vectors became
+        // mutable via `vector-set!` (spec 4.5) in the same behaviour that
+        // added them, so a self-referential or mutually-cyclic vector is
+        // constructible from ordinary source text -- without this guard,
+        // comparing such a vector against itself re-pushes the same work
+        // item forever (qa test-design warning, msg #189, reproduced as a
+        // genuine hang, not a slow crash).
+        if let (Value::Vector(vx), Value::Vector(vy)) = (&x, &y) {
+            let key = (Rc::as_ptr(vx) as usize, Rc::as_ptr(vy) as usize);
             if !seen.insert(key) {
                 continue;
             }
