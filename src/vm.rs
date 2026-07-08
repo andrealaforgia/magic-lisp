@@ -6,6 +6,7 @@ use std::io::Write;
 use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Const, Module, Op};
+use crate::reader::Sexpr;
 use crate::value::{Env, Value, is_truthy};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,8 +26,52 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 14] = [
-    "display", "newline", "+", "-", "*", "/", "=", "<", "<=", ">", ">=", "cons", "car", "cdr",
+const NATIVE_NAMES: [&str; 44] = [
+    "display",
+    "newline",
+    "+",
+    "-",
+    "*",
+    "/",
+    "=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "cons",
+    "car",
+    "cdr",
+    // B7: the numeric library (spec 4.1).
+    "quotient",
+    "remainder",
+    "modulo",
+    "abs",
+    "min",
+    "max",
+    "zero?",
+    "positive?",
+    "negative?",
+    "even?",
+    "odd?",
+    "floor",
+    "ceiling",
+    "round",
+    "truncate",
+    "sqrt",
+    "expt",
+    "exp",
+    "log",
+    "sin",
+    "cos",
+    "tan",
+    "atan",
+    "number?",
+    "integer?",
+    "float?",
+    "exact->inexact",
+    "inexact->exact",
+    "number->string",
+    "string->number",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -571,6 +616,38 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
                 args.len()
             ))),
         },
+        "quotient" => native_quotient(args),
+        "remainder" => native_remainder(args),
+        "modulo" => native_modulo(args),
+        "abs" => native_abs(args),
+        "min" => native_min_max("min", args, |a, b| a < b),
+        "max" => native_min_max("max", args, |a, b| a > b),
+        "zero?" => native_numeric_predicate("zero?", args, |n| n == 0.0),
+        "positive?" => native_numeric_predicate("positive?", args, |n| n > 0.0),
+        "negative?" => native_numeric_predicate("negative?", args, |n| n < 0.0),
+        "even?" => native_int_predicate("even?", args, |n| n % 2 == 0),
+        "odd?" => native_int_predicate("odd?", args, |n| n % 2 != 0),
+        "floor" => native_rounding("floor", args, f64::floor),
+        "ceiling" => native_rounding("ceiling", args, f64::ceil),
+        "round" => native_rounding("round", args, f64::round_ties_even),
+        "truncate" => native_rounding("truncate", args, f64::trunc),
+        "sqrt" => native_unary_float("sqrt", args, f64::sqrt),
+        "expt" => native_expt(args),
+        "exp" => native_unary_float("exp", args, f64::exp),
+        "log" => native_unary_float("log", args, f64::ln),
+        "sin" => native_unary_float("sin", args, f64::sin),
+        "cos" => native_unary_float("cos", args, f64::cos),
+        "tan" => native_unary_float("tan", args, f64::tan),
+        "atan" => native_unary_float("atan", args, f64::atan),
+        "number?" => native_type_predicate("number?", args, |v| {
+            matches!(v, Value::Int(_) | Value::Float(_))
+        }),
+        "integer?" => native_type_predicate("integer?", args, |v| matches!(v, Value::Int(_))),
+        "float?" => native_type_predicate("float?", args, |v| matches!(v, Value::Float(_))),
+        "exact->inexact" => native_exact_to_inexact(args),
+        "inexact->exact" => native_inexact_to_exact(args),
+        "number->string" => native_number_to_string(args),
+        "string->number" => native_string_to_number(args),
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
 }
@@ -729,6 +806,297 @@ fn native_compare(
     let nums = to_f64s(opname, args)?;
     let all_hold = nums.windows(2).all(|pair| holds(pair[0], pair[1]));
     Ok(Value::Bool(all_hold))
+}
+
+/// i64::MIN / -1 overflows in two's complement (the true magnitude exceeds
+/// i64::MAX); Rust panics on plain `/` for that one input. Its true
+/// mathematical quotient has no positive i64 representation, so wrapping
+/// (back to i64::MIN itself) is this codebase's established convention for
+/// this exact edge case — native_minus's unary negation and native_divide's
+/// int_div_step both already do the same.
+fn truncating_div(a: i64, b: i64) -> i64 {
+    a.checked_div(b).unwrap_or_else(|| a.wrapping_neg())
+}
+
+/// i64::MIN % -1 mathematically IS 0 (MIN is evenly divisible by -1), but
+/// Rust's `%` panics on this input too, sharing `/`'s overflow trap.
+/// checked_rem returning None here is exactly (and only) this one case.
+fn truncating_rem(a: i64, b: i64) -> i64 {
+    a.checked_rem(b).unwrap_or(0)
+}
+
+fn two_ints(opname: &str, args: &[Value]) -> Result<(i64, i64), RuntimeError> {
+    if args.len() != 2 {
+        return Err(error(format!(
+            "{opname} expects exactly 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let ints = to_ints(opname, args)?;
+    Ok((ints[0], ints[1]))
+}
+
+fn native_quotient(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (a, b) = two_ints("quotient", args)?;
+    if b == 0 {
+        return Err(error("quotient by zero is a runtime error"));
+    }
+    Ok(Value::Int(truncating_div(a, b)))
+}
+
+fn native_remainder(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (a, b) = two_ints("remainder", args)?;
+    if b == 0 {
+        return Err(error("remainder by zero is a runtime error"));
+    }
+    Ok(Value::Int(truncating_rem(a, b)))
+}
+
+fn native_modulo(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (a, b) = two_ints("modulo", args)?;
+    if b == 0 {
+        return Err(error("modulo by zero is a runtime error"));
+    }
+    let r = truncating_rem(a, b);
+    // Truncated remainder already has the quotient's sign baked in;
+    // floored modulo instead follows the DIVISOR's sign, so a nonzero
+    // remainder whose sign disagrees with the divisor needs nudging by one
+    // divisor-width to floor it correctly.
+    //
+    // Both `<` comparisons below are guarded elsewhere on this same path
+    // (`r != 0` right here; `b == 0` already rejected above), so mutating
+    // either to `<=` is a provably equivalent, unobservable change -- a
+    // `<=`, at the one value (0) it newly admits, can never actually be
+    // reached. Hand-verified: the full suite still passes with either `<=`
+    // mutation manually applied. Mutating `(b < 0)` to `(b == 0)`, by
+    // contrast, IS observable (e.g. `(modulo 7 -2)` must be -1, not 1) and
+    // is covered by a dedicated test.
+    Ok(Value::Int(if r != 0 && (r < 0) != (b < 0) {
+        r + b
+    } else {
+        r
+    }))
+}
+
+fn native_abs(args: &[Value]) -> Result<Value, RuntimeError> {
+    match args {
+        // wrapping_abs, not abs: i64::MIN's true magnitude has no positive
+        // i64 representation, same overflow class this file always handles
+        // by wrapping rather than panicking.
+        [Value::Int(n)] => Ok(Value::Int(n.wrapping_abs())),
+        [Value::Float(n)] => Ok(Value::Float(n.abs())),
+        [other] => Err(error(format!("abs expects a number, found {other}"))),
+        _ => Err(error(format!(
+            "abs expects exactly 1 argument, got {}",
+            args.len()
+        ))),
+    }
+}
+
+/// Shared by `min`/`max`: `is_more_extreme(candidate, current_best)` reports
+/// whether `candidate` should replace `current_best` (`<` for min, `>` for
+/// max). Preserves the WINNING argument's own exactness — an all-integer
+/// call returns an exact integer, matching `+`/`-`/`*`'s promotion rule
+/// (float only if at least one argument is a float) rather than always
+/// returning a float from the internal f64 comparison.
+fn native_min_max(
+    opname: &str,
+    args: &[Value],
+    is_more_extreme: fn(f64, f64) -> bool,
+) -> Result<Value, RuntimeError> {
+    if args.is_empty() {
+        return Err(error(format!("{opname} requires at least 1 argument")));
+    }
+    let nums = to_f64s(opname, args)?;
+    let mut best = 0;
+    for (i, &n) in nums.iter().enumerate().skip(1) {
+        if is_more_extreme(n, nums[best]) {
+            best = i;
+        }
+    }
+    if any_float(args) {
+        Ok(Value::Float(nums[best]))
+    } else {
+        Ok(args[best].clone())
+    }
+}
+
+fn native_numeric_predicate(
+    opname: &str,
+    args: &[Value],
+    holds: fn(f64) -> bool,
+) -> Result<Value, RuntimeError> {
+    let [a] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    };
+    let nums = to_f64s(opname, std::slice::from_ref(a))?;
+    Ok(Value::Bool(holds(nums[0])))
+}
+
+fn native_int_predicate(
+    opname: &str,
+    args: &[Value],
+    holds: fn(i64) -> bool,
+) -> Result<Value, RuntimeError> {
+    let [a] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    };
+    let ints = to_ints(opname, std::slice::from_ref(a))?;
+    Ok(Value::Bool(holds(ints[0])))
+}
+
+/// Shared by floor/ceiling/round/truncate: "float in, float out ... on
+/// fixnums, identity" (spec 4.1) -- an integer argument passes through
+/// completely unchanged (not promoted to a float), since it's already
+/// exactly its own floor/ceiling/round/truncate.
+fn native_rounding(
+    opname: &str,
+    args: &[Value],
+    round: fn(f64) -> f64,
+) -> Result<Value, RuntimeError> {
+    match args {
+        [n @ Value::Int(_)] => Ok(n.clone()),
+        [Value::Float(n)] => Ok(Value::Float(round(*n))),
+        [other] => Err(error(format!("{opname} expects a number, found {other}"))),
+        _ => Err(error(format!(
+            "{opname} expects exactly 1 argument, got {}",
+            args.len()
+        ))),
+    }
+}
+
+fn native_unary_float(
+    opname: &str,
+    args: &[Value],
+    f: fn(f64) -> f64,
+) -> Result<Value, RuntimeError> {
+    let [a] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    };
+    let nums = to_f64s(opname, std::slice::from_ref(a))?;
+    Ok(Value::Float(f(nums[0])))
+}
+
+/// An integer base raised to a non-negative integer exponent is exact
+/// (spec 4.1); every other combination (a negative exponent, or either
+/// operand already a float) produces a float via plain floating-point
+/// exponentiation.
+fn native_expt(args: &[Value]) -> Result<Value, RuntimeError> {
+    match args {
+        [Value::Int(base), Value::Int(exp)] if *exp >= 0 => {
+            let exp: u32 = (*exp).try_into().unwrap_or(u32::MAX);
+            Ok(Value::Int(base.wrapping_pow(exp)))
+        }
+        [_, _] => {
+            let nums = to_f64s("expt", args)?;
+            Ok(Value::Float(nums[0].powf(nums[1])))
+        }
+        _ => Err(error(format!(
+            "expt expects exactly 2 arguments, got {}",
+            args.len()
+        ))),
+    }
+}
+
+fn native_type_predicate(
+    opname: &str,
+    args: &[Value],
+    holds: fn(&Value) -> bool,
+) -> Result<Value, RuntimeError> {
+    let [a] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    };
+    Ok(Value::Bool(holds(a)))
+}
+
+fn native_exact_to_inexact(args: &[Value]) -> Result<Value, RuntimeError> {
+    match args {
+        [Value::Int(n)] => Ok(Value::Float(*n as f64)),
+        [Value::Float(n)] => Ok(Value::Float(*n)),
+        [other] => Err(error(format!(
+            "exact->inexact expects a number, found {other}"
+        ))),
+        _ => Err(error(format!(
+            "exact->inexact expects exactly 1 argument, got {}",
+            args.len()
+        ))),
+    }
+}
+
+fn native_inexact_to_exact(args: &[Value]) -> Result<Value, RuntimeError> {
+    match args {
+        [Value::Int(n)] => Ok(Value::Int(*n)),
+        [Value::Float(n)] => {
+            if !n.is_finite() {
+                return Err(error(format!(
+                    "inexact->exact requires a finite number, found {}",
+                    Value::Float(*n)
+                )));
+            }
+            Ok(Value::Int(n.trunc() as i64))
+        }
+        [other] => Err(error(format!(
+            "inexact->exact expects a number, found {other}"
+        ))),
+        _ => Err(error(format!(
+            "inexact->exact expects exactly 1 argument, got {}",
+            args.len()
+        ))),
+    }
+}
+
+fn native_number_to_string(args: &[Value]) -> Result<Value, RuntimeError> {
+    match args {
+        [n @ (Value::Int(_) | Value::Float(_))] => Ok(Value::Str(n.to_string())),
+        [other] => Err(error(format!(
+            "number->string expects a number, found {other}"
+        ))),
+        _ => Err(error(format!(
+            "number->string expects exactly 1 argument, got {}",
+            args.len()
+        ))),
+    }
+}
+
+/// Reuses the reader's own numeric-literal grammar rather than
+/// reimplementing it: valid input parses to exactly one Int/Float Sexpr;
+/// anything else (a read error, zero or multiple tokens, or a token that
+/// parses but isn't a number) is `#f` per spec, not an error.
+fn native_string_to_number(args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = match args {
+        [Value::Str(s)] => s,
+        [other] => {
+            return Err(error(format!(
+                "string->number expects a string, found {other}"
+            )));
+        }
+        _ => {
+            return Err(error(format!(
+                "string->number expects exactly 1 argument, got {}",
+                args.len()
+            )));
+        }
+    };
+    match crate::reader::read_program(s) {
+        Ok(forms) => match forms.as_slice() {
+            [Sexpr::Int(n)] => Ok(Value::Int(*n)),
+            [Sexpr::Float(n)] => Ok(Value::Float(*n)),
+            _ => Ok(Value::Bool(false)),
+        },
+        Err(_) => Ok(Value::Bool(false)),
+    }
 }
 
 #[cfg(test)]
@@ -1343,6 +1711,467 @@ mod tests {
     fn dividing_a_float_by_zero_follows_ieee_rules_instead_of_erroring() {
         assert_eq!(eval("(display (/ 1.0 0.0))").unwrap(), "+inf.0");
         assert_eq!(eval("(display (/ -1.0 0.0))").unwrap(), "-inf.0");
+    }
+
+    // --- B7 E1: quotient/remainder/modulo ---
+
+    #[test]
+    fn quotient_truncates_toward_zero() {
+        assert_eq!(eval("(display (quotient 7 2))").unwrap(), "3");
+    }
+
+    #[test]
+    fn quotient_truncates_toward_zero_for_a_negative_dividend() {
+        assert_eq!(eval("(display (quotient -7 2))").unwrap(), "-3");
+    }
+
+    #[test]
+    fn remainder_truncates_toward_zero() {
+        assert_eq!(eval("(display (remainder 7 2))").unwrap(), "1");
+    }
+
+    #[test]
+    fn remainder_follows_the_dividends_sign_not_the_divisors() {
+        // Truncated remainder: the sign of the result matches the DIVIDEND
+        // (-7), distinguishing it from modulo's floored result below on the
+        // exact same inputs.
+        assert_eq!(eval("(display (remainder -7 2))").unwrap(), "-1");
+    }
+
+    #[test]
+    fn modulo_is_floored_and_differs_from_remainder_on_a_negative_dividend() {
+        // Same inputs as remainder_follows_the_dividends_sign_not_the_divisors
+        // (-7, 2): remainder gives -1 (truncated, sign of dividend), modulo
+        // gives 1 (floored, sign of divisor) -- this is the floor-vs-
+        // truncate distinction actually being exercised, not just each
+        // operation checked in isolation.
+        assert_eq!(eval("(display (modulo -7 2))").unwrap(), "1");
+    }
+
+    #[test]
+    fn modulo_matches_remainder_when_signs_already_agree() {
+        assert_eq!(eval("(display (modulo 7 2))").unwrap(), "1");
+    }
+
+    #[test]
+    fn modulo_is_floored_and_differs_from_remainder_on_a_negative_divisor() {
+        // The mirror image of modulo_is_floored_and_differs_from_remainder_
+        // on_a_negative_dividend above: here the DIVIDEND is positive and
+        // the DIVISOR is negative. Truncated remainder(7, -2) is 1 (sign of
+        // dividend); floored modulo follows the DIVISOR's sign instead, so
+        // it must nudge by one divisor-width to -1.
+        assert_eq!(eval("(display (remainder 7 -2))").unwrap(), "1");
+        assert_eq!(eval("(display (modulo 7 -2))").unwrap(), "-1");
+    }
+
+    #[test]
+    fn quotient_by_zero_is_a_runtime_error() {
+        assert!(eval("(display (quotient 7 0))").is_err());
+    }
+
+    #[test]
+    fn remainder_by_zero_is_a_runtime_error() {
+        assert!(eval("(display (remainder 7 0))").is_err());
+    }
+
+    #[test]
+    fn modulo_by_zero_is_a_runtime_error() {
+        assert!(eval("(display (modulo 7 0))").is_err());
+    }
+
+    // --- B7 E2: abs/min/max/zero?/positive?/negative?/even?/odd? ---
+
+    #[test]
+    fn abs_of_a_negative_integer_is_positive() {
+        assert_eq!(eval("(display (abs -5))").unwrap(), "5");
+    }
+
+    #[test]
+    fn abs_of_a_positive_integer_is_unchanged() {
+        assert_eq!(eval("(display (abs 5))").unwrap(), "5");
+    }
+
+    #[test]
+    fn abs_of_a_negative_float_is_positive() {
+        assert_eq!(eval("(display (abs -5.5))").unwrap(), "5.5");
+    }
+
+    #[test]
+    fn abs_of_a_non_number_is_a_runtime_error_naming_the_bad_value() {
+        // Distinguishes the "wrong type" error path from the (differently
+        // worded) "wrong argument count" one -- both are reachable with
+        // exactly one argument, so a mutant collapsing them together
+        // wouldn't be caught by an is_err()-only check on either alone.
+        let err = eval("(display (abs \"x\"))").unwrap_err();
+        assert!(
+            err.message.contains("expects a number"),
+            "expected a wrong-type error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn min_of_two_arguments() {
+        assert_eq!(eval("(display (min 3 1))").unwrap(), "1");
+    }
+
+    #[test]
+    fn min_of_more_than_two_arguments() {
+        assert_eq!(eval("(display (min 5 1 3 2))").unwrap(), "1");
+    }
+
+    #[test]
+    fn max_of_two_arguments() {
+        assert_eq!(eval("(display (max 1 5))").unwrap(), "5");
+    }
+
+    #[test]
+    fn max_of_more_than_two_arguments() {
+        assert_eq!(eval("(display (max 1 5 3))").unwrap(), "5");
+    }
+
+    #[test]
+    fn min_keeps_the_first_seen_candidate_on_an_exact_tie() {
+        // 0.0 and -0.0 compare equal under `<`/`>` but display distinctly
+        // (value.rs already establishes this distinction is observable) --
+        // exactly the tool needed to prove min keeps the FIRST-seen tied
+        // candidate, not the last, which is what distinguishes a strict `<`
+        // comparison from a `<=` one that would let a later tie silently
+        // overwrite the winner (both produce the same result on any
+        // non-tied input, so only a tie can catch this).
+        assert_eq!(eval("(display (min 0.0 -0.0))").unwrap(), "0.0");
+    }
+
+    #[test]
+    fn max_keeps_the_first_seen_candidate_on_an_exact_tie() {
+        assert_eq!(eval("(display (max 0.0 -0.0))").unwrap(), "0.0");
+    }
+
+    #[test]
+    fn zero_predicate_is_true_for_zero() {
+        assert_eq!(eval("(display (zero? 0))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn zero_predicate_is_false_for_a_nonzero_value() {
+        assert_eq!(eval("(display (zero? 1))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn positive_predicate_is_true_for_a_positive_value() {
+        assert_eq!(eval("(display (positive? 1))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn positive_predicate_is_false_for_a_negative_value() {
+        assert_eq!(eval("(display (positive? -1))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn positive_predicate_is_false_for_zero() {
+        assert_eq!(eval("(display (positive? 0))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn negative_predicate_is_true_for_a_negative_value() {
+        assert_eq!(eval("(display (negative? -1))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn negative_predicate_is_false_for_zero() {
+        assert_eq!(eval("(display (negative? 0))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn negative_predicate_is_false_for_a_positive_value() {
+        assert_eq!(eval("(display (negative? 1))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn even_predicate_is_true_for_an_even_number() {
+        assert_eq!(eval("(display (even? 10))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn even_predicate_is_false_for_an_odd_number() {
+        assert_eq!(eval("(display (even? 3))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn odd_predicate_is_true_for_an_odd_number() {
+        assert_eq!(eval("(display (odd? 3))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn odd_predicate_is_false_for_an_even_number() {
+        assert_eq!(eval("(display (odd? 10))").unwrap(), "#f");
+    }
+
+    // --- B7 E3: floor/ceiling/round/truncate ---
+
+    #[test]
+    fn floor_of_a_positive_fraction_rounds_down() {
+        assert_eq!(eval("(display (floor 2.7))").unwrap(), "2.0");
+    }
+
+    #[test]
+    fn ceiling_of_a_positive_fraction_rounds_up() {
+        assert_eq!(eval("(display (ceiling 2.7))").unwrap(), "3.0");
+    }
+
+    #[test]
+    fn truncate_of_a_positive_fraction_drops_the_fraction() {
+        assert_eq!(eval("(display (truncate 2.7))").unwrap(), "2.0");
+    }
+
+    #[test]
+    fn floor_ceiling_truncate_round_all_differ_on_a_negative_fraction() {
+        // -2.7: floor rounds down to -3 (away from zero); ceiling rounds up
+        // to -2 (toward zero); truncate drops the fraction, also landing on
+        // -2; round goes to the NEAREST integer, -3 -- a different pairing
+        // than the positive-fraction case above, proving these are four
+        // genuinely distinct operations, not two functions under four names.
+        assert_eq!(eval("(display (floor -2.7))").unwrap(), "-3.0");
+        assert_eq!(eval("(display (ceiling -2.7))").unwrap(), "-2.0");
+        assert_eq!(eval("(display (truncate -2.7))").unwrap(), "-2.0");
+        assert_eq!(eval("(display (round -2.7))").unwrap(), "-3.0");
+    }
+
+    #[test]
+    fn round_of_two_point_five_rounds_to_the_even_neighbor() {
+        assert_eq!(eval("(display (round 2.5))").unwrap(), "2.0");
+    }
+
+    #[test]
+    fn round_of_three_point_five_rounds_to_the_even_neighbor() {
+        assert_eq!(eval("(display (round 3.5))").unwrap(), "4.0");
+    }
+
+    #[test]
+    fn floor_ceiling_round_truncate_are_identity_on_a_whole_number_input() {
+        // Fixnums pass through unchanged -- NOT promoted to a float, per
+        // spec's "float in, float out ... on fixnums, identity".
+        assert_eq!(eval("(display (floor 5))").unwrap(), "5");
+        assert_eq!(eval("(display (ceiling 5))").unwrap(), "5");
+        assert_eq!(eval("(display (round 5))").unwrap(), "5");
+        assert_eq!(eval("(display (truncate 5))").unwrap(), "5");
+    }
+
+    #[test]
+    fn floor_of_a_non_number_is_a_runtime_error_naming_the_bad_value() {
+        // Same wrong-type-vs-wrong-count distinction as abs's equivalent
+        // test above, for native_rounding's own separately-implemented
+        // error paths.
+        let err = eval("(display (floor \"x\"))").unwrap_err();
+        assert!(
+            err.message.contains("expects a number"),
+            "expected a wrong-type error, got: {}",
+            err.message
+        );
+    }
+
+    // --- B7 E4: sqrt/expt/exp/log/sin/cos/tan/atan ---
+
+    #[test]
+    fn sqrt_of_a_perfect_square_is_still_a_float() {
+        assert_eq!(eval("(display (sqrt 4))").unwrap(), "2.0");
+    }
+
+    #[test]
+    fn expt_with_an_integer_base_and_a_nonnegative_integer_exponent_is_exact() {
+        assert_eq!(eval("(display (expt 2 10))").unwrap(), "1024");
+    }
+
+    #[test]
+    fn expt_with_a_negative_exponent_is_a_float() {
+        assert_eq!(eval("(display (expt 2 -1))").unwrap(), "0.5");
+    }
+
+    #[test]
+    fn expt_with_a_float_operand_is_a_float() {
+        assert_eq!(eval("(display (expt 2.0 2))").unwrap(), "4.0");
+    }
+
+    #[test]
+    fn exp_of_zero_is_one() {
+        assert_eq!(eval("(display (exp 0))").unwrap(), "1.0");
+    }
+
+    #[test]
+    fn log_of_one_is_zero() {
+        assert_eq!(eval("(display (log 1))").unwrap(), "0.0");
+    }
+
+    #[test]
+    fn sin_of_zero_is_zero() {
+        assert_eq!(eval("(display (sin 0))").unwrap(), "0.0");
+    }
+
+    #[test]
+    fn cos_of_zero_is_one() {
+        assert_eq!(eval("(display (cos 0))").unwrap(), "1.0");
+    }
+
+    #[test]
+    fn tan_of_zero_is_zero() {
+        assert_eq!(eval("(display (tan 0))").unwrap(), "0.0");
+    }
+
+    #[test]
+    fn atan_of_zero_is_zero() {
+        assert_eq!(eval("(display (atan 0))").unwrap(), "0.0");
+    }
+
+    // --- B7 E5: number?/integer?/float?/exact->inexact/inexact->exact ---
+
+    #[test]
+    fn number_predicate_is_true_for_an_integer() {
+        assert_eq!(eval("(display (number? 5))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn number_predicate_is_true_for_a_float() {
+        assert_eq!(eval("(display (number? 5.0))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn number_predicate_is_false_for_a_non_number() {
+        assert_eq!(eval("(display (number? \"5\"))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn integer_predicate_is_true_for_an_integer() {
+        assert_eq!(eval("(display (integer? 5))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn integer_predicate_is_false_for_a_float() {
+        assert_eq!(eval("(display (integer? 5.0))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn float_predicate_is_true_for_a_float() {
+        assert_eq!(eval("(display (float? 5.0))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn float_predicate_is_false_for_an_integer() {
+        assert_eq!(eval("(display (float? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn exact_to_inexact_converts_a_whole_number_to_a_float() {
+        assert_eq!(eval("(display (exact->inexact 5))").unwrap(), "5.0");
+    }
+
+    #[test]
+    fn exact_to_inexact_leaves_an_already_inexact_value_unchanged() {
+        assert_eq!(eval("(display (exact->inexact 5.0))").unwrap(), "5.0");
+    }
+
+    #[test]
+    fn inexact_to_exact_leaves_an_already_exact_value_unchanged() {
+        assert_eq!(eval("(display (inexact->exact 5))").unwrap(), "5");
+    }
+
+    #[test]
+    fn inexact_to_exact_truncates_a_positive_float_toward_zero() {
+        assert_eq!(eval("(display (inexact->exact 5.7))").unwrap(), "5");
+    }
+
+    #[test]
+    fn inexact_to_exact_truncates_a_negative_float_toward_zero() {
+        assert_eq!(eval("(display (inexact->exact -5.7))").unwrap(), "-5");
+    }
+
+    #[test]
+    fn inexact_to_exact_on_positive_infinity_is_a_runtime_error() {
+        assert!(eval("(display (inexact->exact (/ 1.0 0.0)))").is_err());
+    }
+
+    #[test]
+    fn inexact_to_exact_on_negative_infinity_is_a_runtime_error() {
+        assert!(eval("(display (inexact->exact (/ -1.0 0.0)))").is_err());
+    }
+
+    #[test]
+    fn inexact_to_exact_on_not_a_number_is_a_runtime_error() {
+        assert!(eval("(display (inexact->exact (/ 0.0 0.0)))").is_err());
+    }
+
+    #[test]
+    fn exact_to_inexact_of_a_non_number_is_a_runtime_error_naming_the_bad_value() {
+        let err = eval("(display (exact->inexact \"x\"))").unwrap_err();
+        assert!(
+            err.message.contains("expects a number"),
+            "expected a wrong-type error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn inexact_to_exact_of_a_non_number_is_a_runtime_error_naming_the_bad_value() {
+        let err = eval("(display (inexact->exact \"x\"))").unwrap_err();
+        assert!(
+            err.message.contains("expects a number"),
+            "expected a wrong-type error, got: {}",
+            err.message
+        );
+    }
+
+    // --- B7 E6: number->string/string->number ---
+
+    #[test]
+    fn number_to_string_converts_an_integer() {
+        assert_eq!(eval("(display (number->string 5))").unwrap(), "5");
+    }
+
+    #[test]
+    fn number_to_string_converts_a_float() {
+        assert_eq!(eval("(display (number->string 5.5))").unwrap(), "5.5");
+    }
+
+    #[test]
+    fn string_to_number_parses_a_float() {
+        assert_eq!(eval("(display (string->number \"3.5\"))").unwrap(), "3.5");
+    }
+
+    #[test]
+    fn string_to_number_parses_an_integer() {
+        assert_eq!(eval("(display (string->number \"42\"))").unwrap(), "42");
+    }
+
+    #[test]
+    fn string_to_number_returns_false_on_unparseable_input() {
+        assert_eq!(eval("(display (string->number \"xyz\"))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn number_to_string_then_string_to_number_round_trips() {
+        assert_eq!(
+            eval("(display (string->number (number->string 42)))").unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn number_to_string_of_a_non_number_is_a_runtime_error_naming_the_bad_value() {
+        let err = eval("(display (number->string \"x\"))").unwrap_err();
+        assert!(
+            err.message.contains("expects a number"),
+            "expected a wrong-type error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn string_to_number_of_a_non_string_is_a_runtime_error_naming_the_bad_value() {
+        let err = eval("(display (string->number 5))").unwrap_err();
+        assert!(
+            err.message.contains("expects a string"),
+            "expected a wrong-type error, got: {}",
+            err.message
+        );
     }
 
     #[test]
