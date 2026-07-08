@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 97] = [
+const NATIVE_NAMES: [&str; 99] = [
     "display",
     "newline",
     "+",
@@ -128,6 +128,8 @@ const NATIVE_NAMES: [&str; 97] = [
     "string->symbol",
     "list->string",
     "string->list",
+    "string-upcase",
+    "string-downcase",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -772,6 +774,18 @@ fn call_native(
         "string->symbol" => native_string_to_symbol(args),
         "list->string" => native_list_to_string(args),
         "string->list" => native_string_to_list(args),
+        "string-upcase" => native_unary("string-upcase", args, |v| match v {
+            Value::Str(s) => Ok(Value::Str(Rc::new(s.to_uppercase()))),
+            other => Err(error(format!(
+                "string-upcase expects a string, found {other}"
+            ))),
+        }),
+        "string-downcase" => native_unary("string-downcase", args, |v| match v {
+            Value::Str(s) => Ok(Value::Str(Rc::new(s.to_lowercase()))),
+            other => Err(error(format!(
+                "string-downcase expects a string, found {other}"
+            ))),
+        }),
         "quotient" => native_quotient(args),
         "remainder" => native_remainder(args),
         "modulo" => native_modulo(args),
@@ -4456,5 +4470,17 @@ mod tests {
             eval("(display (list->string (string->list \"hello\")))").unwrap(),
             "hello"
         );
+    }
+
+    // --- B10 E4: string-upcase/string-downcase (spec 6.1) ---
+
+    #[test]
+    fn string_upcase_converts_to_all_uppercase() {
+        assert_eq!(eval("(display (string-upcase \"abc\"))").unwrap(), "ABC");
+    }
+
+    #[test]
+    fn string_downcase_converts_to_all_lowercase() {
+        assert_eq!(eval("(display (string-downcase \"ABC\"))").unwrap(), "abc");
     }
 }
