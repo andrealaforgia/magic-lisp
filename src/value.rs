@@ -217,15 +217,10 @@ pub fn value_eqv(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Deep structural equality (spec 3.7): recurses into pairs, vectors, and
-/// strings comparing contents, falling back to `eqv?` for everything else.
-/// Plain structural recursion with no cycle detection -- terminates on
-/// acyclic data, as required; behaviour on cyclic data is
-/// implementation-defined per spec, so no special handling is needed for it.
 /// Decomposes any non-empty proper-or-improper-list-shaped value into its
 /// car/cdr, regardless of whether it's backed by a `Pair` chain or a flat
-/// `List` -- so `value_equal` can recurse into a list uniformly without
-/// caring which representation either side happens to use (spec 5.1's own
+/// `List` -- so `value_equal` can walk a list uniformly without caring
+/// which representation either side happens to use (spec 5.1's own
 /// BOUNDARIES: that choice isn't observable).
 fn as_pair_parts(v: &Value) -> Option<(Value, Value)> {
     match v {
@@ -240,39 +235,62 @@ fn as_pair_parts(v: &Value) -> Option<(Value, Value)> {
     }
 }
 
-/// `value_equal`'s real work, threading a set of already-compared `Pair`
-/// address pairs through the recursion. `Pair` is the only value type a
-/// MagicLisp program can mutate into a cycle (`set-car!`/`set-cdr!`), so
-/// revisiting the exact same pair of addresses means the recursion has
-/// gone all the way around a cycle without finding a mismatch -- correct
-/// to treat as equal and stop, rather than recurse forever.
-fn value_equal_inner(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize)>) -> bool {
-    if let (Value::Pair(pa), Value::Pair(pb)) = (a, b) {
-        let key = (Rc::as_ptr(pa) as usize, Rc::as_ptr(pb) as usize);
-        if !seen.insert(key) {
-            return true;
-        }
-    }
-    if let (Some((a0, a1)), Some((b0, b1))) = (as_pair_parts(a), as_pair_parts(b)) {
-        return value_equal_inner(&a0, &b0, seen) && value_equal_inner(&a1, &b1, seen);
-    }
-    match (a, b) {
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::List(x), Value::List(y)) if x.is_empty() && y.is_empty() => true,
-        (Value::Vector(x), Value::Vector(y)) => {
-            let x = x.borrow();
-            let y = y.borrow();
-            x.len() == y.len()
-                && x.iter()
-                    .zip(y.iter())
-                    .all(|(a, b)| value_equal_inner(a, b, seen))
-        }
-        _ => value_eqv(a, b),
-    }
-}
-
+/// Deep structural equality (spec 3.7): walks into pairs, vectors, and
+/// strings comparing contents, falling back to `eqv?` for everything else.
+///
+/// Explicitly iterative (a heap-allocated work stack), not recursive: a
+/// `Pair` chain has no runtime length bound -- an ordinary, non-malicious
+/// program can build an arbitrarily long one via `cons` in a tail-recursive
+/// loop -- so one native stack frame per element would let ordinary source
+/// text crash the process outright (warden security review, msg #144),
+/// bypassing this project's own panic-catching defense in depth (a Rust
+/// stack overflow aborts the process unconditionally; it is never a caught
+/// panic). A `seen` set of already-compared `Pair` address pairs also makes
+/// this safe on a *cyclic* pair chain (constructible since pairs became
+/// mutable via `set-car!`/`set-cdr!`): revisiting the same pair of
+/// addresses means the walk has gone all the way around the cycle without
+/// finding a mismatch, so it's correct to treat that branch as equal and
+/// stop there instead of looping forever.
 pub fn value_equal(a: &Value, b: &Value) -> bool {
-    value_equal_inner(a, b, &mut HashSet::new())
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    let mut work: Vec<(Value, Value)> = vec![(a.clone(), b.clone())];
+    while let Some((x, y)) = work.pop() {
+        if let (Value::Pair(px), Value::Pair(py)) = (&x, &y) {
+            let key = (Rc::as_ptr(px) as usize, Rc::as_ptr(py) as usize);
+            if !seen.insert(key) {
+                continue;
+            }
+        }
+        if let (Some((x0, x1)), Some((y0, y1))) = (as_pair_parts(&x), as_pair_parts(&y)) {
+            work.push((x1, y1));
+            work.push((x0, y0));
+            continue;
+        }
+        match (&x, &y) {
+            (Value::Str(sx), Value::Str(sy)) => {
+                if sx != sy {
+                    return false;
+                }
+            }
+            (Value::List(lx), Value::List(ly)) if lx.is_empty() && ly.is_empty() => {}
+            (Value::Vector(vx), Value::Vector(vy)) => {
+                let vx = vx.borrow();
+                let vy = vy.borrow();
+                if vx.len() != vy.len() {
+                    return false;
+                }
+                for (ex, ey) in vx.iter().zip(vy.iter()) {
+                    work.push((ex.clone(), ey.clone()));
+                }
+            }
+            (x2, y2) => {
+                if !value_eqv(x2, y2) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -366,6 +384,15 @@ mod tests {
             Value::Pair(Rc::new(RefCell::new((Value::Int(2), Value::Int(3))))),
         ))));
         assert_eq!(list.to_string(), "(1 2 . 3)");
+    }
+
+    #[test]
+    fn displays_a_pair_whose_cdr_is_a_non_empty_list_inline_not_dotted() {
+        let pair = Value::Pair(Rc::new(RefCell::new((
+            Value::Int(1),
+            Value::List(Rc::new(vec![Value::Int(2), Value::Int(3)])),
+        ))));
+        assert_eq!(pair.to_string(), "(1 2 3)");
     }
 
     #[test]

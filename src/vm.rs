@@ -799,10 +799,19 @@ fn call_native(
 /// spec 3.7's `list?` is true only for well-formed, finite lists, not
 /// improper (dotted) structures.
 fn is_proper_list(v: &Value) -> bool {
-    match v {
-        Value::List(_) => true,
-        Value::Pair(cell) => is_proper_list(&cell.borrow().1),
-        _ => false,
+    // Iterative, not recursive: a `Pair` chain is fully constructible at
+    // runtime with unlimited length via ordinary `cons` (e.g. a tail-
+    // recursive builder loop), so one native stack frame per element would
+    // let an ordinary, non-malicious program crash the process outright
+    // (warden security review, msg #144) -- the same class of bug this
+    // project has already fixed for the reader and the VM's own call depth.
+    let mut current = v.clone();
+    loop {
+        match current {
+            Value::List(_) => return true,
+            Value::Pair(cell) => current = cell.borrow().1.clone(),
+            _ => return false,
+        }
     }
 }
 
@@ -921,21 +930,33 @@ fn vec_to_list(items: Vec<Value>) -> Value {
 /// converted via [`vec_to_list`] first) -- spec 5.1 requires this stay
 /// cons-shaped (holding the last element and the empty list), not just the
 /// bare last element.
+/// Iterative, not recursive, for the same reason as [`is_proper_list`]: a
+/// `Pair` chain has no runtime length bound, so walking it one native stack
+/// frame per element would crash on an ordinary long list.
 fn last_pair(opname: &str, v: &Value) -> Result<Value, RuntimeError> {
-    let v = match v {
+    let mut current = match v {
+        // The `!items.is_empty()` guard is unobservable on an empty items
+        // Vec specifically: `vec_to_list(vec![])` and `other.clone()` both
+        // produce an (Rc-distinct but Display-and-error-message-identical)
+        // empty List, and this function never returns a List successfully
+        // -- an empty input always falls through the loop below to the
+        // `Err` arm either way, with the same message. Hand-verified: with
+        // the guard forced to `true`, the full test suite still passes.
         Value::List(items) if !items.is_empty() => vec_to_list(items.to_vec()),
         other => other.clone(),
     };
-    match &v {
-        Value::Pair(cell) => {
-            let cdr = cell.borrow().1.clone();
-            if matches!(cdr, Value::Pair(_)) {
-                last_pair(opname, &cdr)
-            } else {
-                Ok(v)
+    loop {
+        match current {
+            Value::Pair(cell) => {
+                let cdr = cell.borrow().1.clone();
+                if matches!(cdr, Value::Pair(_)) {
+                    current = cdr;
+                } else {
+                    return Ok(Value::Pair(cell));
+                }
             }
+            other => return Err(error(format!("{opname} expects a pair, found {other}"))),
         }
-        other => Err(error(format!("{opname} expects a pair, found {other}"))),
     }
 }
 
@@ -3589,6 +3610,20 @@ mod tests {
     }
 
     #[test]
+    fn car_and_cdr_of_the_empty_list_literal_are_clean_runtime_errors_not_a_crash() {
+        // Asserts on the specific message, not just is_err(): an indexing
+        // panic inside car_of/cdr_of would also surface as an Err (VM
+        // panics are caught and converted at the thread join), but with a
+        // generic "VM thread panicked" message rather than this one -- so
+        // only checking the message distinguishes a clean, intentional
+        // error path from an accidental out-of-bounds panic.
+        let car_err = eval("(display (car (quote ())))").unwrap_err();
+        assert_eq!(car_err.message, "car expects a pair, found ()");
+        let cdr_err = eval("(display (cdr (quote ())))").unwrap_err();
+        assert_eq!(cdr_err.message, "cdr expects a pair, found ()");
+    }
+
+    #[test]
     fn car_of_a_non_pair_is_a_clean_runtime_error() {
         assert!(eval("(display (car 5))").is_err());
     }
@@ -3672,6 +3707,17 @@ mod tests {
         assert_eq!(
             eval("(display (cdr (last-pair (list 1 2 3))))").unwrap(),
             "()"
+        );
+    }
+
+    #[test]
+    fn last_pair_also_works_on_a_quoted_list_literal_not_just_a_cons_built_list() {
+        // (list 1 2 3) already builds a genuine Pair chain, so it never
+        // exercises last-pair's separate List-to-Pair conversion path; a
+        // quoted literal is backed by the flat List representation instead.
+        assert_eq!(
+            eval("(display (last-pair (quote (1 2 3))))").unwrap(),
+            "(3)"
         );
     }
 
@@ -3927,5 +3973,47 @@ mod tests {
             "1\n2\n3\n(1 2 3 4)\n(3 2 1)\n(1 4 9)\n(11 22 33)\n(1 3 5)\n\
              10\n(1 2 3)\n10\n10\n(2 . b)\n(2 3)\n"
         );
+    }
+
+    // --- qa test-review (msg #143): equal? must terminate on a self-
+    // referential pair built via set-cdr!, now that pairs are mutable ---
+
+    #[test]
+    fn equal_terminates_on_a_pair_made_self_referential_via_set_cdr() {
+        assert_eq!(
+            eval("(define p (cons 1 2)) (set-cdr! p p) (display (equal? p p))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn equal_terminates_comparing_two_separately_built_self_referential_pairs() {
+        assert_eq!(
+            eval(
+                "(define p (cons 1 2)) (set-cdr! p p) \
+                  (define q (cons 1 2)) (set-cdr! q q) \
+                  (display (equal? p q))"
+            )
+            .unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn value_equal_list_predicate_and_last_pair_complete_on_a_multi_million_element_pair_chain() {
+        // Regression test for warden security review msg #144: equal?'s
+        // Pair-chain walk, list?, and last-pair must each be iterative, not
+        // recursive -- an ordinary tail-recursive builder loop constructs a
+        // Pair chain with no runtime length bound, and one native stack
+        // frame per element previously crashed the process outright on a
+        // long enough chain (confirmed at 8,000,000 elements pre-fix).
+        let src = "(define (build-loop n acc) \
+                     (if (= n 0) acc (build-loop (- n 1) (cons n acc)))) \
+                   (define a (build-loop 8000000 (quote ()))) \
+                   (define b (build-loop 8000000 (quote ()))) \
+                   (display (equal? a b)) (newline) \
+                   (display (list? a)) (newline) \
+                   (display (car (last-pair a)))";
+        assert_eq!(eval(src).unwrap(), "#t\n#t\n8000000");
     }
 }
