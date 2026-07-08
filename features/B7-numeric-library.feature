@@ -75,7 +75,7 @@ Feature: B7 — The numeric library
     #   inexact->exact(5.7)=5 (truncated toward zero)
     #   $ magiclisp eval e5.ml -> #t/#f/#t/#f/#t/#f/5.0/5, exit 0
     #   $ magiclisp eval e5-posinf.ml  ; (inexact->exact (/ 1.0 0.0))
-    #   -> "error: runtime error: inexact->exact requires a finite number, found +inf.0", exit 70
+    #   -> "error: runtime error: inexact->exact requires a number representable as an exact integer, found +inf.0", exit 70
     #   (same clean error, naming -inf.0 / +nan.0 respectively, for the negative-infinity and nan cases)
     #   Independently re-verified the +inf.0 case against the release binary.
 
