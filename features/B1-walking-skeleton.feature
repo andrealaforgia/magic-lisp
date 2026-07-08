@@ -68,7 +68,7 @@ Feature: B1 — Walking skeleton: a MagicLisp CLI that reads, compiles, saves, a
     Then stdout is exactly:
       """
       line one
-      line two	tabbed"quoted"\backslash
+      line two	tabbed"quoted"\backslash
       45
       #t
       #f
@@ -91,7 +91,7 @@ Feature: B1 — Walking skeleton: a MagicLisp CLI that reads, compiles, saves, a
     # Evidence: $ cat kitchen-sink.ml (shown above)
     #   $ magiclisp eval kitchen-sink.ml
     #   line one
-    #   line two	tabbed"quoted"\backslash
+    #   line two	tabbed"quoted"\backslash
     #   45
     #   #t
     #   #f

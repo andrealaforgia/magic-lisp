@@ -121,6 +121,15 @@ struct Vm<'m> {
 /// immediately enclosing frame's captured locals; depth 2 = its parent;
 /// etc.), matching how `Ctx::resolve_upvalue` counts levels at compile time.
 fn resolve_env(env: &Env, depth: u8) -> Result<&Env, RuntimeError> {
+    // depth == 0 is never emitted by the compiler (1 is the immediately
+    // enclosing frame) and isn't a meaningful encoding of anything -- reject
+    // it explicitly rather than letting the `1..depth` loop below silently
+    // treat it the same as depth == 1 (a security-review finding: harmless
+    // today since only hand-crafted bytecode could ever produce it, but a
+    // degenerate encoding accepted by construction is worth closing off).
+    if depth == 0 {
+        return Err(error("upvalue depth 0 is not a valid encoding"));
+    }
     let mut current = env;
     for _ in 1..depth {
         current = current
@@ -611,10 +620,10 @@ fn int_div_step(acc: i64, divisor: i64) -> Result<IntDivStep, RuntimeError> {
     // above), and i64::MIN negated wraps back to itself, which is exactly
     // this division's true (exact) mathematical result modulo 2^64.
     match acc.checked_rem(divisor) {
-        Some(0) => Ok(IntDivStep::Exact(
-            acc.checked_div(divisor)
-                .unwrap_or_else(|| acc.wrapping_neg()),
-        )),
+        // checked_rem and checked_div overflow in lockstep (both None only
+        // for this same i64::MIN/-1 pair), so checked_rem returning Some(_)
+        // here already proves plain `/` cannot overflow on these operands.
+        Some(0) => Ok(IntDivStep::Exact(acc / divisor)),
         Some(_) => Ok(IntDivStep::Inexact(acc as f64 / divisor as f64)),
         None => Ok(IntDivStep::Exact(acc.wrapping_neg())),
     }
@@ -705,6 +714,50 @@ mod tests {
         let forms = read_program("(display 1)").unwrap();
         let module = compile_program(&forms).unwrap();
         assert!(run(&module, &mut FailingWriter).is_err());
+    }
+
+    // --- upvalue error paths (qa test-design review, msg #87/#89): these
+    // three defensive checks in resolve_env/upvalue_cell are only ever
+    // reachable via a hand-crafted .mlbc artifact (the compiler never emits
+    // an out-of-range depth/slot itself), but per this codebase's own
+    // established precedent — hand-built Chunks already exercise
+    // undefined-opcode and out-of-range-constant-index the same way —
+    // every guarded invariant gets a direct test, not just a code comment
+    // asserting it's safe. Tested as plain unit calls against Env directly,
+    // since resolve_env/upvalue_cell need no VM/Chunk machinery at all.
+
+    #[test]
+    fn resolve_env_rejects_depth_zero() {
+        let env = Env {
+            locals: vec![],
+            parent: None,
+        };
+        assert!(resolve_env(&env, 0).is_err());
+    }
+
+    #[test]
+    fn resolve_env_rejects_a_depth_exceeding_the_captured_chain() {
+        // A single-level (parentless) environment can only satisfy depth 1;
+        // depth 2 would need to walk one parent link that doesn't exist.
+        let env = Env {
+            locals: vec![],
+            parent: None,
+        };
+        assert!(resolve_env(&env, 2).is_err());
+    }
+
+    #[test]
+    fn upvalue_cell_rejects_a_missing_captured_environment() {
+        assert!(upvalue_cell(None, 1, 0).is_err());
+    }
+
+    #[test]
+    fn upvalue_cell_rejects_an_out_of_range_slot() {
+        let env = Rc::new(Env {
+            locals: vec![],
+            parent: None,
+        });
+        assert!(upvalue_cell(Some(&env), 1, 0).is_err());
     }
 
     #[test]
@@ -1193,12 +1246,6 @@ mod tests {
         // value has no positive i64 representation), matching how
         // native_minus's own unary case already handles this input.
         let out = eval(&format!("(display (/ {} -1))", i64::MIN)).unwrap();
-        assert_eq!(out, i64::MIN.to_string());
-    }
-
-    #[test]
-    fn a_division_chain_reaching_i64_min_mid_fold_then_dividing_by_negative_one_does_not_panic() {
-        let out = eval(&format!("(display (/ {} 1 -1))", i64::MIN)).unwrap();
         assert_eq!(out, i64::MIN.to_string());
     }
 

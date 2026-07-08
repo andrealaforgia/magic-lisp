@@ -169,17 +169,32 @@ impl Ctx {
     /// levels at runtime. Only ever consults each ancestor's `locals`
     /// (never its `aliases` or globals), since an alias resolves through a
     /// global regardless of nesting and needs no upvalue at all.
-    fn resolve_upvalue(&self, name: &str) -> Option<(u8, u8)> {
+    /// `Ok(None)`: `name` isn't a local anywhere in the enclosing chain (not
+    /// an upvalue at all — the caller should fall back to a global lookup).
+    /// `Ok(Some(_))`: found, encodable in the bytecode's `u8` depth operand.
+    /// `Err(_)`: found, but more than 255 enclosing-function levels away —
+    /// a hard compile error instead of silently falling through to a global
+    /// lookup, which would resolve to the wrong value if a same-named
+    /// global happens to exist (a security-review finding: `depth: u8`
+    /// overflowing past 255 used to be treated identically to "not an
+    /// upvalue," a silent wrong-answer risk, not just a rejected program).
+    fn resolve_upvalue(&self, name: &str) -> Result<Option<(u8, u8)>, CompileError> {
         let mut depth: u8 = 1;
         let mut current = self.parent.as_deref();
         while let Some(ctx) = current {
             if let Some(slot) = ctx.resolve_local(name) {
-                return Some((depth, slot));
+                return Ok(Some((depth, slot)));
             }
             current = ctx.parent.as_deref();
-            depth = depth.checked_add(1)?;
+            depth = depth.checked_add(1).ok_or_else(|| {
+                err(format!(
+                    "'{name}' is captured through too many levels of nested functions \
+                     (more than {} — this bytecode format can't encode a deeper upvalue)",
+                    u8::MAX
+                ))
+            })?;
         }
-        None
+        Ok(None)
     }
 
     fn with_alias(&self, name: String, alias: String) -> Ctx {
@@ -757,7 +772,7 @@ fn compile_set(
     } else if let Some(alias) = ctx.resolve_alias(&name) {
         let idx = chunk.add_const(Const::Symbol(alias.to_string()));
         chunk.emit_set_global(idx);
-    } else if let Some((depth, slot)) = ctx.resolve_upvalue(&name) {
+    } else if let Some((depth, slot)) = ctx.resolve_upvalue(&name)? {
         chunk.emit_set_upvalue(depth, slot);
     } else {
         let idx = chunk.add_const(Const::Symbol(name));
@@ -1050,7 +1065,7 @@ fn compile_expr(
             } else if let Some(alias) = ctx.resolve_alias(s) {
                 let idx = chunk.add_const(Const::Symbol(alias.to_string()));
                 chunk.emit_get_global(idx);
-            } else if let Some((depth, slot)) = ctx.resolve_upvalue(s) {
+            } else if let Some((depth, slot)) = ctx.resolve_upvalue(s)? {
                 chunk.emit_get_upvalue(depth, slot);
             } else {
                 let idx = chunk.add_const(Const::Symbol(s.clone()));
