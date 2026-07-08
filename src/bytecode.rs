@@ -775,6 +775,31 @@ mod tests {
         assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
     }
 
+    /// Chains via cdr, not car -- the shape a real dotted-list literal like
+    /// `(1 2 3 ... . tail)` actually produces, unlike `nested_pair_const`
+    /// above (which only exercises the car side's own depth counting).
+    fn cdr_nested_pair_const(depth: usize) -> Const {
+        let mut c = Const::Int(0);
+        for _ in 0..depth {
+            c = Const::Pair(Box::new(Const::Int(0)), Box::new(c));
+        }
+        c
+    }
+
+    #[test]
+    fn round_trips_a_cdr_chained_constant_pair_nested_to_exactly_the_configured_maximum_depth() {
+        let module = module_with_const(cdr_nested_pair_const(MAX_CONST_NESTING_DEPTH));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Ok(module));
+    }
+
+    #[test]
+    fn rejects_a_cdr_chained_constant_pair_nested_one_deeper_than_the_configured_maximum() {
+        let module = module_with_const(cdr_nested_pair_const(MAX_CONST_NESTING_DEPTH + 1));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+    }
+
     #[test]
     fn patch_jump_writes_the_current_end_of_code_as_the_absolute_target() {
         let mut chunk = Chunk::new();

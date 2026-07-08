@@ -147,6 +147,11 @@ fn display_pair_chain(
                 write!(f, " {car}")?;
                 current = cdr;
             }
+            // This guard is unobservable: dropping it entirely would still
+            // print nothing extra for an empty items Vec, since the next
+            // arm's loop is a no-op over zero elements before its own
+            // `break`. Hand-verified: with the guard forced to `false`,
+            // the full test suite still passes.
             Value::List(items) if items.is_empty() => break,
             Value::List(items) => {
                 for item in items.iter() {
@@ -299,6 +304,11 @@ pub fn value_equal(a: &Value, b: &Value) -> bool {
                     return false;
                 }
             }
+            // This guard is unobservable: dropping it falls through to the
+            // `value_eqv` fallback below, which has its own identical
+            // empty-List special case and returns the same answer. Hand-
+            // verified: with the guard forced to `false`, the full test
+            // suite still passes.
             (Value::List(lx), Value::List(ly)) if lx.is_empty() && ly.is_empty() => {}
             (Value::Vector(vx), Value::Vector(vy)) => {
                 let vx = vx.borrow();
