@@ -38,6 +38,24 @@ pub enum Value {
     /// construction (`set-car!`/`set-cdr!`), so it needs interior
     /// mutability, not just `Rc`'s shared-ownership identity (the same
     /// `eq?`-identity reason as `Str` above).
+    ///
+    /// Known, deliberately deferred hardening (warden security review, msg
+    /// #150): `Const::Pair` (the compile-time literal counterpart) has a
+    /// custom `Drop` that unwinds a long chain iteratively, since Rust's
+    /// default field-drop glue would otherwise recurse once per element.
+    /// The identical defect applies here in principle, but is masked in
+    /// practice by the VM's dedicated ~3 GiB stack thread (sized for an
+    /// unrelated reason) -- extrapolating the measured single-digit-MB
+    /// crash threshold on an ordinary stack, the real crash point under
+    /// that stack is roughly 90-100 million elements. Fixing this directly
+    /// (`impl Drop for Value`) is not viable: Rust forbids partially moving
+    /// a field out of any variant of a type that implements `Drop`, and
+    /// `Value` is destructured by move throughout the VM's hot path (e.g.
+    /// `Value::Closure(idx, env)`, `Value::Native(name)`) -- so the correct
+    /// fix is a dedicated newtype wrapper around this `Rc<RefCell<...>>>`
+    /// carrying its own `Drop`, not a `Drop` impl on `Value` itself. Left
+    /// as a tracked, not-yet-implemented improvement given the impractical
+    /// exploit scale, rather than rushed under time pressure.
     Pair(Rc<RefCell<(Value, Value)>>),
     /// `Rc`, not a plain `Vec`, for the same `eq?`-identity reason as `Str`
     /// and `Pair` above — a non-empty list is a compound/reference value
@@ -116,9 +134,9 @@ fn display_pair_chain(
     let mut seen = HashSet::new();
     seen.insert(Rc::as_ptr(cell) as usize);
     loop {
-        match current {
+        match &current {
             Value::Pair(next) => {
-                if !seen.insert(Rc::as_ptr(&next) as usize) {
+                if !seen.insert(Rc::as_ptr(next) as usize) {
                     write!(f, " ...")?;
                     break;
                 }
