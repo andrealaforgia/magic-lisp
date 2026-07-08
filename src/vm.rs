@@ -1360,34 +1360,61 @@ fn find_hash_value(entries: &Rc<RefCell<Vec<(Value, Value)>>>, key: &Value) -> O
 /// of `vm.stdin`, leaving the rest for a subsequent `read`/`read-line` call
 /// to continue from.
 fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
+    // `read_one` re-tokenizes its whole input from scratch every call (it
+    // has no state to resume from), so retrying it after every single new
+    // line pulled in for a datum spread across N lines costs O(current
+    // size) per line x O(N) lines = O(N^2) total (warden security review
+    // msg #208, confirmed with measured quadratic scaling). Retrying only
+    // once the buffer has roughly DOUBLED since the last attempt (rather
+    // than on every new chunk) keeps the sizes actually re-parsed forming
+    // a geometric series that sums to O(final size) -- linear overall,
+    // dominated by the one full-size attempt at the end -- while still
+    // resolving in a single attempt for the common single-chunk case
+    // (the first attempt always runs immediately, threshold 0).
+    let mut next_attempt_at = 0;
     loop {
-        match reader::read_one(&vm.stdin_buffer) {
-            Ok((Some(sexpr), remaining)) => {
-                vm.stdin_buffer = remaining;
-                let c = sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
-                return Ok(const_to_value(&c));
-            }
-            // Either nothing parseable yet (just whitespace so far) or a
-            // genuine parse error (e.g. an unterminated list) -- both are
-            // ambiguous until we know whether more input is still coming,
-            // since a multi-line datum looks identical to malformed input
-            // until its closing delimiter actually arrives. Pull one more
-            // chunk and retry; only once the stream is truly exhausted
-            // (below) is either outcome treated as final.
-            Ok((None, _)) | Err(_) => match vm.stdin_channel.next_chunk() {
-                Some(chunk) => vm.stdin_buffer.push_str(&chunk),
-                None => {
-                    return match reader::read_one(&vm.stdin_buffer) {
-                        Ok((Some(sexpr), _)) => {
-                            let c =
-                                sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
-                            Ok(const_to_value(&c))
-                        }
-                        Ok((None, _)) => Ok(Value::Eof),
-                        Err(e) => Err(error(format!("read: {e}"))),
-                    };
+        if vm.stdin_buffer.len() >= next_attempt_at {
+            match reader::read_one(&vm.stdin_buffer) {
+                Ok((Some(sexpr), remaining)) => {
+                    vm.stdin_buffer = remaining;
+                    let c = sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
+                    return Ok(const_to_value(&c));
                 }
-            },
+                // Either nothing parseable yet (just whitespace so far) or
+                // a genuine parse error (e.g. an unterminated list) -- both
+                // are ambiguous until we know whether more input is still
+                // coming, since a multi-line datum looks identical to
+                // malformed input until its closing delimiter actually
+                // arrives. Only once the stream is truly exhausted (below)
+                // is either outcome treated as final.
+                Ok((None, _)) | Err(_) => {
+                    // The trailing `+ 1` is unobservable under this
+                    // relay's own invariant that every `Some(chunk)` from
+                    // `next_chunk` has `chunk.len() >= 1` (a true
+                    // end-of-stream is `None`, never an empty `Some("")`):
+                    // whether the threshold after an empty buffer's failed
+                    // attempt is 0 or 1, the very next real chunk always
+                    // satisfies it identically, since its length is never
+                    // 0. Hand-verified: with this `+ 1` mutated away, the
+                    // full test suite still passes. Kept anyway as a
+                    // defensive margin against a future relay change that
+                    // might relax that invariant.
+                    next_attempt_at = vm.stdin_buffer.len() * 2 + 1;
+                }
+            }
+        }
+        match vm.stdin_channel.next_chunk() {
+            Some(chunk) => vm.stdin_buffer.push_str(&chunk),
+            None => {
+                return match reader::read_one(&vm.stdin_buffer) {
+                    Ok((Some(sexpr), _)) => {
+                        let c = sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
+                        Ok(const_to_value(&c))
+                    }
+                    Ok((None, _)) => Ok(Value::Eof),
+                    Err(e) => Err(error(format!("read: {e}"))),
+                };
+            }
         }
     }
 }
@@ -5535,6 +5562,30 @@ mod tests {
     fn read_advances_across_two_consecutive_calls_not_single_shot() {
         let out = eval_with_stdin("(display (read)) (display (read))", "1 2").unwrap();
         assert_eq!(out, "12");
+    }
+
+    #[test]
+    fn read_parses_a_single_datum_spread_across_many_lines() {
+        let stdin: String = (0..20).map(|i| format!("{i}\n")).collect();
+        let stdin = format!("(\n{stdin})");
+        let out = eval_with_stdin("(display (length (read)))", &stdin).unwrap();
+        assert_eq!(out, "20");
+    }
+
+    #[test]
+    fn read_on_a_datum_spread_across_many_lines_completes_quickly_not_quadratically() {
+        // Regression test for warden security review msg #208: native_read
+        // used to re-tokenize its whole accumulated buffer from scratch
+        // after every single new line, making a datum spread across N
+        // lines cost O(N^2) -- confirmed pre-fix to still be running after
+        // 60s at N=100,000. The exponential-backoff retry fix keeps total
+        // re-parse work linear in the final size; this completing well
+        // within the default test timeout (rather than hanging) is the
+        // actual regression signal, not a precise timing assertion.
+        let stdin: String = (0..100_000).map(|i| format!("{i}\n")).collect();
+        let stdin = format!("(\n{stdin})");
+        let out = eval_with_stdin("(display (length (read)))", &stdin).unwrap();
+        assert_eq!(out, "100000");
     }
 
     #[test]
