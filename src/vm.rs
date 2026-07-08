@@ -5720,4 +5720,126 @@ mod tests {
         .unwrap();
         assert_eq!(out, "\"a\\nb\"\na\nb\nsym\n");
     }
+
+    // --- B13 E1: a template with no markers is literal data, not code
+    // (spec 3.4) ---
+
+    #[test]
+    fn a_quasiquote_with_no_markers_is_literal_data_not_evaluated_as_code() {
+        assert_eq!(eval("(display `(+ 1 2))").unwrap(), "(+ 1 2)");
+    }
+
+    // --- B13 E2: unquote inserts a single evaluated value in place ---
+
+    #[test]
+    fn unquote_inserts_a_single_evaluated_value_in_place() {
+        assert_eq!(
+            eval("(define x 10) (display `(a ,x c))").unwrap(),
+            "(a 10 c)"
+        );
+    }
+
+    #[test]
+    fn two_separate_unquote_markers_are_each_independently_evaluated() {
+        assert_eq!(
+            eval("(define x 1) (define y 2) (display `(,x mid ,y))").unwrap(),
+            "(1 mid 2)"
+        );
+    }
+
+    #[test]
+    fn unquoting_a_list_valued_expression_inserts_it_as_one_single_element() {
+        // The critical distinguishing case versus E3's splicing: the list
+        // value must appear NESTED as one element, not flattened in.
+        assert_eq!(
+            eval("(define mid (list 2 3 4)) (display `(1 ,mid 5))").unwrap(),
+            "(1 (2 3 4) 5)"
+        );
+    }
+
+    // --- B13 E3: unquote-splicing flattens a list value's elements in ---
+
+    #[test]
+    fn unquote_splicing_flattens_a_list_values_elements_directly_in() {
+        assert_eq!(
+            eval("(define mid (list 2 3 4)) (display `(1 ,@mid 5))").unwrap(),
+            "(1 2 3 4 5)"
+        );
+    }
+
+    #[test]
+    fn unquote_splicing_an_inline_list_expression() {
+        assert_eq!(eval("(display `(1 ,@(list 2 3) 4))").unwrap(), "(1 2 3 4)");
+    }
+
+    #[test]
+    fn unquote_splicing_an_empty_list_contributes_zero_elements() {
+        assert_eq!(eval("(display `(1 ,@(list) 2))").unwrap(), "(1 2)");
+    }
+
+    #[test]
+    fn unquote_splicing_with_elements_on_both_sides() {
+        assert_eq!(
+            eval("(display `(0 1 ,@(list 2 3) 4 5))").unwrap(),
+            "(0 1 2 3 4 5)"
+        );
+    }
+
+    // --- B13 E4: nested quasiquote raises the level, matching markers
+    // lower it, only a marker reaching level 0 is evaluated (spec 3.4) ---
+
+    #[test]
+    fn a_doubly_unquoted_value_inside_a_nested_quasiquote_reaches_level_zero_and_is_evaluated() {
+        assert_eq!(
+            eval("(define y 5) (display `(a `(b ,,y)))").unwrap(),
+            "(a (quasiquote (b (unquote 5))))"
+        );
+    }
+
+    #[test]
+    fn a_singly_unquoted_value_inside_a_nested_quasiquote_never_reaches_zero_and_stays_literal() {
+        // Contrasts directly with the doubly-unquoted case above: a single
+        // comma only lowers the level from 2 to 1, not to 0, so y itself
+        // (the symbol) is never substituted.
+        assert_eq!(
+            eval("(define y 5) (display `(a `(b ,y)))").unwrap(),
+            "(a (quasiquote (b (unquote y))))"
+        );
+    }
+
+    // --- B13 E5: both markers work inside a vector template too ---
+
+    #[test]
+    fn unquote_works_inside_a_vector_template() {
+        assert_eq!(
+            eval("(define x 10) (display `#(1 ,x 3))").unwrap(),
+            "#(1 10 3)"
+        );
+    }
+
+    #[test]
+    fn unquote_splicing_works_inside_a_vector_template() {
+        assert_eq!(
+            eval("(display `#(1 ,@(list 2 3) 4))").unwrap(),
+            "#(1 2 3 4)"
+        );
+    }
+
+    // --- B13 E6: integration, all five verbatim demo expressions ---
+
+    #[test]
+    fn all_five_demo_expressions_produce_exactly_the_prescribed_output() {
+        let out = eval(
+            "(define mid (list 2 3 4)) (write `(1 ,@mid 5)) (newline) \
+             (define x 10) (display `(a ,x c)) (newline) \
+             (display `(1 ,@(list 2 3) 4)) (newline) \
+             (display `#(1 ,x 3)) (newline) \
+             (define y 5) (display `(a `(b ,,y))) (newline)",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "(1 2 3 4 5)\n(a 10 c)\n(1 2 3 4)\n#(1 10 3)\n(a (quasiquote (b (unquote 5))))\n"
+        );
+    }
 }

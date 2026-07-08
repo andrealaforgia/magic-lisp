@@ -498,6 +498,180 @@ fn compile_quote(items: &[Sexpr], chunk: &mut Chunk) -> Result<(), CompileError>
     Ok(())
 }
 
+fn compile_quasiquote(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+    tail: bool,
+) -> Result<(), CompileError> {
+    let [_, template] = items else {
+        return Err(err(format!(
+            "quasiquote requires exactly one template, got {}",
+            items.len().saturating_sub(1)
+        )));
+    };
+    let expanded = expand_quasiquote(template, 1, depth)?;
+    compile_expr(&expanded, ctx, chunk, comp, depth + 1, tail)
+}
+
+/// True if `items` is the 2-element shape `(tag datum)` the reader produces
+/// for `` `x ``/`,x`/`,@x` shorthand (spec 3.4) -- e.g.
+/// `is_tagged(items, "unquote")` recognizes `(unquote x)`.
+fn is_tagged<'a>(items: &'a [Sexpr], tag: &str) -> Option<&'a Sexpr> {
+    match items {
+        [Sexpr::Symbol(s), datum] if s == tag => Some(datum),
+        _ => None,
+    }
+}
+
+/// `(list (quote sym) expr)` -- code that, when evaluated, reconstructs the
+/// 2-element `(sym <value-of-expr>)` shape the reader produces for
+/// `` `x ``/`,x`/`,@x`, used when a marker doesn't reach nesting level 0 and
+/// must survive as literal (but still recursively-expanded) data instead of
+/// being evaluated.
+fn qq_reconstruct_tagged(tag: &str, expr: Sexpr) -> Sexpr {
+    Sexpr::List(vec![
+        Sexpr::Symbol("list".to_string()),
+        Sexpr::List(vec![
+            Sexpr::Symbol("quote".to_string()),
+            Sexpr::Symbol(tag.to_string()),
+        ]),
+        expr,
+    ])
+}
+
+/// Expands a quasiquote template (spec 3.4) into an ordinary expression --
+/// built entirely from the existing `quote`/`list`/`append`/`list->vector`
+/// forms -- that reconstructs the template's data when evaluated, with each
+/// `,expr` replaced by `expr`'s runtime value and each `,@expr` splicing
+/// `expr`'s (list-valued) runtime value's elements in directly. Reuses the
+/// ordinary compilation path for the expansion result rather than adding
+/// any new bytecode: this is exactly the same "desugar into existing
+/// `Sexpr` forms, then recurse through `compile_expr`" strategy `do`'s
+/// expansion into `let`/`if` already uses.
+///
+/// `level` is the current quasiquote nesting depth (starting at 1 for the
+/// template right after a backquote): a nested backquote raises it by one,
+/// and an unquote/unquote-splicing marker lowers it by one -- only a marker
+/// that brings `level` all the way to 0 is actually evaluated; one that
+/// doesn't reach 0 is reconstructed as literal (still-tagged) data instead,
+/// via `qq_reconstruct_tagged`, continuing to expand recursively inside it
+/// in case something deeper still reaches 0 (spec 3.4's doubly-nested case).
+///
+/// `depth` is compile-time recursion depth, bounded by `MAX_NESTING_DEPTH`
+/// exactly like `compile_expr` itself -- this is naturally bounded by the
+/// reader's own identical guard on the template's source nesting, but is
+/// checked independently anyway for the same defense-in-depth reason
+/// `compile_expr` checks it rather than relying solely on the reader.
+fn expand_quasiquote(template: &Sexpr, level: u32, depth: usize) -> Result<Sexpr, CompileError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(too_deep());
+    }
+    match template {
+        Sexpr::List(items) => {
+            if let Some(inner) = is_tagged(items, "quasiquote") {
+                let expanded_inner = expand_quasiquote(inner, level + 1, depth + 1)?;
+                return Ok(qq_reconstruct_tagged("quasiquote", expanded_inner));
+            }
+            if let Some(inner) = is_tagged(items, "unquote") {
+                return if level == 1 {
+                    Ok(inner.clone())
+                } else {
+                    let expanded_inner = expand_quasiquote(inner, level - 1, depth + 1)?;
+                    Ok(qq_reconstruct_tagged("unquote", expanded_inner))
+                };
+            }
+            if is_tagged(items, "unquote-splicing").is_some() {
+                return Err(err(
+                    "unquote-splicing is only valid as an element of a list or vector template",
+                ));
+            }
+            expand_qq_sequence(items, level, depth)
+        }
+        Sexpr::Vector(items) => {
+            let list_expr = expand_qq_sequence(items, level, depth)?;
+            Ok(Sexpr::List(vec![
+                Sexpr::Symbol("list->vector".to_string()),
+                list_expr,
+            ]))
+        }
+        Sexpr::DottedList(items, tail) => {
+            let head = expand_qq_sequence(items, level, depth)?;
+            let expanded_tail = expand_quasiquote(tail, level, depth + 1)?;
+            Ok(qq_append(head, expanded_tail))
+        }
+        // An atomic/self-evaluating datum (or a plain symbol -- data here,
+        // not a variable reference): literal, unchanged regardless of level.
+        other => Ok(Sexpr::List(vec![
+            Sexpr::Symbol("quote".to_string()),
+            other.clone(),
+        ])),
+    }
+}
+
+/// Expands every element of a list/vector template into one `append` chain
+/// of "pieces": an ordinary element contributes a one-element `(list
+/// <value>)` piece, while `,@expr` at the level that actually splices here
+/// contributes `expr` itself directly (its own list value's elements, not
+/// wrapped in another list) -- the one place list- and vector-template
+/// expansion actually differ (vector wraps the result in `list->vector`;
+/// see the caller).
+fn expand_qq_sequence(items: &[Sexpr], level: u32, depth: usize) -> Result<Sexpr, CompileError> {
+    let mut pieces = Vec::with_capacity(items.len());
+    for item in items {
+        let splice_target = match item {
+            Sexpr::List(inner) => is_tagged(inner, "unquote-splicing"),
+            _ => None,
+        };
+        match splice_target {
+            Some(inner) if level == 1 => pieces.push(inner.clone()),
+            Some(inner) => {
+                let expanded_inner = expand_quasiquote(inner, level - 1, depth + 1)?;
+                pieces.push(wrap_singleton_list(qq_reconstruct_tagged(
+                    "unquote-splicing",
+                    expanded_inner,
+                )));
+            }
+            None => {
+                let value_expr = expand_quasiquote(item, level, depth + 1)?;
+                pieces.push(wrap_singleton_list(value_expr));
+            }
+        }
+    }
+    Ok(fold_append(pieces))
+}
+
+fn wrap_singleton_list(expr: Sexpr) -> Sexpr {
+    Sexpr::List(vec![Sexpr::Symbol("list".to_string()), expr])
+}
+
+fn qq_append(a: Sexpr, b: Sexpr) -> Sexpr {
+    Sexpr::List(vec![Sexpr::Symbol("append".to_string()), a, b])
+}
+
+/// Combines "pieces" (each already an expression whose value is a list of
+/// the elements it contributes) into one right-associated `append` chain --
+/// `append` itself only takes exactly 2 arguments (spec 5.1), so N pieces
+/// need N-1 nested calls, not one variadic one.
+fn fold_append(mut pieces: Vec<Sexpr>) -> Sexpr {
+    match pieces.len() {
+        0 => Sexpr::List(vec![
+            Sexpr::Symbol("quote".to_string()),
+            Sexpr::List(vec![]),
+        ]),
+        1 => pieces.pop().unwrap(),
+        _ => {
+            let last = pieces.pop().unwrap();
+            pieces
+                .into_iter()
+                .rev()
+                .fold(last, |acc, piece| qq_append(piece, acc))
+        }
+    }
+}
+
 fn compile_if(
     items: &[Sexpr],
     ctx: &Ctx,
@@ -1137,6 +1311,9 @@ fn compile_expr(
             if let Some(Sexpr::Symbol(op)) = items.first() {
                 match op.as_str() {
                     "quote" => return compile_quote(items, chunk),
+                    "quasiquote" => {
+                        return compile_quasiquote(items, ctx, chunk, comp, depth, tail);
+                    }
                     "if" => return compile_if(items, ctx, chunk, comp, depth, tail),
                     "define" => return compile_define(items, ctx, chunk, comp, depth),
                     "lambda" => return compile_lambda(items, ctx, chunk, comp, depth),
@@ -2727,5 +2904,67 @@ mod tests {
             "both case-clause bodies must be tail calls: {ops:?}"
         );
         assert!(!ops.contains(&Op::Call));
+    }
+
+    // --- B13: quasiquotation error paths (spec 3.4) ---
+
+    #[test]
+    fn unquote_splicing_outside_of_a_list_or_vector_is_a_clean_compile_error() {
+        let forms = crate::reader::read_program("`,@(list 1 2)").unwrap();
+        let err = compile_program(&forms).unwrap_err();
+        assert!(err.message.contains("unquote-splicing"));
+    }
+
+    #[test]
+    fn unquote_splicing_as_the_sole_element_of_a_quasiquoted_list_is_still_an_error_when_not_at_level_one()
+     {
+        // Nested one level deeper (inside a second backquote), the same
+        // `,@x` marker doesn't reach level 0 and is reconstructed as
+        // literal data instead -- this must NOT hit the "outside of a list"
+        // error, since it's still inside one.
+        let forms = crate::reader::read_program("`(a `(,@b))").unwrap();
+        assert!(compile_program(&forms).is_ok());
+    }
+
+    #[test]
+    fn quasiquote_with_zero_arguments_is_a_clean_compile_error() {
+        let program = [list(vec![sym("quasiquote")])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    #[test]
+    fn quasiquote_with_more_than_one_argument_is_a_clean_compile_error() {
+        let program = [list(vec![sym("quasiquote"), sym("a"), sym("b")])];
+        assert!(compile_program(&program).is_err());
+    }
+
+    fn nested_quasiquoted_list(depth: usize) -> Sexpr {
+        // A hand-built AST (bypassing the reader entirely, unlike the
+        // backtick-nesting reader tests) so this specifically exercises
+        // expand_quasiquote's own depth guard, not the reader's identical
+        // but separate one -- mirrors nested_call's same rationale above.
+        let mut expr = Sexpr::Int(1);
+        for _ in 0..depth {
+            expr = Sexpr::List(vec![expr]);
+        }
+        Sexpr::List(vec![sym("quasiquote"), expr])
+    }
+
+    #[test]
+    fn quasiquote_template_nesting_comfortably_under_the_configured_maximum_still_compiles() {
+        let program = [nested_quasiquoted_list(100)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    fn quasiquote_template_nesting_of_one_more_than_the_configured_maximum_is_a_clean_error_not_a_crash()
+     {
+        let program = [nested_quasiquoted_list(MAX_NESTING_DEPTH + 1)];
+        let error = compile_program(&program).unwrap_err();
+        assert!(
+            error.message.contains("nesting") && error.message.contains("depth"),
+            "expected a nesting-depth error, got: {}",
+            error.message
+        );
     }
 }
