@@ -1,6 +1,7 @@
 //! Runtime values.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 
@@ -239,9 +240,21 @@ fn as_pair_parts(v: &Value) -> Option<(Value, Value)> {
     }
 }
 
-pub fn value_equal(a: &Value, b: &Value) -> bool {
+/// `value_equal`'s real work, threading a set of already-compared `Pair`
+/// address pairs through the recursion. `Pair` is the only value type a
+/// MagicLisp program can mutate into a cycle (`set-car!`/`set-cdr!`), so
+/// revisiting the exact same pair of addresses means the recursion has
+/// gone all the way around a cycle without finding a mismatch -- correct
+/// to treat as equal and stop, rather than recurse forever.
+fn value_equal_inner(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize)>) -> bool {
+    if let (Value::Pair(pa), Value::Pair(pb)) = (a, b) {
+        let key = (Rc::as_ptr(pa) as usize, Rc::as_ptr(pb) as usize);
+        if !seen.insert(key) {
+            return true;
+        }
+    }
     if let (Some((a0, a1)), Some((b0, b1))) = (as_pair_parts(a), as_pair_parts(b)) {
-        return value_equal(&a0, &b0) && value_equal(&a1, &b1);
+        return value_equal_inner(&a0, &b0, seen) && value_equal_inner(&a1, &b1, seen);
     }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
@@ -249,10 +262,17 @@ pub fn value_equal(a: &Value, b: &Value) -> bool {
         (Value::Vector(x), Value::Vector(y)) => {
             let x = x.borrow();
             let y = y.borrow();
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_equal(a, b))
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|(a, b)| value_equal_inner(a, b, seen))
         }
         _ => value_eqv(a, b),
     }
+}
+
+pub fn value_equal(a: &Value, b: &Value) -> bool {
+    value_equal_inner(a, b, &mut HashSet::new())
 }
 
 #[cfg(test)]
