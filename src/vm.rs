@@ -4456,6 +4456,12 @@ mod tests {
     }
 
     #[test]
+    fn substring_with_start_after_end_is_a_clean_runtime_error_naming_it_invalid() {
+        let err = eval("(display (substring \"hello\" 3 1))").unwrap_err();
+        assert_eq!(err.message, "substring range 3..1 is invalid");
+    }
+
+    #[test]
     fn string_length_counts_a_multi_byte_character_as_one_position_not_two_bytes() {
         // qa test-design review (msg #167): all of E1's original tests were
         // pure ASCII, where char-count and byte-count are numerically
@@ -4494,9 +4500,19 @@ mod tests {
     }
 
     #[test]
+    fn string_less_than_is_false_for_two_equal_strings() {
+        assert_eq!(eval("(display (string<? \"abc\" \"abc\"))").unwrap(), "#f");
+    }
+
+    #[test]
     fn string_greater_than_is_shown_both_true_and_false() {
         assert_eq!(eval("(display (string>? \"abd\" \"abc\"))").unwrap(), "#t");
         assert_eq!(eval("(display (string>? \"abc\" \"abd\"))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn string_greater_than_is_false_for_two_equal_strings() {
+        assert_eq!(eval("(display (string>? \"abc\" \"abc\"))").unwrap(), "#f");
     }
 
     // --- B10 E3: string/symbol/char-list conversions (spec 6.1, 6.2) ---
