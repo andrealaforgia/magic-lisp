@@ -15,6 +15,8 @@ mod world;
 
 #[path = "features/steps_b1.rs"]
 mod steps_b1;
+#[path = "features/steps_b10.rs"]
+mod steps_b10;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -100,4 +102,10 @@ fn b8_type_predicates_and_equality() {
 fn b9_pairs_and_lists() {
     let src = include_str!("../features/B9-pairs-and-lists.feature");
     registry::run_feature("B9-pairs-and-lists", src, &steps_b9::registry());
+}
+
+#[test]
+fn b10_strings_and_characters() {
+    let src = include_str!("../features/B10-strings-and-characters.feature");
+    registry::run_feature("B10-strings-and-characters", src, &steps_b10::registry());
 }
