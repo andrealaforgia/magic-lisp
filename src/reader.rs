@@ -76,7 +76,14 @@ impl<'a> Scanner<'a> {
     }
 
     fn is_delimiter(c: char) -> bool {
-        c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';' || c == '\''
+        c.is_whitespace()
+            || c == '('
+            || c == ')'
+            || c == '"'
+            || c == ';'
+            || c == '\''
+            || c == '`'
+            || c == ','
     }
 
     fn peek_is_lone_dot(&self) -> bool {
@@ -131,6 +138,40 @@ impl<'a> Scanner<'a> {
                     .read_form()?
                     .ok_or_else(|| err("expected a datum after '\''"))?;
                 Ok(Sexpr::List(vec![Sexpr::Symbol("quote".to_string()), datum]))
+            }
+            // `` `x `` (quasiquote) and `,x`/`,@x` (unquote/unquote-splicing,
+            // spec 3.4) desugar exactly like `'x` above -- routed through
+            // `self.read_form()`, not `read_form_body` directly, so the same
+            // `MAX_NESTING_DEPTH` guard that already covers quote-shorthand
+            // nesting covers these by construction too.
+            Some('`') => {
+                self.chars.next();
+                let datum = self
+                    .read_form()?
+                    .ok_or_else(|| err("expected a datum after '`'"))?;
+                Ok(Sexpr::List(vec![
+                    Sexpr::Symbol("quasiquote".to_string()),
+                    datum,
+                ]))
+            }
+            Some(',') => {
+                self.chars.next();
+                let splicing = self.chars.peek() == Some(&'@');
+                if splicing {
+                    self.chars.next();
+                }
+                let tag = if splicing {
+                    "unquote-splicing"
+                } else {
+                    "unquote"
+                };
+                let datum = self.read_form()?.ok_or_else(|| {
+                    err(format!(
+                        "expected a datum after ',{}'",
+                        if splicing { "@" } else { "" }
+                    ))
+                })?;
+                Ok(Sexpr::List(vec![Sexpr::Symbol(tag.to_string()), datum]))
             }
             Some(_) => self.read_atom(),
         }
@@ -971,5 +1012,105 @@ mod tests {
             ]))
         );
         assert_eq!(rest, "");
+    }
+
+    // --- B13: quasiquote/unquote/unquote-splicing shorthand (spec 3.4) ---
+
+    #[test]
+    fn reads_quasiquote_shorthand_on_a_symbol_as_a_quasiquote_form() {
+        assert_eq!(
+            read_program("`x").unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("quasiquote".to_string()),
+                Sexpr::Symbol("x".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn reads_unquote_shorthand_on_a_symbol_as_an_unquote_form() {
+        assert_eq!(
+            read_program(",x").unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("unquote".to_string()),
+                Sexpr::Symbol("x".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn reads_unquote_splicing_shorthand_distinctly_from_plain_unquote() {
+        assert_eq!(
+            read_program(",@x").unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("unquote-splicing".to_string()),
+                Sexpr::Symbol("x".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn reads_a_quasiquoted_list_containing_unquote_and_unquote_splicing() {
+        assert_eq!(
+            read_program("`(a ,b ,@c)").unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("quasiquote".to_string()),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("a".to_string()),
+                    Sexpr::List(vec![
+                        Sexpr::Symbol("unquote".to_string()),
+                        Sexpr::Symbol("b".to_string()),
+                    ]),
+                    Sexpr::List(vec![
+                        Sexpr::Symbol("unquote-splicing".to_string()),
+                        Sexpr::Symbol("c".to_string()),
+                    ]),
+                ]),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_backtick_or_comma_ends_a_preceding_atom_without_whitespace() {
+        assert_eq!(
+            read_program("(a`b,c)").unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("a".to_string()),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("quasiquote".to_string()),
+                    Sexpr::Symbol("b".to_string()),
+                ]),
+                Sexpr::List(vec![
+                    Sexpr::Symbol("unquote".to_string()),
+                    Sexpr::Symbol("c".to_string()),
+                ]),
+            ])]
+        );
+    }
+
+    #[test]
+    fn quasiquote_shorthand_nesting_up_to_the_configured_maximum_still_succeeds() {
+        let src = format!("{}x", "`".repeat(MAX_NESTING_DEPTH - 1));
+        assert!(read_program(&src).is_ok());
+    }
+
+    #[test]
+    fn quasiquote_shorthand_nesting_is_bounded_by_the_same_depth_limit_as_lists() {
+        // Mirrors the analogous quote-shorthand security-review fix: `` `x ``
+        // and `,x` route through `self.read_form()`, the same depth-checked
+        // entry point, not a bespoke unguarded recursion.
+        let src = format!("{}x", "`".repeat(MAX_NESTING_DEPTH + 1));
+        let err = read_program(&src).unwrap_err();
+        assert!(
+            err.message.contains("nesting") && err.message.contains("depth"),
+            "expected a nesting-depth error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn unquote_with_no_following_datum_is_a_clean_read_error() {
+        assert!(read_program(",").is_err());
+        assert!(read_program(",@").is_err());
     }
 }
