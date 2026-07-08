@@ -1,7 +1,7 @@
 //! B9: pairs and lists (spec 5.1).
 
-use super::helpers::{eval_ok, run, run_demo, write_source};
-use magiclisp::exitcode::SUCCESS;
+use super::helpers::{eval_ok, run, run_demo, stderr_of, write_source};
+use magiclisp::exitcode::{RUNTIME_ERROR, SUCCESS};
 
 #[test]
 fn b9_e1_pair_mutation_and_cxr_accessors() {
@@ -283,4 +283,41 @@ fn a_large_dotted_list_literal_evaluates_cleanly_instead_of_crashing_the_process
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "0");
+}
+
+#[test]
+fn list_operations_on_a_circular_list_terminate_cleanly_through_the_real_cli() {
+    // Acceptance-level counterpart to the unit tests in src/vm.rs proving
+    // equal?/list?/last-pair/length/member/display all terminate on a
+    // set-cdr!-induced circular structure (warden msgs #143/#144/#146/#147)
+    // -- those were previously only verified by calling eval() directly in
+    // the same binary as the code under test, never through the actual CLI
+    // argument-parsing/process-exit path a real user would hit (qa
+    // test-design review, msg #165).
+    let src = "(define p (list 1 2 3)) (set-cdr! (last-pair p) p) \
+               (display (list? p)) (newline) \
+               (display (member 99 p)) (newline) \
+               (display p)";
+    let file = write_source("b9-circular-list.ml", src);
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(SUCCESS),
+        "expected a clean exit, got: {:?} (stderr: {})",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "#f\n#f\n(1 2 3 ...)"
+    );
+}
+
+#[test]
+fn length_on_a_circular_list_is_a_clean_runtime_error_through_the_real_cli_not_a_hang() {
+    let src = "(define p (list 1 2 3)) (set-cdr! (last-pair p) p) (display (length p))";
+    let file = write_source("b9-circular-length.ml", src);
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(RUNTIME_ERROR));
+    assert!(!stderr_of(&output).is_empty());
 }
