@@ -4574,6 +4574,19 @@ mod tests {
         assert_eq!(eval("(display (string-downcase \"ABC\"))").unwrap(), "abc");
     }
 
+    #[test]
+    fn string_upcase_handles_a_unicode_case_conversion_that_changes_length() {
+        // qa test-design review (msg #170): an ASCII-only test ("abc" ->
+        // "ABC") can't catch a length-changing Unicode case conversion --
+        // confirmed reproducible: German "straße" uppercases to "STRASSE"
+        // (6 characters become 7, since sharp-s has no single-character
+        // uppercase form).
+        assert_eq!(
+            eval("(display (string-upcase \"straße\"))").unwrap(),
+            "STRASSE"
+        );
+    }
+
     // --- B10 E5: char<->integer, char=?/char<?, char predicates (spec 6.2) ---
 
     #[test]
