@@ -50,6 +50,13 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Everything not yet consumed, as an owned string -- used by
+    /// [`read_one`], whose caller needs the leftover text handed back to
+    /// continue a later read from wherever this one left off.
+    fn remaining(&self) -> String {
+        self.chars.clone().collect()
+    }
+
     fn skip_atmosphere(&mut self) {
         loop {
             match self.chars.peek() {
@@ -344,6 +351,20 @@ pub fn read_program(src: &str) -> Result<Vec<Sexpr>, ReadError> {
         forms.push(form);
     }
     Ok(forms)
+}
+
+/// Reads exactly one datum from `src`, returning it together with
+/// everything left unconsumed afterward -- for callers (the `read` native,
+/// spec 4.8) that read one unit of data at a time from a stream, each call
+/// continuing from wherever the previous one left off, rather than parsing
+/// a whole program's worth of text up front like [`read_program`] does.
+/// Returns `Ok((None, ...))` (with only leading whitespace/comments
+/// consumed) at end of input, mirroring `read_program`'s own "no more
+/// forms" signal.
+pub fn read_one(src: &str) -> Result<(Option<Sexpr>, String), ReadError> {
+    let mut scanner = Scanner::new(src);
+    let form = scanner.read_form()?;
+    Ok((form, scanner.remaining()))
 }
 
 #[cfg(test)]
@@ -888,5 +909,37 @@ mod tests {
         assert_eq!(read_program("#t").unwrap(), vec![Sexpr::Bool(true)]);
         assert_eq!(read_program("#f").unwrap(), vec![Sexpr::Bool(false)]);
         assert_eq!(read_program("#x1A").unwrap(), vec![Sexpr::Int(26)]);
+    }
+
+    // --- B12 E1: read_one, spec 4.8's underlying single-datum reader ---
+
+    #[test]
+    fn read_one_reads_a_single_datum_and_returns_the_rest_unconsumed() {
+        let (form, rest) = read_one("(+ 1 2) (+ 3 4)").unwrap();
+        assert_eq!(
+            form,
+            Some(Sexpr::List(vec![
+                Sexpr::Symbol("+".to_string()),
+                Sexpr::Int(1),
+                Sexpr::Int(2),
+            ]))
+        );
+        assert_eq!(rest, " (+ 3 4)");
+    }
+
+    #[test]
+    fn read_one_advances_correctly_across_two_consecutive_calls() {
+        let (first, rest) = read_one("1 2").unwrap();
+        assert_eq!(first, Some(Sexpr::Int(1)));
+        let (second, rest) = read_one(&rest).unwrap();
+        assert_eq!(second, Some(Sexpr::Int(2)));
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn read_one_returns_none_at_end_of_input() {
+        let (form, rest) = read_one("   ").unwrap();
+        assert_eq!(form, None);
+        assert_eq!(rest, "");
     }
 }
