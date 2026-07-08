@@ -4621,4 +4621,20 @@ mod tests {
     fn the_named_tab_literal_has_code_point_nine() {
         assert_eq!(eval("(display (char->integer #\\tab))").unwrap(), "9");
     }
+
+    // --- B10 E7: length/indexing count by character, not byte (spec 6.1) ---
+
+    #[test]
+    fn a_plain_letter_plus_one_accented_character_is_length_two() {
+        assert_eq!(eval("(display (string-length \"aé\"))").unwrap(), "2");
+    }
+
+    #[test]
+    fn position_zero_is_the_plain_letter_and_position_one_is_the_accented_character() {
+        // Confirms the two are at their correct respective positions, not
+        // swapped -- position 0 is the single-byte plain letter, position 1
+        // is the two-byte accented character.
+        assert_eq!(eval("(display (string-ref \"aé\" 0))").unwrap(), "a");
+        assert_eq!(eval("(display (string-ref \"aé\" 1))").unwrap(), "é");
+    }
 }
