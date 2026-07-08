@@ -43,9 +43,11 @@ pub enum Const {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Const>),
+    Vector(Vec<Const>),
     Unspecified,
 }
 
@@ -239,6 +241,17 @@ fn encode_const(out: &mut Vec<u8>, c: &Const) {
             }
         }
         Const::Unspecified => out.push(5),
+        Const::Char(c) => {
+            out.push(7);
+            out.extend_from_slice(&(*c as u32).to_le_bytes());
+        }
+        Const::Vector(items) => {
+            out.push(8);
+            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for item in items {
+                encode_const(out, item);
+            }
+        }
     }
 }
 
@@ -339,6 +352,18 @@ fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
         }
         5 => Const::Unspecified,
         6 => Const::Float(r.f64()?),
+        7 => {
+            let scalar = r.u32()?;
+            Const::Char(char::from_u32(scalar).ok_or(BytecodeError::Truncated)?)
+        }
+        8 => {
+            let count = r.u32()?;
+            let mut items = Vec::new();
+            for _ in 0..count {
+                items.push(decode_const(r, depth + 1)?);
+            }
+            Const::Vector(items)
+        }
         _ => return Err(BytecodeError::Truncated),
     })
 }
@@ -442,6 +467,40 @@ mod tests {
     fn round_trips_a_float_constant_byte_for_byte() {
         let mut chunk = Chunk::new();
         let idx = chunk.add_const(Const::Float(3.5));
+        chunk.emit_const(idx);
+        chunk.emit_halt();
+        let module = Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        };
+        let bytes = encode(&module);
+        let decoded = decode(&bytes).expect("valid module should decode");
+        assert_eq!(decoded, module);
+    }
+
+    #[test]
+    fn round_trips_a_char_constant_byte_for_byte() {
+        let mut chunk = Chunk::new();
+        let idx = chunk.add_const(Const::Char('a'));
+        chunk.emit_const(idx);
+        chunk.emit_halt();
+        let module = Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        };
+        let bytes = encode(&module);
+        let decoded = decode(&bytes).expect("valid module should decode");
+        assert_eq!(decoded, module);
+    }
+
+    #[test]
+    fn round_trips_a_vector_constant_byte_for_byte() {
+        let mut chunk = Chunk::new();
+        let idx = chunk.add_const(Const::Vector(vec![
+            Const::Int(1),
+            Const::Str("x".to_string()),
+            Const::Vector(vec![Const::Int(2)]),
+        ]));
         chunk.emit_const(idx);
         chunk.emit_halt();
         let module = Module {
@@ -587,6 +646,33 @@ mod tests {
     #[test]
     fn rejects_a_constant_list_nested_one_deeper_than_the_configured_maximum() {
         let module = module_with_const(nested_list_const(MAX_CONST_NESTING_DEPTH + 1));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+    }
+
+    fn nested_vector_const(depth: usize) -> Const {
+        let mut c = Const::Int(0);
+        for _ in 0..depth {
+            c = Const::Vector(vec![c]);
+        }
+        c
+    }
+
+    #[test]
+    fn round_trips_a_constant_vector_nested_to_exactly_the_configured_maximum_depth() {
+        let module = module_with_const(nested_vector_const(MAX_CONST_NESTING_DEPTH));
+        let bytes = encode(&module);
+        assert_eq!(decode(&bytes), Ok(module));
+    }
+
+    #[test]
+    fn rejects_a_constant_vector_nested_one_deeper_than_the_configured_maximum() {
+        // Pins down that decode_const's recursion depth counter is
+        // genuinely incremented per nested Vector level, the same as for
+        // List above -- a `depth` that's read but never actually advanced
+        // for this variant would let pathologically deep vector literals
+        // blow the native stack instead of failing cleanly.
+        let module = module_with_const(nested_vector_const(MAX_CONST_NESTING_DEPTH + 1));
         let bytes = encode(&module);
         assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
     }

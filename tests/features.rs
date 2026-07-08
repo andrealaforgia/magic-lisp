@@ -27,6 +27,8 @@ mod steps_b5;
 mod steps_b6;
 #[path = "features/steps_b7.rs"]
 mod steps_b7;
+#[path = "features/steps_b8.rs"]
+mod steps_b8;
 
 #[test]
 fn b1_walking_skeleton() {
@@ -80,4 +82,14 @@ fn b6_tail_and_deep_recursion() {
 fn b7_numeric_library() {
     let src = include_str!("../features/B7-numeric-library.feature");
     registry::run_feature("B7-numeric-library", src, &steps_b7::registry());
+}
+
+#[test]
+fn b8_type_predicates_and_equality() {
+    let src = include_str!("../features/B8-type-predicates-and-equality.feature");
+    registry::run_feature(
+        "B8-type-predicates-and-equality",
+        src,
+        &steps_b8::registry(),
+    );
 }

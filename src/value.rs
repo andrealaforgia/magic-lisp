@@ -20,7 +20,13 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(String),
+    Char(char),
+    /// `Rc`, not a plain `String`: `eq?` (spec 3.7) must tell two
+    /// separately-built strings with identical contents (different
+    /// objects) apart from the same string bound to two different names
+    /// (the same object) — a plain owned `String`, deep-cloned on every
+    /// `Value::clone()`, has no notion of object identity to compare.
+    Str(Rc<String>),
     Symbol(String),
     Native(String),
     /// A user-defined function: an index into the module's function table,
@@ -30,8 +36,23 @@ pub enum Value {
     /// A minimal cons cell — just enough to construct a pair and retrieve
     /// each half back out; the broader pair/list operation library is a
     /// later behaviour, so this deliberately isn't unified with `List`.
-    Pair(Box<Value>, Box<Value>),
-    List(Vec<Value>),
+    /// `Rc`, not `Box`, for the same `eq?`-identity reason as `Str` above.
+    Pair(Rc<(Value, Value)>),
+    /// `Rc`, not a plain `Vec`, for the same `eq?`-identity reason as `Str`
+    /// and `Pair` above — a non-empty list is a compound/reference value
+    /// per spec 3.7, so two separately-quoted lists with the same contents
+    /// must NOT be `eq?` to each other.
+    List(Rc<Vec<Value>>),
+    /// A fixed-length mutable array (spec 4.5). Minimal: enough to exist as
+    /// a distinct, `eq?`-by-reference, `vector?`-recognizable value type;
+    /// the full vector-manipulation procedure library is a later behaviour.
+    Vector(Rc<RefCell<Vec<Value>>>),
+    /// A mutable hash table (spec 4.6), keyed by `equal?`. Minimal:
+    /// association-list-backed, enough to exist as a distinct,
+    /// `eq?`-by-reference, `hash?`-recognizable value type; the full
+    /// hash-table procedure library (`hash-set!`, `hash-ref`, ...) is a
+    /// later behaviour.
+    Hash(Rc<RefCell<Vec<(Value, Value)>>>),
     Unspecified,
 }
 
@@ -81,11 +102,12 @@ impl fmt::Display for Value {
             Value::Float(n) => write!(f, "{}", format_float(*n)),
             Value::Bool(true) => write!(f, "#t"),
             Value::Bool(false) => write!(f, "#f"),
+            Value::Char(c) => write!(f, "{c}"),
             Value::Str(s) => write!(f, "{s}"),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Native(name) => write!(f, "#<procedure:{name}>"),
             Value::Closure(idx, _) => write!(f, "#<procedure:{idx}>"),
-            Value::Pair(a, b) => write!(f, "({a} . {b})"),
+            Value::Pair(cell) => write!(f, "({} . {})", cell.0, cell.1),
             Value::List(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
@@ -96,6 +118,17 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Vector(items) => {
+                write!(f, "#(")?;
+                for (i, item) in items.borrow().iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, ")")
+            }
+            Value::Hash(_) => write!(f, "#<hash>"),
             Value::Unspecified => Ok(()),
         }
     }
@@ -103,6 +136,65 @@ impl fmt::Display for Value {
 
 pub fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false))
+}
+
+/// NaN compares equal to NaN under `eqv?`; positive and negative zero do
+/// NOT compare equal to each other (spec 3.7) -- a bit-pattern comparison,
+/// not IEEE `==`, which disagrees with both of those on purpose.
+fn float_eqv(a: f64, b: f64) -> bool {
+    (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+}
+
+/// The shared implementation behind both `eq?` and `eqv?` (spec 3.7):
+/// simple values (fixnums, booleans, characters, symbols, the empty list)
+/// compare by value; compound values (pairs, strings, vectors, hashes,
+/// non-empty lists, procedures) compare only if they're literally the same
+/// object. No demo in this language's behaviour suite distinguishes `eq?`
+/// from `eqv?` on any concrete input -- `eq?` on floats is explicitly
+/// implementation-defined, and this implementation picks the same
+/// bit-precise comparison `eqv?` requires, so one function correctly backs
+/// both native procedures.
+pub fn value_eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Native(x), Value::Native(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => float_eqv(*x, *y),
+        (Value::List(x), Value::List(y)) if x.is_empty() && y.is_empty() => true,
+        (Value::Str(x), Value::Str(y)) => Rc::ptr_eq(x, y),
+        (Value::Pair(x), Value::Pair(y)) => Rc::ptr_eq(x, y),
+        (Value::List(x), Value::List(y)) => Rc::ptr_eq(x, y),
+        (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
+        (Value::Hash(x), Value::Hash(y)) => Rc::ptr_eq(x, y),
+        (Value::Closure(idx1, env1), Value::Closure(idx2, env2)) => {
+            idx1 == idx2 && Rc::ptr_eq(env1, env2)
+        }
+        (Value::Unspecified, Value::Unspecified) => true,
+        _ => false,
+    }
+}
+
+/// Deep structural equality (spec 3.7): recurses into pairs, vectors, and
+/// strings comparing contents, falling back to `eqv?` for everything else.
+/// Plain structural recursion with no cycle detection -- terminates on
+/// acyclic data, as required; behaviour on cyclic data is
+/// implementation-defined per spec, so no special handling is needed for it.
+pub fn value_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Pair(x), Value::Pair(y)) => value_equal(&x.0, &y.0) && value_equal(&x.1, &y.1),
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_equal(a, b))
+        }
+        (Value::Vector(x), Value::Vector(y)) => {
+            let x = x.borrow();
+            let y = y.borrow();
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_equal(a, b))
+        }
+        _ => value_eqv(a, b),
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +220,7 @@ mod tests {
     #[test]
     fn displays_a_string_as_its_raw_content() {
         assert_eq!(
-            Value::Str("hello\nworld".to_string()).to_string(),
+            Value::Str(Rc::new("hello\nworld".to_string())).to_string(),
             "hello\nworld"
         );
     }
@@ -140,25 +232,43 @@ mod tests {
 
     #[test]
     fn displays_an_empty_list_as_a_pair_of_parens() {
-        assert_eq!(Value::List(vec![]).to_string(), "()");
+        assert_eq!(Value::List(Rc::new(vec![])).to_string(), "()");
     }
 
     #[test]
     fn displays_a_list_with_space_separated_elements() {
-        let list = Value::List(vec![
+        let list = Value::List(Rc::new(vec![
             Value::Symbol("+".to_string()),
             Value::Int(1),
             Value::Int(2),
-        ]);
+        ]));
         assert_eq!(list.to_string(), "(+ 1 2)");
     }
 
     #[test]
-    fn displays_a_nested_list_recursively() {
-        let list = Value::List(vec![
+    fn displays_an_empty_vector_with_no_interior_space() {
+        assert_eq!(
+            Value::Vector(Rc::new(RefCell::new(vec![]))).to_string(),
+            "#()"
+        );
+    }
+
+    #[test]
+    fn displays_a_vector_with_space_separated_elements() {
+        let vector = Value::Vector(Rc::new(RefCell::new(vec![
             Value::Int(1),
-            Value::List(vec![Value::Int(2), Value::Int(3)]),
-        ]);
+            Value::Int(2),
+            Value::Int(3),
+        ])));
+        assert_eq!(vector.to_string(), "#(1 2 3)");
+    }
+
+    #[test]
+    fn displays_a_nested_list_recursively() {
+        let list = Value::List(Rc::new(vec![
+            Value::Int(1),
+            Value::List(Rc::new(vec![Value::Int(2), Value::Int(3)])),
+        ]));
         assert_eq!(list.to_string(), "(1 (2 3))");
     }
 
@@ -206,8 +316,8 @@ mod tests {
         assert!(!is_truthy(&Value::Bool(false)));
         assert!(is_truthy(&Value::Bool(true)));
         assert!(is_truthy(&Value::Int(0)));
-        assert!(is_truthy(&Value::List(vec![])));
-        assert!(is_truthy(&Value::Str(String::new())));
+        assert!(is_truthy(&Value::List(Rc::new(vec![]))));
+        assert!(is_truthy(&Value::Str(Rc::new(String::new()))));
         assert!(is_truthy(&Value::Unspecified));
     }
 }

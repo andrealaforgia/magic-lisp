@@ -5,12 +5,15 @@ pub enum Sexpr {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Sexpr>),
     /// `(a b . rest)` — an improper list with a fixed head and a non-list
     /// tail. Used exclusively for parameter-list syntax in this language.
     DottedList(Vec<Sexpr>, Box<Sexpr>),
+    /// `#(a b c)` — a vector literal (spec 3.1 grammar: `vector-lit`).
+    Vector(Vec<Sexpr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +117,7 @@ impl<'a> Scanner<'a> {
             }
             Some(')') => Err(err("unexpected ')' with no matching '('")),
             Some('"') => self.read_string(),
+            Some('#') => self.read_hash_form(),
             Some('\'') => {
                 self.chars.next();
                 let datum = self
@@ -122,6 +126,82 @@ impl<'a> Scanner<'a> {
                 Ok(Sexpr::List(vec![Sexpr::Symbol("quote".to_string()), datum]))
             }
             Some(_) => self.read_atom(),
+        }
+    }
+
+    /// Dispatches every `#`-prefixed form. `#\` (character literals) and
+    /// `#(` (vector literals) need dedicated readers, since their bodies
+    /// can themselves contain delimiter characters (`#\(` is the literal
+    /// `(` character; `#(1 2)` nests ordinary datum syntax) that
+    /// `read_atom`'s single-token tokenizer isn't equipped to handle.
+    /// Everything else `#`-prefixed (`#t`, `#f`, `#x..`/`#b..`/`#o..`
+    /// radix literals) is an ordinary delimiter-bounded token, unaffected
+    /// by this dispatch, and falls through to the existing `read_atom` path.
+    fn read_hash_form(&mut self) -> Result<Sexpr, ReadError> {
+        let mut lookahead = self.chars.clone();
+        lookahead.next(); // '#' itself
+        match lookahead.peek() {
+            Some('(') => {
+                self.chars.next(); // '#'
+                self.chars.next(); // '('
+                self.read_vector_body()
+            }
+            Some('\\') => self.read_character(),
+            _ => self.read_atom(),
+        }
+    }
+
+    fn read_character(&mut self) -> Result<Sexpr, ReadError> {
+        self.chars.next(); // '#'
+        self.chars.next(); // '\'
+        let first = self
+            .chars
+            .next()
+            .ok_or_else(|| err("expected a character after '#\\'"))?;
+        // A single non-alphabetic character (e.g. `(`, a digit, a symbol
+        // character) is always the literal itself, never the start of a
+        // named form like "space" -- only letters continue into a name.
+        let mut name = String::new();
+        name.push(first);
+        if first.is_alphabetic() {
+            while let Some(&c) = self.chars.peek() {
+                if Self::is_delimiter(c) {
+                    break;
+                }
+                name.push(c);
+                self.chars.next();
+            }
+        }
+        let mut chars = name.chars();
+        let ch = match (chars.next(), chars.as_str()) {
+            (Some(only), "") => only,
+            (Some(_), _) => match name.as_str() {
+                "space" => ' ',
+                "newline" => '\n',
+                "tab" => '\t',
+                other => {
+                    return Err(err(format!(
+                        "unknown named character literal: '#\\{other}'"
+                    )));
+                }
+            },
+            (None, _) => unreachable!("name always has at least the first char pushed"),
+        };
+        Ok(Sexpr::Char(ch))
+    }
+
+    fn read_vector_body(&mut self) -> Result<Sexpr, ReadError> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_atmosphere();
+            if let Some(')') = self.chars.peek() {
+                self.chars.next();
+                return Ok(Sexpr::Vector(items));
+            }
+            let form = self
+                .read_form()?
+                .ok_or_else(|| err("unterminated vector literal: missing ')'"))?;
+            items.push(form);
         }
     }
 
@@ -731,5 +811,82 @@ mod tests {
             "expected a nesting-depth error, got: {}",
             err.message
         );
+    }
+
+    // --- B8: character and vector literals (spec 3.1 grammar) ---
+
+    #[test]
+    fn reads_a_plain_character_literal() {
+        assert_eq!(read_program("#\\a").unwrap(), vec![Sexpr::Char('a')]);
+    }
+
+    #[test]
+    fn reads_a_character_literal_whose_own_character_is_a_delimiter() {
+        // '(' is itself a delimiter that read_atom's ordinary tokenizer
+        // would stop at -- #\( needs dedicated handling to read correctly
+        // rather than misparsing as an empty token followed by a list.
+        assert_eq!(read_program("#\\(").unwrap(), vec![Sexpr::Char('(')]);
+    }
+
+    #[test]
+    fn reads_the_named_space_character_literal() {
+        assert_eq!(read_program("#\\space").unwrap(), vec![Sexpr::Char(' ')]);
+    }
+
+    #[test]
+    fn reads_the_named_newline_character_literal() {
+        assert_eq!(read_program("#\\newline").unwrap(), vec![Sexpr::Char('\n')]);
+    }
+
+    #[test]
+    fn reads_the_named_tab_character_literal() {
+        assert_eq!(read_program("#\\tab").unwrap(), vec![Sexpr::Char('\t')]);
+    }
+
+    #[test]
+    fn rejects_an_unknown_named_character_literal() {
+        assert!(read_program("#\\bogus").is_err());
+    }
+
+    #[test]
+    fn reads_an_empty_vector_literal() {
+        assert_eq!(read_program("#()").unwrap(), vec![Sexpr::Vector(vec![])]);
+    }
+
+    #[test]
+    fn reads_a_vector_literal_with_elements() {
+        assert_eq!(
+            read_program("#(1 2 3)").unwrap(),
+            vec![Sexpr::Vector(vec![
+                Sexpr::Int(1),
+                Sexpr::Int(2),
+                Sexpr::Int(3)
+            ])]
+        );
+    }
+
+    #[test]
+    fn reads_a_nested_vector_literal() {
+        assert_eq!(
+            read_program("#(1 #(2 3))").unwrap(),
+            vec![Sexpr::Vector(vec![
+                Sexpr::Int(1),
+                Sexpr::Vector(vec![Sexpr::Int(2), Sexpr::Int(3)]),
+            ])]
+        );
+    }
+
+    #[test]
+    fn rejects_an_unterminated_vector_literal() {
+        assert!(read_program("#(1 2").is_err());
+    }
+
+    #[test]
+    fn still_reads_hash_t_and_hash_f_after_adding_hash_dispatch() {
+        // #t/#f/#x../#b../#o.. must keep routing through the ordinary
+        // read_atom path now that '#' has a dedicated dispatcher.
+        assert_eq!(read_program("#t").unwrap(), vec![Sexpr::Bool(true)]);
+        assert_eq!(read_program("#f").unwrap(), vec![Sexpr::Bool(false)]);
+        assert_eq!(read_program("#x1A").unwrap(), vec![Sexpr::Int(26)]);
     }
 }

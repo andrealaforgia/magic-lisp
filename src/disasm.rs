@@ -35,6 +35,11 @@ fn describe_const_value(c: &Const) -> String {
             let inner: Vec<String> = items.iter().map(describe_const_value).collect();
             format!("({})", inner.join(" "))
         }
+        Const::Char(c) => format!("#\\{c}"),
+        Const::Vector(items) => {
+            let inner: Vec<String> = items.iter().map(describe_const_value).collect();
+            format!("#({})", inner.join(" "))
+        }
         Const::Unspecified => "<unspecified>".to_string(),
     }
 }

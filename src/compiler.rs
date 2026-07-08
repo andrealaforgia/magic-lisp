@@ -244,9 +244,16 @@ fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
         Sexpr::Int(n) => Const::Int(*n),
         Sexpr::Float(n) => Const::Float(*n),
         Sexpr::Bool(b) => Const::Bool(*b),
+        Sexpr::Char(c) => Const::Char(*c),
         Sexpr::Str(s) => Const::Str(s.clone()),
         Sexpr::Symbol(s) => Const::Symbol(s.clone()),
         Sexpr::List(items) => Const::List(
+            items
+                .iter()
+                .map(sexpr_to_const)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Sexpr::Vector(items) => Const::Vector(
             items
                 .iter()
                 .map(sexpr_to_const)
@@ -1090,8 +1097,20 @@ fn compile_expr(
             let idx = chunk.add_const(Const::Bool(*b));
             chunk.emit_const(idx);
         }
+        Sexpr::Char(c) => {
+            let idx = chunk.add_const(Const::Char(*c));
+            chunk.emit_const(idx);
+        }
         Sexpr::Str(s) => {
             let idx = chunk.add_const(Const::Str(s.clone()));
+            chunk.emit_const(idx);
+        }
+        Sexpr::Vector(items) => {
+            let items = items
+                .iter()
+                .map(sexpr_to_const)
+                .collect::<Result<Vec<_>, _>>()?;
+            let idx = chunk.add_const(Const::Vector(items));
             chunk.emit_const(idx);
         }
         Sexpr::Symbol(s) => {

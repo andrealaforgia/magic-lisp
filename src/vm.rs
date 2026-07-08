@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Const, Module, Op};
 use crate::reader::Sexpr;
-use crate::value::{Env, Value, is_truthy};
+use crate::value::{Env, Value, is_truthy, value_equal, value_eqv};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -26,7 +26,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 44] = [
+const NATIVE_NAMES: [&str; 59] = [
     "display",
     "newline",
     "+",
@@ -72,6 +72,22 @@ const NATIVE_NAMES: [&str; 44] = [
     "inexact->exact",
     "number->string",
     "string->number",
+    // B8: type predicates and the three equality relations (spec 3.7, 4.2).
+    "eq?",
+    "eqv?",
+    "equal?",
+    "not",
+    "null?",
+    "pair?",
+    "list?",
+    "symbol?",
+    "string?",
+    "char?",
+    "boolean?",
+    "procedure?",
+    "vector?",
+    "hash?",
+    "make-hash",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -86,9 +102,13 @@ fn const_to_value(c: &Const) -> Value {
         Const::Int(n) => Value::Int(*n),
         Const::Float(n) => Value::Float(*n),
         Const::Bool(b) => Value::Bool(*b),
-        Const::Str(s) => Value::Str(s.clone()),
+        Const::Str(s) => Value::Str(Rc::new(s.clone())),
         Const::Symbol(s) => Value::Symbol(s.clone()),
-        Const::List(items) => Value::List(items.iter().map(const_to_value).collect()),
+        Const::List(items) => Value::List(Rc::new(items.iter().map(const_to_value).collect())),
+        Const::Char(c) => Value::Char(*c),
+        Const::Vector(items) => Value::Vector(Rc::new(RefCell::new(
+            items.iter().map(const_to_value).collect(),
+        ))),
         Const::Unspecified => Value::Unspecified,
     }
 }
@@ -336,7 +356,7 @@ impl<'m> Vm<'m> {
                         let a = stack
                             .pop()
                             .ok_or_else(|| error("stack underflow during EQV"))?;
-                        stack.push(Value::Bool(a == b));
+                        stack.push(Value::Bool(value_eqv(&a, &b)));
                     }
                     op if op == Op::MakeFunction as u8 => {
                         let idx = read_u32(code, &mut ip)?;
@@ -487,7 +507,7 @@ fn bind_arguments(
         }
         let rest = args.split_off(arity);
         let mut locals = to_cells(args);
-        locals.push(Rc::new(RefCell::new(Value::List(rest))));
+        locals.push(Rc::new(RefCell::new(Value::List(Rc::new(rest)))));
         Ok(locals)
     } else {
         if args.len() != arity {
@@ -598,10 +618,10 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
                     args.len()
                 )));
             };
-            Ok(Value::Pair(Box::new(a.clone()), Box::new(b.clone())))
+            Ok(Value::Pair(Rc::new((a.clone(), b.clone()))))
         }
         "car" => match args {
-            [Value::Pair(a, _)] => Ok((**a).clone()),
+            [Value::Pair(cell)] => Ok(cell.0.clone()),
             [other] => Err(error(format!("car expects a pair, found {other}"))),
             _ => Err(error(format!(
                 "car expects exactly 1 argument, got {}",
@@ -609,7 +629,7 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
             ))),
         },
         "cdr" => match args {
-            [Value::Pair(_, b)] => Ok((**b).clone()),
+            [Value::Pair(cell)] => Ok(cell.1.clone()),
             [other] => Err(error(format!("cdr expects a pair, found {other}"))),
             _ => Err(error(format!(
                 "cdr expects exactly 1 argument, got {}",
@@ -648,8 +668,66 @@ fn call_native(name: &str, args: &[Value], out: &mut impl Write) -> Result<Value
         "inexact->exact" => native_inexact_to_exact(args),
         "number->string" => native_number_to_string(args),
         "string->number" => native_string_to_number(args),
+        "eq?" => native_binary_predicate("eq?", args, value_eqv),
+        "eqv?" => native_binary_predicate("eqv?", args, value_eqv),
+        "equal?" => native_binary_predicate("equal?", args, value_equal),
+        "not" => match args {
+            [v] => Ok(Value::Bool(!is_truthy(v))),
+            _ => Err(error(format!(
+                "not expects exactly 1 argument, got {}",
+                args.len()
+            ))),
+        },
+        "null?" => native_type_predicate("null?", args, is_null),
+        "pair?" => native_type_predicate("pair?", args, is_pair),
+        "list?" => native_type_predicate("list?", args, is_proper_list),
+        "symbol?" => native_type_predicate("symbol?", args, |v| matches!(v, Value::Symbol(_))),
+        "string?" => native_type_predicate("string?", args, |v| matches!(v, Value::Str(_))),
+        "char?" => native_type_predicate("char?", args, |v| matches!(v, Value::Char(_))),
+        "boolean?" => native_type_predicate("boolean?", args, |v| matches!(v, Value::Bool(_))),
+        "procedure?" => native_type_predicate("procedure?", args, |v| {
+            matches!(v, Value::Closure(..) | Value::Native(_))
+        }),
+        "vector?" => native_type_predicate("vector?", args, |v| matches!(v, Value::Vector(_))),
+        "hash?" => native_type_predicate("hash?", args, |v| matches!(v, Value::Hash(_))),
+        "make-hash" => match args {
+            [] => Ok(Value::Hash(Rc::new(RefCell::new(Vec::new())))),
+            _ => Err(error(format!(
+                "make-hash expects no arguments, got {}",
+                args.len()
+            ))),
+        },
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
+}
+
+/// A proper (finite, non-circular) list: either the empty-list `List`
+/// value directly, or a `Pair` chain whose cdr eventually reaches one --
+/// spec 3.7's `list?` is true only for well-formed, finite lists, not
+/// improper (dotted) structures.
+fn is_proper_list(v: &Value) -> bool {
+    match v {
+        Value::List(_) => true,
+        Value::Pair(cell) => is_proper_list(&cell.1),
+        _ => false,
+    }
+}
+
+/// A non-empty list is, per real Scheme semantics, built from pairs -- so
+/// it counts as a pair too, even though this codebase's `Value::List`
+/// keeps a flat internal representation rather than an actual pair chain
+/// (an internal detail this behaviour's own BOUNDARIES says isn't
+/// observable).
+fn is_pair(v: &Value) -> bool {
+    match v {
+        Value::Pair(_) => true,
+        Value::List(items) => !items.is_empty(),
+        _ => false,
+    }
+}
+
+fn is_null(v: &Value) -> bool {
+    matches!(v, Value::List(items) if items.is_empty())
 }
 
 fn to_ints(opname: &str, args: &[Value]) -> Result<Vec<i64>, RuntimeError> {
@@ -1080,7 +1158,7 @@ fn native_inexact_to_exact(args: &[Value]) -> Result<Value, RuntimeError> {
 
 fn native_number_to_string(args: &[Value]) -> Result<Value, RuntimeError> {
     match args {
-        [n @ (Value::Int(_) | Value::Float(_))] => Ok(Value::Str(n.to_string())),
+        [n @ (Value::Int(_) | Value::Float(_))] => Ok(Value::Str(Rc::new(n.to_string()))),
         [other] => Err(error(format!(
             "number->string expects a number, found {other}"
         ))),
@@ -1118,6 +1196,20 @@ fn native_string_to_number(args: &[Value]) -> Result<Value, RuntimeError> {
         },
         Err(_) => Ok(Value::Bool(false)),
     }
+}
+
+fn native_binary_predicate(
+    opname: &str,
+    args: &[Value],
+    holds: fn(&Value, &Value) -> bool,
+) -> Result<Value, RuntimeError> {
+    let [a, b] = args else {
+        return Err(error(format!(
+            "{opname} expects exactly 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    Ok(Value::Bool(holds(a, b)))
 }
 
 #[cfg(test)]
@@ -2253,6 +2345,385 @@ mod tests {
         );
     }
 
+    // --- B8 E1: eq? ---
+
+    #[test]
+    fn eq_is_true_for_two_separately_written_same_named_symbols() {
+        assert_eq!(eval("(display (eq? (quote a) (quote a)))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn eq_is_true_for_simple_values_that_are_the_same_value() {
+        assert_eq!(eval("(display (eq? 1 1))").unwrap(), "#t");
+        assert_eq!(eval("(display (eq? #t #t))").unwrap(), "#t");
+        assert_eq!(eval("(display (eq? (quote ()) (quote ())))").unwrap(), "#t");
+        assert_eq!(eval("(display (eq? #\\a #\\a))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn eq_is_true_for_the_same_native_procedure() {
+        assert_eq!(eval("(display (eq? + +))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn eq_is_false_for_two_separately_built_non_empty_lists_with_identical_contents() {
+        assert_eq!(
+            eval("(display (eq? (quote (1 2 3)) (quote (1 2 3))))").unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn eq_is_true_for_the_same_non_empty_list_bound_to_two_different_names() {
+        assert_eq!(
+            eval(
+                "(define lst (quote (1 2 3))) (define other lst) \
+                  (display (eq? lst other))"
+            )
+            .unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn eq_is_false_for_two_separately_built_vectors_with_identical_contents() {
+        assert_eq!(eval("(display (eq? #(1 2) #(1 2)))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn eq_is_true_for_the_same_vector_bound_to_two_different_names() {
+        assert_eq!(
+            eval("(define v #(1 2)) (define w v) (display (eq? v w))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn eq_is_false_for_two_separately_built_hashes() {
+        assert_eq!(
+            eval("(display (eq? (make-hash) (make-hash)))").unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn eq_is_true_for_the_same_hash_bound_to_two_different_names() {
+        assert_eq!(
+            eval("(define h (make-hash)) (define g h) (display (eq? h g))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn eq_is_true_for_the_same_closure_bound_to_two_different_names() {
+        assert_eq!(
+            eval("(define f (lambda (x) x)) (define g f) (display (eq? f g))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn eq_is_false_for_two_separately_defined_closures_with_identical_bodies() {
+        assert_eq!(
+            eval(
+                "(define f (lambda (x) x)) (define g (lambda (x) x)) \
+                  (display (eq? f g))"
+            )
+            .unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn eq_is_false_for_two_closures_from_the_same_lambda_captured_in_different_environments() {
+        assert_eq!(
+            eval(
+                "(define (make-adder n) (lambda (x) (+ x n))) \
+                  (display (eq? (make-adder 1) (make-adder 2)))"
+            )
+            .unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn eq_is_false_between_the_empty_list_and_a_non_empty_list() {
+        assert_eq!(
+            eval("(display (eq? (quote ()) (quote (1 2))))").unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn eq_is_true_for_two_unspecified_results_from_set() {
+        assert_eq!(
+            eval("(define x 1) (display (eq? (set! x 2) (set! x 3)))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn eq_is_false_for_two_separately_built_pairs_with_identical_contents() {
+        assert_eq!(eval("(display (eq? (cons 1 2) (cons 1 2)))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn eq_is_true_for_the_same_pair_bound_to_two_different_names() {
+        assert_eq!(
+            eval("(define p (cons 1 2)) (define q p) (display (eq? p q))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn eq_is_false_for_two_separately_built_strings_with_identical_contents() {
+        assert_eq!(eval("(display (eq? \"ab\" \"ab\"))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn eq_is_true_for_the_same_string_bound_to_two_different_names() {
+        assert_eq!(
+            eval("(define s \"ab\") (define t s) (display (eq? s t))").unwrap(),
+            "#t"
+        );
+    }
+
+    // --- B8 E2: eqv? ---
+
+    #[test]
+    fn eqv_is_false_between_a_whole_number_and_a_float_of_the_same_magnitude() {
+        assert_eq!(eval("(display (eqv? 1 1.0))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn eqv_is_false_between_positive_and_negative_zero() {
+        assert_eq!(eval("(display (eqv? 0.0 -0.0))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn eqv_is_true_for_two_independently_computed_equal_floats() {
+        assert_eq!(eval("(display (eqv? (+ 0.5 0.5) 1.0))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn eqv_is_true_for_two_nan_floats() {
+        assert_eq!(
+            eval("(display (eqv? (/ 0.0 0.0) (/ 0.0 0.0)))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn eqv_is_false_between_a_nan_float_and_an_ordinary_float() {
+        // Distinguishes "NaN is equal to NaN specifically" from a broken
+        // "either side is NaN" check that would wrongly call a NaN equal
+        // to anything.
+        assert_eq!(eval("(display (eqv? (/ 0.0 0.0) 5.0))").unwrap(), "#f");
+    }
+
+    // --- B8 E3: equal? ---
+
+    #[test]
+    fn equal_is_true_for_two_separately_built_lists_with_the_same_contents() {
+        assert_eq!(
+            eval("(display (equal? (cons 1 (cons 2 (quote ()))) (cons 1 (cons 2 (quote ())))))")
+                .unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn equal_is_true_for_two_separately_built_strings_with_the_same_characters() {
+        assert_eq!(eval("(display (equal? \"ab\" \"ab\"))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn equal_is_true_for_two_separately_built_quoted_lists_with_the_same_contents() {
+        assert_eq!(
+            eval("(display (equal? (quote (1 2 3)) (quote (1 2 3))))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn equal_is_false_for_two_quoted_lists_where_one_is_a_prefix_of_the_other() {
+        assert_eq!(
+            eval("(display (equal? (quote (1 2)) (quote (1 2 3))))").unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn equal_recurses_into_a_list_containing_a_list() {
+        // Proves genuine recursion, not just a top-level shallow compare:
+        // the outer lists' second elements are themselves lists that must
+        // be compared structurally too.
+        assert_eq!(
+            eval(
+                "(display (equal? (cons 1 (cons (cons 2 (cons 3 (quote ()))) (quote ()))) \
+                                   (cons 1 (cons (cons 2 (cons 3 (quote ()))) (quote ())))))"
+            )
+            .unwrap(),
+            "#t"
+        );
+        assert_eq!(
+            eval(
+                "(display (equal? (cons 1 (cons (cons 2 (cons 3 (quote ()))) (quote ()))) \
+                                   (cons 1 (cons (cons 2 (cons 4 (quote ()))) (quote ())))))"
+            )
+            .unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn equal_recurses_into_a_vector_containing_strings() {
+        assert_eq!(
+            eval("(display (equal? #(\"a\" \"b\") #(\"a\" \"b\")))").unwrap(),
+            "#t"
+        );
+        assert_eq!(
+            eval("(display (equal? #(\"a\" \"b\") #(\"a\" \"c\")))").unwrap(),
+            "#f"
+        );
+    }
+
+    #[test]
+    fn equal_falls_back_to_eqv_for_non_container_values() {
+        assert_eq!(eval("(display (equal? 1 1.0))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn equal_completes_without_hanging_on_a_moderately_deep_non_circular_structure() {
+        let src = format!(
+            "(define (build n) (if (= n 0) (quote ()) (cons n (build (- n 1))))) \
+             (display (equal? (build {n}) (build {n})))",
+            n = 5_000
+        );
+        assert_eq!(eval(&src).unwrap(), "#t");
+    }
+
+    // --- B8 E4: not ---
+
+    #[test]
+    fn not_of_false_is_true() {
+        assert_eq!(eval("(display (not #f))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn not_of_zero_is_false() {
+        assert_eq!(eval("(display (not 0))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn not_of_the_empty_list_is_false() {
+        assert_eq!(eval("(display (not (quote ())))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn not_of_a_string_is_false() {
+        assert_eq!(eval("(display (not \"x\"))").unwrap(), "#f");
+    }
+
+    // --- B8 E5: type predicates ---
+
+    #[test]
+    fn list_predicate_is_true_for_a_proper_finite_list() {
+        assert_eq!(
+            eval("(display (list? (cons 1 (cons 2 (cons 3 (quote ()))))))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn list_predicate_is_false_for_an_improper_dotted_structure() {
+        assert_eq!(eval("(display (list? (cons 1 2)))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn list_predicate_is_true_for_a_quoted_list_literal() {
+        assert_eq!(eval("(display (list? (quote (1 2 3))))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn null_predicate_is_true_for_the_empty_list() {
+        assert_eq!(eval("(display (null? (quote ())))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn null_predicate_is_false_for_a_non_empty_value() {
+        assert_eq!(eval("(display (null? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn pair_predicate_is_false_for_the_empty_list() {
+        assert_eq!(eval("(display (pair? (quote ())))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn pair_predicate_is_true_for_an_actual_pair() {
+        assert_eq!(eval("(display (pair? (cons 1 2)))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn pair_predicate_is_true_for_a_non_empty_quoted_list() {
+        assert_eq!(eval("(display (pair? (quote (1 2 3))))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn procedure_predicate_is_true_for_the_addition_operator() {
+        assert_eq!(eval("(display (procedure? +))").unwrap(), "#t");
+    }
+
+    #[test]
+    fn procedure_predicate_is_false_for_a_non_procedure() {
+        assert_eq!(eval("(display (procedure? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn procedure_predicate_is_true_for_a_user_defined_closure() {
+        assert_eq!(
+            eval("(define (f x) x) (display (procedure? f))").unwrap(),
+            "#t"
+        );
+    }
+
+    #[test]
+    fn symbol_predicate_shown_both_ways() {
+        assert_eq!(eval("(display (symbol? (quote a)))").unwrap(), "#t");
+        assert_eq!(eval("(display (symbol? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn string_predicate_shown_both_ways() {
+        assert_eq!(eval("(display (string? \"x\"))").unwrap(), "#t");
+        assert_eq!(eval("(display (string? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn char_predicate_shown_both_ways() {
+        assert_eq!(eval("(display (char? #\\a))").unwrap(), "#t");
+        assert_eq!(eval("(display (char? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn boolean_predicate_shown_both_ways() {
+        assert_eq!(eval("(display (boolean? #t))").unwrap(), "#t");
+        assert_eq!(eval("(display (boolean? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn vector_predicate_shown_both_ways() {
+        assert_eq!(eval("(display (vector? #(1 2)))").unwrap(), "#t");
+        assert_eq!(eval("(display (vector? 5))").unwrap(), "#f");
+    }
+
+    #[test]
+    fn hash_predicate_shown_both_ways() {
+        assert_eq!(eval("(display (hash? (make-hash)))").unwrap(), "#t");
+        assert_eq!(eval("(display (hash? 5))").unwrap(), "#f");
+    }
+
     #[test]
     fn plus_promotes_to_float_when_any_argument_is_a_float() {
         assert_eq!(eval("(display (+ 1 2.0))").unwrap(), "3.0");
@@ -2488,6 +2959,27 @@ mod tests {
         chunk.emit_pop();
         chunk.emit_halt();
         assert_eq!(run_to_string(chunk).unwrap(), "#t#f");
+    }
+
+    #[test]
+    fn op_eqv_distinguishes_positive_from_negative_zero() {
+        // A pre-existing bug, fixed alongside B8's eqv? implementation:
+        // Op::Eqv (case's own candidate-matching opcode) used raw IEEE `==`
+        // instead of eqv?'s bit-precise comparison, so it used to
+        // incorrectly treat 0.0 and -0.0 as the same value -- e.g. `(case
+        // -0.0 ((0.0) 'wrong-match))` would wrongly take that branch.
+        let mut chunk = Chunk::new();
+        let pos_zero = chunk.add_const(Const::Float(0.0));
+        let neg_zero = chunk.add_const(Const::Float(-0.0));
+        let display_sym = chunk.add_const(Const::Symbol("display".to_string()));
+        chunk.emit_get_global(display_sym);
+        chunk.emit_const(pos_zero);
+        chunk.emit_const(neg_zero);
+        chunk.emit_eqv();
+        chunk.emit_call(1);
+        chunk.emit_pop();
+        chunk.emit_halt();
+        assert_eq!(run_to_string(chunk).unwrap(), "#f");
     }
 
     // B6: tail-call trampoline. These tests exercise the VM's own O(1)-space
