@@ -70,3 +70,12 @@ Feature: B11 — Vectors and hash tables
     #   $ magiclisp eval e6.ml ->
     #   2 / 99 / 3 / (1 99 3) / #(0 0 0) / #(1 2) / #(1 2 3) / 2 / (a b) / nope / #t / #f
     #   exit 0
+
+  Scenario: E7 — a vector made self-referential, or cyclic across pairs and vectors together, terminates cleanly instead of crashing or hanging
+    Given a vector set to contain itself, and a pair and a vector each set to contain the other
+    When the self-referential vector is compared to itself and displayed, and the cross-type cycle is displayed
+    Then equal? terminates instead of hanging, display terminates with an ellipsis instead of crashing with a stack overflow, and the cross-type cycle terminates the same way
+    # Evidence: $ magiclisp eval (define v (vector 1 2 3)) (vector-set! v 0 v) (display (equal? v v)) -> #t
+    #   $ magiclisp eval (define v (vector 1 2 3)) (vector-set! v 0 v) (display v)  -> #(#(...) 2 3)
+    #   $ magiclisp eval (define p (cons 1 2)) (define v (vector p)) (set-cdr! p v) (display p)
+    #   -> "(1 . #((...)))", exit 0 (a cycle alternating between a mutable pair and a mutable vector, not just one type)

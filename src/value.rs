@@ -713,4 +713,20 @@ mod tests {
         assert!(value_equal(&Value::Eof, &Value::Eof));
         assert!(!value_equal(&Value::Eof, &Value::Bool(false)));
     }
+
+    #[test]
+    fn eof_is_not_equal_to_any_compound_value_type() {
+        // qa test-design review (msg #213): only Int/Bool/Unspecified had
+        // been checked against Eof -- close the same check against every
+        // compound/reference type too.
+        let pair = Value::Pair(Rc::new(RefCell::new((Value::Int(1), Value::Int(2)))));
+        let vector = Value::Vector(Rc::new(RefCell::new(vec![Value::Int(1)])));
+        let hash = Value::Hash(Rc::new(RefCell::new(vec![])));
+        assert!(!value_eqv(&Value::Eof, &pair));
+        assert!(!value_eqv(&Value::Eof, &vector));
+        assert!(!value_eqv(&Value::Eof, &hash));
+        assert!(!value_equal(&Value::Eof, &pair));
+        assert!(!value_equal(&Value::Eof, &vector));
+        assert!(!value_equal(&Value::Eof, &hash));
+    }
 }

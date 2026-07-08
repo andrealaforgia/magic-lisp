@@ -187,4 +187,31 @@ pub(crate) fn registry() -> Registry {
                 );
             },
         )
+        // --- E7 ---
+        .step(
+            "a vector set to contain itself, and a pair and a vector each set to contain the other",
+            |_w, _text, _| {},
+        )
+        .step(
+            "the self-referential vector is compared to itself and displayed, and the cross-type cycle is displayed",
+            |w, _text, _| {
+                let out = eval_ok(
+                    "b11-e7.ml",
+                    "(define v (vector 1 2 3)) (vector-set! v 0 v) \
+                     (display (equal? v v)) (newline) (display v) (newline) \
+                     (define p (cons 1 2)) (define v2 (vector p)) (set-cdr! p v2) \
+                     (display p)",
+                );
+                w.notes.push(out);
+            },
+        )
+        .step(
+            "equal? terminates instead of hanging, display terminates with an ellipsis instead of crashing with a stack overflow, and the cross-type cycle terminates the same way",
+            |w, _text, _| {
+                assert_eq!(
+                    w.notes.last().unwrap(),
+                    "#t\n#(#(...) 2 3)\n(1 . #((...)))"
+                );
+            },
+        )
 }
