@@ -4625,15 +4625,35 @@ mod tests {
         // qa test-design review (msg #167): all of E1's original tests were
         // pure ASCII, where char-count and byte-count are numerically
         // identical -- none could fail if `.chars().count()` regressed to
-        // `.len()` (byte count). "héllo" is 5 characters but 6 UTF-8 bytes
-        // (é is 2 bytes), so this genuinely distinguishes the two.
-        assert_eq!(eval("(display (string-length \"héllo\"))").unwrap(), "5");
+        // `.len()` (byte count). FIVE_CHAR_ACCENTED is 5 characters but 6
+        // UTF-8 bytes (é is 2 bytes), so this genuinely distinguishes the two.
+        use crate::unicode_fixtures::FIVE_CHAR_ACCENTED;
+        assert_eq!(
+            eval(&format!(
+                "(display (string-length \"{FIVE_CHAR_ACCENTED}\"))"
+            ))
+            .unwrap(),
+            "5"
+        );
     }
 
     #[test]
     fn string_ref_reaches_a_multi_byte_character_by_position_not_byte_offset() {
-        assert_eq!(eval("(display (string-ref \"héllo\" 1))").unwrap(), "é");
-        assert_eq!(eval("(display (string-ref \"héllo\" 2))").unwrap(), "l");
+        use crate::unicode_fixtures::FIVE_CHAR_ACCENTED;
+        assert_eq!(
+            eval(&format!(
+                "(display (string-ref \"{FIVE_CHAR_ACCENTED}\" 1))"
+            ))
+            .unwrap(),
+            "é"
+        );
+        assert_eq!(
+            eval(&format!(
+                "(display (string-ref \"{FIVE_CHAR_ACCENTED}\" 2))"
+            ))
+            .unwrap(),
+            "l"
+        );
     }
 
     // --- B10 E2: string=?/string<?/string>? (spec 6.1) ---
@@ -4737,11 +4757,12 @@ mod tests {
     fn string_upcase_handles_a_unicode_case_conversion_that_changes_length() {
         // qa test-design review (msg #170): an ASCII-only test ("abc" ->
         // "ABC") can't catch a length-changing Unicode case conversion --
-        // confirmed reproducible: German "straße" uppercases to "STRASSE"
+        // confirmed reproducible: German sharp-s uppercases to "STRASSE"
         // (6 characters become 7, since sharp-s has no single-character
         // uppercase form).
+        use crate::unicode_fixtures::GERMAN_SHARP_S;
         assert_eq!(
-            eval("(display (string-upcase \"straße\"))").unwrap(),
+            eval(&format!("(display (string-upcase \"{GERMAN_SHARP_S}\"))")).unwrap(),
             "STRASSE"
         );
     }
@@ -4782,7 +4803,14 @@ mod tests {
         // char-alphabetic?/char-numeric?/char-whitespace? can't catch a
         // regression to ASCII-only predicates, since Rust's underlying
         // is_alphabetic()/is_numeric()/is_whitespace() are Unicode-aware.
-        assert_eq!(eval("(display (char-alphabetic? #\\é))").unwrap(), "#t");
+        use crate::unicode_fixtures::ACCENTED_LETTER;
+        assert_eq!(
+            eval(&format!(
+                "(display (char-alphabetic? #\\{ACCENTED_LETTER}))"
+            ))
+            .unwrap(),
+            "#t"
+        );
     }
 
     #[test]
@@ -4823,7 +4851,14 @@ mod tests {
 
     #[test]
     fn a_plain_letter_plus_one_accented_character_is_length_two() {
-        assert_eq!(eval("(display (string-length \"aé\"))").unwrap(), "2");
+        use crate::unicode_fixtures::TWO_CHAR_ACCENTED;
+        assert_eq!(
+            eval(&format!(
+                "(display (string-length \"{TWO_CHAR_ACCENTED}\"))"
+            ))
+            .unwrap(),
+            "2"
+        );
     }
 
     #[test]
@@ -4831,16 +4866,24 @@ mod tests {
         // Confirms the two are at their correct respective positions, not
         // swapped -- position 0 is the single-byte plain letter, position 1
         // is the two-byte accented character.
-        assert_eq!(eval("(display (string-ref \"aé\" 0))").unwrap(), "a");
-        assert_eq!(eval("(display (string-ref \"aé\" 1))").unwrap(), "é");
+        use crate::unicode_fixtures::TWO_CHAR_ACCENTED;
+        assert_eq!(
+            eval(&format!("(display (string-ref \"{TWO_CHAR_ACCENTED}\" 0))")).unwrap(),
+            "a"
+        );
+        assert_eq!(
+            eval(&format!("(display (string-ref \"{TWO_CHAR_ACCENTED}\" 1))")).unwrap(),
+            "é"
+        );
     }
 
     // --- B10 E8: integration: all seventeen demo expressions in one program ---
 
     #[test]
     fn all_seventeen_demo_expressions_produce_exactly_the_prescribed_output() {
+        use crate::unicode_fixtures::TWO_CHAR_ACCENTED;
         assert_eq!(
-            eval(
+            eval(&format!(
                 "(display (string-length \"hello\")) (newline) \
                  (display (string-ref \"hello\" 1)) (newline) \
                  (display (substring \"hello\" 1 4)) (newline) \
@@ -4856,9 +4899,9 @@ mod tests {
                  (display (char-numeric? #\\5)) (newline) \
                  (display (list->string (list #\\h #\\i))) (newline) \
                  (display (string->list \"ab\")) (newline) \
-                 (display (string-length \"aé\")) (newline) \
-                 (display (string-ref \"aé\" 1)) (newline)"
-            )
+                 (display (string-length \"{TWO_CHAR_ACCENTED}\")) (newline) \
+                 (display (string-ref \"{TWO_CHAR_ACCENTED}\" 1)) (newline)"
+            ))
             .unwrap(),
             "5\ne\nell\nfoobar\n#t\n#t\nABC\nhello\nworld\n65\nB\n#t\n#t\nhi\n(a b)\n2\né\n"
         );

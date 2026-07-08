@@ -1,6 +1,7 @@
 //! B10: strings and characters (spec 6.1, 6.2).
 
 use super::helpers::{eval_ok, run_demo};
+use magiclisp::unicode_fixtures::{ACCENTED_LETTER, TWO_CHAR_ACCENTED};
 
 #[test]
 fn b10_e1_length_ref_substring_append_and_bounds_errors() {
@@ -114,6 +115,16 @@ fn b10_e5_char_conversions_and_predicates() {
         eval_ok("b10-e5i.ml", "(display (char-whitespace? #\\a))"),
         "#f"
     );
+    // Non-ASCII coverage (qa test-design review, msg #186): the unit-level
+    // fix confirming char-alphabetic? is genuinely Unicode-aware, not
+    // ASCII-only, had not threaded through to this CLI-integration layer.
+    assert_eq!(
+        eval_ok(
+            "b10-e5j.ml",
+            &format!("(display (char-alphabetic? #\\{ACCENTED_LETTER}))")
+        ),
+        "#t"
+    );
 }
 
 #[test]
@@ -139,15 +150,24 @@ fn b10_e6_character_literal_code_points() {
 #[test]
 fn b10_e7_length_and_indexing_count_by_character_not_byte() {
     assert_eq!(
-        eval_ok("b10-e7a.ml", "(display (string-length \"aé\"))"),
+        eval_ok(
+            "b10-e7a.ml",
+            &format!("(display (string-length \"{TWO_CHAR_ACCENTED}\"))")
+        ),
         "2"
     );
     assert_eq!(
-        eval_ok("b10-e7b.ml", "(display (string-ref \"aé\" 0))"),
+        eval_ok(
+            "b10-e7b.ml",
+            &format!("(display (string-ref \"{TWO_CHAR_ACCENTED}\" 0))")
+        ),
         "a"
     );
     assert_eq!(
-        eval_ok("b10-e7c.ml", "(display (string-ref \"aé\" 1))"),
+        eval_ok(
+            "b10-e7c.ml",
+            &format!("(display (string-ref \"{TWO_CHAR_ACCENTED}\" 1))")
+        ),
         "é"
     );
 }
@@ -215,11 +235,17 @@ fn b10_e8_all_seventeen_demo_expressions_produce_exactly_the_prescribed_output()
         "(a b)\n"
     );
     assert_eq!(
-        run_demo("b10-e8-16.ml", "(display (string-length \"aé\"))"),
+        run_demo(
+            "b10-e8-16.ml",
+            &format!("(display (string-length \"{TWO_CHAR_ACCENTED}\"))")
+        ),
         "2\n"
     );
     assert_eq!(
-        run_demo("b10-e8-17.ml", "(display (string-ref \"aé\" 1))"),
+        run_demo(
+            "b10-e8-17.ml",
+            &format!("(display (string-ref \"{TWO_CHAR_ACCENTED}\" 1))")
+        ),
         "é\n"
     );
 }

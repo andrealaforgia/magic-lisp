@@ -1,6 +1,7 @@
 //! Step definitions for features/B10-strings-and-characters.feature.
 
 use magiclisp::exitcode::RUNTIME_ERROR;
+use magiclisp::unicode_fixtures::{ACCENTED_LETTER, GERMAN_SHARP_S, TWO_CHAR_ACCENTED};
 
 use super::registry::Registry;
 use super::world::{eval_ok, run, stderr_of, write_source};
@@ -95,9 +96,11 @@ pub(crate) fn registry() -> Registry {
             |w, _text, _| {
                 let out = eval_ok(
                     "b10-e4.ml",
-                    "(display (string-upcase \"abc\")) \
-                     (display (string-downcase \"ABC\")) \
-                     (display (string-upcase \"straße\"))",
+                    &format!(
+                        "(display (string-upcase \"abc\")) \
+                         (display (string-downcase \"ABC\")) \
+                         (display (string-upcase \"{GERMAN_SHARP_S}\"))"
+                    ),
                 );
                 w.notes.push(out);
             },
@@ -147,6 +150,17 @@ pub(crate) fn registry() -> Registry {
                     eval_ok("b10-e5-false-c.ml", "(display (char<? #\\b #\\a))"),
                     "#f"
                 );
+                // Non-ASCII coverage (qa test-design review, msg #186): the
+                // unit-level fix confirming char-alphabetic? is genuinely
+                // Unicode-aware, not ASCII-only, had not threaded through to
+                // this BDD layer.
+                assert_eq!(
+                    eval_ok(
+                        "b10-e5-non-ascii.ml",
+                        &format!("(display (char-alphabetic? #\\{ACCENTED_LETTER}))")
+                    ),
+                    "#t"
+                );
             },
         )
         // --- E6 ---
@@ -180,9 +194,11 @@ pub(crate) fn registry() -> Registry {
             |w, _text, _| {
                 let out = eval_ok(
                     "b10-e7.ml",
-                    "(display (string-length \"aé\")) \
-                     (display (string-ref \"aé\" 0)) \
-                     (display (string-ref \"aé\" 1))",
+                    &format!(
+                        "(display (string-length \"{TWO_CHAR_ACCENTED}\")) \
+                         (display (string-ref \"{TWO_CHAR_ACCENTED}\" 0)) \
+                         (display (string-ref \"{TWO_CHAR_ACCENTED}\" 1))"
+                    ),
                 );
                 w.notes.push(out);
             },
@@ -201,23 +217,25 @@ pub(crate) fn registry() -> Registry {
         .step("it is run", |w, _text, _| {
             let out = eval_ok(
                 "b10-e8.ml",
-                "(display (string-length \"hello\")) (newline) \
-                 (display (string-ref \"hello\" 1)) (newline) \
-                 (display (substring \"hello\" 1 4)) (newline) \
-                 (display (string-append \"foo\" \"bar\")) (newline) \
-                 (display (string=? \"abc\" \"abc\")) (newline) \
-                 (display (string<? \"abc\" \"abd\")) (newline) \
-                 (display (string-upcase \"abc\")) (newline) \
-                 (display (symbol->string (quote hello))) (newline) \
-                 (display (string->symbol \"world\")) (newline) \
-                 (display (char->integer #\\A)) (newline) \
-                 (display (integer->char 66)) (newline) \
-                 (display (char-alphabetic? #\\a)) (newline) \
-                 (display (char-numeric? #\\5)) (newline) \
-                 (display (list->string (list #\\h #\\i))) (newline) \
-                 (display (string->list \"ab\")) (newline) \
-                 (display (string-length \"aé\")) (newline) \
-                 (display (string-ref \"aé\" 1)) (newline)",
+                &format!(
+                    "(display (string-length \"hello\")) (newline) \
+                     (display (string-ref \"hello\" 1)) (newline) \
+                     (display (substring \"hello\" 1 4)) (newline) \
+                     (display (string-append \"foo\" \"bar\")) (newline) \
+                     (display (string=? \"abc\" \"abc\")) (newline) \
+                     (display (string<? \"abc\" \"abd\")) (newline) \
+                     (display (string-upcase \"abc\")) (newline) \
+                     (display (symbol->string (quote hello))) (newline) \
+                     (display (string->symbol \"world\")) (newline) \
+                     (display (char->integer #\\A)) (newline) \
+                     (display (integer->char 66)) (newline) \
+                     (display (char-alphabetic? #\\a)) (newline) \
+                     (display (char-numeric? #\\5)) (newline) \
+                     (display (list->string (list #\\h #\\i))) (newline) \
+                     (display (string->list \"ab\")) (newline) \
+                     (display (string-length \"{TWO_CHAR_ACCENTED}\")) (newline) \
+                     (display (string-ref \"{TWO_CHAR_ACCENTED}\" 1)) (newline)"
+                ),
             );
             w.notes.push(out);
         })
