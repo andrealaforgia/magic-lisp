@@ -1,5 +1,9 @@
 //! B12: input reading and the write/display output distinction (spec 3.2, 4.8).
 
+use std::io::Write as _;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use super::helpers::{eval_ok, run_with_stdin, stdout_of, write_source};
 use magiclisp::exitcode::SUCCESS;
 
@@ -121,4 +125,56 @@ fn b12_e6_all_three_demo_scenarios_produce_exactly_the_prescribed_output() {
         ),
         "\"a\\nb\"\na\nb\nsym\n"
     );
+}
+
+#[test]
+fn read_completes_promptly_even_when_stdin_stays_open_after_a_complete_datum() {
+    // Regression test for warden security review msg #218: native_read's
+    // O(n^2) fix (msg #208) could leave a datum that had ALREADY fully
+    // arrived unread, indefinitely, if the stream stayed open afterward --
+    // exactly how an interactive terminal or a persistent request/response
+    // pipe behaves. Confirmed pre-fix via a live FIFO test with a 3+
+    // second stall. This drives the same shape through a real spawned
+    // process: writes a complete, valid 20-line datum, then deliberately
+    // keeps stdin OPEN well past when the read should have completed, and
+    // asserts the process finishes anyway -- proving completion doesn't
+    // depend on the stream closing or on more (irrelevant) data arriving.
+    let file = write_source("b12-read-stream-stays-open.ml", "(display (length (read)))");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let datum: String = (0..20).map(|i| format!("{i}\n")).collect();
+    stdin.write_all(format!("(\n{datum})").as_bytes()).unwrap();
+
+    // Poll for up to 2s -- comfortably more than the read should ever
+    // need, comfortably less than the 3+ second stall the pre-fix bug
+    // exhibited -- while STILL holding stdin open the whole time.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not complete within 2s while stdin stayed open \
+                 -- likely the interactive-stream stall regression"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(status.success(), "expected a clean exit, got: {status:?}");
 }
