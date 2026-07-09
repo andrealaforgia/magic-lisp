@@ -29,6 +29,8 @@ mod steps_b14;
 mod steps_b15;
 #[path = "features/steps_b16.rs"]
 mod steps_b16;
+#[path = "features/steps_b17.rs"]
+mod steps_b17;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -156,4 +158,10 @@ fn b15_errors_and_exit() {
 fn b16_disassembler() {
     let src = include_str!("../features/B16-disassembler.feature");
     registry::run_feature("B16-disassembler", src, &steps_b16::registry());
+}
+
+#[test]
+fn b17_repl() {
+    let src = include_str!("../features/B17-repl.feature");
+    registry::run_feature("B17-repl", src, &steps_b17::registry());
 }
