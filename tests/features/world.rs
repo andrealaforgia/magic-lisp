@@ -229,6 +229,16 @@ pub(crate) struct World {
     /// memory When step (B6 E1/E2), read back by the following "peak
     /// memory usage stays flat" Then/And step.
     pub(crate) rss_pairs: Vec<(u64, u64)>,
+    /// Full CLI invocations (e.g. `["eval", "/tmp/x.ml"]`, `["run",
+    /// "/tmp/x.mlbc"]`, `["frobnicate"]`) a Given step queues for a
+    /// shared, generically-worded When step (B18's "each is run", reused
+    /// verbatim across several scenarios whose Givens span both malformed
+    /// SOURCE files and corrupted ARTIFACT files) — unlike `pending`
+    /// (always a bare MagicLisp snippet to `display`-wrap and `eval`),
+    /// each entry here is a complete, self-contained argv, since a single
+    /// shared step can't otherwise tell a `run`/`disasm` case from an
+    /// `eval` one.
+    pub(crate) pending_commands: Vec<Vec<String>>,
 }
 
 impl World {
