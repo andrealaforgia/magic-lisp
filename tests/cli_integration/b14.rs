@@ -212,6 +212,38 @@ fn a_macro_returning_an_excessively_large_flat_list_fails_cleanly_not_a_dispropo
 }
 
 #[test]
+fn a_macro_returning_an_oversized_vector_directly_fails_cleanly_not_a_disproportionate_cost() {
+    // Regression test distinguishing the size cap's own up-front check
+    // (for a `Value::Vector` already built to its full size in one step,
+    // e.g. via `make-vector`) from the incremental check the `cons`-chain
+    // case above exercises -- a macro whose result is a `Vector` never
+    // passes through any smaller intermediate size on its way to this
+    // one, so a check that only fires at an exact element count (rather
+    // than any count past the limit) would never observe it.
+    let file = write_source(
+        "b14-oversized-vector-macro-result.ml",
+        "(define-macro (huge) (make-vector 200000)) (huge)",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SOURCE_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
+fn a_macro_returning_an_oversized_flat_list_directly_fails_cleanly_not_a_disproportionate_cost() {
+    // Same distinction as the vector case above, but for a `Value::List`
+    // built directly to its full size in one step (`vector->list` of an
+    // oversized vector) rather than incrementally via `cons`.
+    let file = write_source(
+        "b14-oversized-list-macro-result.ml",
+        "(define-macro (huge) (vector->list (make-vector 200000))) (huge)",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SOURCE_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
 fn b14_e4_gensym_produces_a_symbol_distinct_from_every_other_symbol() {
     assert_eq!(
         eval_ok("b14-e4a.ml", "(display (eq? (gensym) (gensym)))"),

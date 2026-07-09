@@ -3264,6 +3264,31 @@ mod tests {
         assert!(value_to_sexpr(&Value::Pair(cell)).is_err());
     }
 
+    fn nested_single_element_list_value(depth: usize) -> Value {
+        let mut v = Value::Int(1);
+        for _ in 0..depth {
+            v = Value::List(Rc::new(vec![v]));
+        }
+        v
+    }
+
+    #[test]
+    fn value_to_sexpr_accepts_nesting_of_exactly_the_configured_maximum_depth() {
+        // Distinguishes `>` from `>=` in the depth guard: depth only ever
+        // increments by exactly 1 per recursive call starting from 0, so
+        // it always passes through the exact threshold on its way to
+        // anything deeper -- a `>=` mutant would reject this one level
+        // too early.
+        let v = nested_single_element_list_value(crate::compiler::MAX_NESTING_DEPTH);
+        assert!(value_to_sexpr(&v).is_ok());
+    }
+
+    #[test]
+    fn value_to_sexpr_rejects_nesting_of_one_more_than_the_configured_maximum_depth() {
+        let v = nested_single_element_list_value(crate::compiler::MAX_NESTING_DEPTH + 1);
+        assert!(value_to_sexpr(&v).is_err());
+    }
+
     #[test]
     fn value_to_sexpr_rejects_a_procedure_value_with_a_clear_error() {
         assert!(value_to_sexpr(&Value::Native("car".to_string())).is_err());
