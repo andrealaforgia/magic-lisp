@@ -27,6 +27,8 @@ mod steps_b13;
 mod steps_b14;
 #[path = "features/steps_b15.rs"]
 mod steps_b15;
+#[path = "features/steps_b16.rs"]
+mod steps_b16;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -148,4 +150,10 @@ fn b14_macros_and_gensym() {
 fn b15_errors_and_exit() {
     let src = include_str!("../features/B15-errors-and-exit.feature");
     registry::run_feature("B15-errors-and-exit", src, &steps_b15::registry());
+}
+
+#[test]
+fn b16_disassembler() {
+    let src = include_str!("../features/B16-disassembler.feature");
+    registry::run_feature("B16-disassembler", src, &steps_b16::registry());
 }
