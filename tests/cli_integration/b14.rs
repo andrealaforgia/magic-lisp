@@ -192,6 +192,27 @@ fn b14_e4_gensym_produces_a_symbol_distinct_from_every_other_symbol() {
 }
 
 #[test]
+fn gensym_results_from_two_separate_macros_do_not_collide_through_the_real_compiler_path() {
+    // Regression test for qa test-design review msg #264: the existing
+    // coverage for gensym's cross-invocation hygiene fix only threads a
+    // counter through two direct `eval_top_level_function` calls -- it
+    // never goes through `compile_macro_call` (the real path an ordinary
+    // program actually exercises) at all. Two SEPARATE macro definitions,
+    // each calling `(gensym)` during their own compile-time expansion,
+    // is what would have silently collided (both producing the identical
+    // symbol) before the fix.
+    assert_eq!(
+        eval_ok(
+            "b14-gensym-cross-macro-hygiene.ml",
+            "(define-macro (g1) (list (quote quote) (gensym))) \
+             (define-macro (g2) (list (quote quote) (gensym))) \
+             (display (eq? (g1) (g2)))"
+        ),
+        "#f"
+    );
+}
+
+#[test]
 fn b14_e5_a_local_variable_shadowing_a_macro_name_wins_over_the_macro() {
     // If the macro won, `(trap 1)` would expand to `(quote 1)` and display
     // "1" without ever calling the passed-in procedure. Since the local

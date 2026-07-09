@@ -211,19 +211,28 @@ pub(crate) fn const_to_value(c: &Const) -> Value {
     }
 }
 
-/// Caps how many elements a single flat list/vector `value_to_sexpr` will
-/// convert -- unlike quasiquote templates (`compiler::
-/// MAX_QUASIQUOTE_SEQUENCE_LEN`, 2,000, bounding SOURCE TEXT written by
-/// a person) or `make-vector` (`MAX_VECTOR_LENGTH`, 10,000,000, a single
-/// allocation at ordinary program RUNTIME), nothing bounded how large a
-/// flat structure a macro body could build via ordinary recursive `cons`
-/// and return as its compile-time expansion result (warden security
-/// review msg #260: confirmed a macro building a multi-million-element
-/// list from a source file well under 200 bytes disproportionately costs
-/// real compile-time seconds and hundreds of MB, purely by choosing a
-/// large numeric literal). Generous for anything a macro is actually
-/// generating CODE for -- this bounds compile-time cost, not expressible
-/// program behavior.
+/// Caps how many elements a single flat list/vector `value_to_sexpr`
+/// itself will CONVERT back into code -- unlike quasiquote templates
+/// (`compiler::MAX_QUASIQUOTE_SEQUENCE_LEN`, 2,000, bounding SOURCE TEXT
+/// written by a person) or `make-vector` (`MAX_VECTOR_LENGTH`,
+/// 10,000,000, a single allocation at ordinary program RUNTIME), nothing
+/// bounded how large a flat structure a macro body could build via
+/// ordinary recursive `cons` and return as its compile-time expansion
+/// result (warden security review msg #260: confirmed a macro building a
+/// multi-million-element list from a source file well under 200 bytes
+/// disproportionately costs real compile-time seconds and hundreds of MB,
+/// purely by choosing a large numeric literal).
+///
+/// This specific check only ever stops PAYING for the conversion step
+/// once it's already too large (see the `List`/`Vector`/`Pair` arms
+/// below) -- the macro body's own CONSTRUCTION of that oversized value in
+/// the first place (an ordinary tail-recursive loop, however many
+/// iterations it runs) is a separate cost, bounded only by the coarser
+/// `MACRO_TRAMPOLINE_STEP_BUDGET` guard, not by this one (qa test-design
+/// review msg #264). The two guards compose to bound total cost either
+/// way; this constant's own precision claim is scoped to conversion only.
+/// Generous for anything a macro is actually generating CODE for -- this
+/// bounds compile-time cost, not expressible program behavior.
 const MAX_MACRO_RESULT_ELEMENTS: usize = 100_000;
 
 /// The reverse of [`const_to_value`]/[`sexpr_to_const`]: turns a runtime
