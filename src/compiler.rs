@@ -79,7 +79,7 @@ const MAX_QUASIQUOTE_SEQUENCE_LEN: usize = 2_000;
 /// `MAX_NESTING_DEPTH`: that guard bounds how deep an expression TREE
 /// nests; this one bounds how many times ONE call site gets re-expanded in
 /// place before compiling whatever it settles on.
-const MAX_MACRO_EXPANSION_ROUNDS: usize = 100;
+const MAX_MACRO_EXPANSION_ROUNDS: usize = 1000;
 
 fn too_many_macro_expansion_rounds() -> CompileError {
     err(format!(

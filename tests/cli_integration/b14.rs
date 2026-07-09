@@ -90,6 +90,32 @@ fn b14_e3_a_macro_that_always_expands_into_another_macro_call_fails_cleanly_not_
         stderr.contains("macro") && stderr.contains("recursion"),
         "expected the macro-expansion-round guard's own error, got: {stderr}"
     );
+    // Examiner msg #281: the spec requires the round limit to be at least
+    // 1000, not merely some clean error at whatever number -- assert the
+    // specific number the error reports so a regression back down to a
+    // too-low limit (e.g. the previous 100) is actually caught here.
+    assert!(
+        stderr.contains("1000"),
+        "expected the round-limit error to report exactly the raised limit (>= 1000), got: {stderr}"
+    );
+}
+
+#[test]
+fn b14_e3_a_legitimately_long_macro_expansion_chain_still_completes() {
+    // Examiner msg #281 (c): demonstrates the raised ceiling actually
+    // supports more real rounds, not just a moved boundary number -- a
+    // macro that re-expands itself 501 times (counting down from 500 to
+    // 0), well past the old 100-round limit but comfortably under the new
+    // 1000-round one, must still settle on its final value and compile.
+    assert_eq!(
+        eval_ok(
+            "b14-e3-long-chain.ml",
+            "(define-macro (count-down n) \
+               (if (= n 0) 1 (list (quote count-down) (- n 1)))) \
+             (display (count-down 500))"
+        ),
+        "1"
+    );
 }
 
 #[test]
