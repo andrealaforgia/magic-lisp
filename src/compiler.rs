@@ -641,6 +641,7 @@ fn compile_function(
     comp: &mut Compilation,
     depth: usize,
     enclosing_ctx: &Ctx,
+    name: Option<String>,
 ) -> Result<u32, CompileError> {
     let formals = parse_formals(formals_sexpr)?;
     let (params, arity, has_rest) = match formals {
@@ -664,6 +665,7 @@ fn compile_function(
     let mut fn_chunk = Chunk::new();
     fn_chunk.arity = arity;
     fn_chunk.has_rest = has_rest;
+    fn_chunk.name = name;
     // A function's own body starts a fresh tail-position context: its last
     // expression's value IS this function's return value, regardless of
     // whatever tail status the *lambda-creating* expression itself had.
@@ -993,6 +995,35 @@ fn compile_define(
     // run at the start of a body — compile_body handles that case) binds a
     // real global under its own literal name.
     let (name, value_expr) = extract_define_binding(items)?;
+    // `(define (f ...) ...)` desugars (above, in extract_define_binding) to
+    // `(define f (lambda ...))` -- recognized here and compiled directly
+    // via `compile_function` (bypassing `compile_lambda`'s own, otherwise
+    // identical, dispatch) SPECIFICALLY so `f`'s name can be threaded
+    // through to the compiled chunk (B16): `compile_expr`'s ordinary
+    // `"lambda"` dispatch has no name to give it, since by the time it
+    // runs, the binding's own name has already been erased by this exact
+    // desugaring. An ordinary `(define x <non-lambda-expr>)` (including
+    // one whose expression merely EVALUATES to a procedure value, e.g.
+    // `(define x (if #t + -))`) takes the unnamed path below unchanged.
+    if let Sexpr::List(lambda_items) = &value_expr {
+        if matches!(lambda_items.first(), Some(Sexpr::Symbol(s)) if s == "lambda") {
+            let formals_sexpr = lambda_items
+                .get(1)
+                .ok_or_else(|| err("lambda requires a parameter list"))?;
+            let fn_index = compile_function(
+                formals_sexpr,
+                &lambda_items[2..],
+                comp,
+                depth,
+                ctx,
+                Some(name.clone()),
+            )?;
+            chunk.emit_make_function(fn_index);
+            let idx = chunk.add_const(Const::Symbol(name));
+            chunk.emit_def_global(idx);
+            return Ok(());
+        }
+    }
     compile_expr(&value_expr, ctx, chunk, comp, depth + 1, false)?;
     let idx = chunk.add_const(Const::Symbol(name));
     chunk.emit_def_global(idx);
@@ -1052,7 +1083,14 @@ fn compile_define_macro(
         .get(1)
         .ok_or_else(|| err("define-macro requires a (name . formals) head"))?;
     let (name, formals_sexpr) = split_define_macro_head(head)?;
-    let fn_index = compile_function(&formals_sexpr, &items[2..], comp, depth, ctx)?;
+    let fn_index = compile_function(
+        &formals_sexpr,
+        &items[2..],
+        comp,
+        depth,
+        ctx,
+        Some(name.clone()),
+    )?;
     comp.macros.insert(name, fn_index);
     let idx = chunk.add_const(Const::Unspecified);
     chunk.emit_const(idx);
@@ -1176,7 +1214,7 @@ fn compile_lambda(
     let formals_sexpr = items
         .get(1)
         .ok_or_else(|| err("lambda requires a parameter list"))?;
-    let fn_index = compile_function(formals_sexpr, &items[2..], comp, depth, ctx)?;
+    let fn_index = compile_function(formals_sexpr, &items[2..], comp, depth, ctx, None)?;
     chunk.emit_make_function(fn_index);
     Ok(())
 }
@@ -1290,7 +1328,7 @@ fn compile_named_let(
     let body = &items[3..];
 
     let alias = comp.gensym(&name);
-    let ctx_with_alias = ctx.with_alias(name, alias.clone());
+    let ctx_with_alias = ctx.with_alias(name.clone(), alias.clone());
 
     let formals_sexpr = Sexpr::List(
         bindings
@@ -1298,7 +1336,14 @@ fn compile_named_let(
             .map(|(n, _)| Sexpr::Symbol(n.clone()))
             .collect(),
     );
-    let fn_index = compile_function(&formals_sexpr, body, comp, depth, &ctx_with_alias)?;
+    let fn_index = compile_function(
+        &formals_sexpr,
+        body,
+        comp,
+        depth,
+        &ctx_with_alias,
+        Some(name.clone()),
+    )?;
     chunk.emit_make_function(fn_index);
     let def_idx = chunk.add_const(Const::Symbol(alias.clone()));
     chunk.emit_def_global(def_idx);

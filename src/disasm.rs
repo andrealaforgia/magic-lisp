@@ -24,6 +24,96 @@ fn consume_step(remaining: usize) -> usize {
     remaining.saturating_sub(1)
 }
 
+fn const_type_name(c: &Const) -> &'static str {
+    match c {
+        Const::Int(_) => "Int",
+        Const::Float(_) => "Float",
+        Const::Bool(_) => "Bool",
+        Const::Char(_) => "Char",
+        Const::Str(_) => "Str",
+        Const::Symbol(_) => "Symbol",
+        Const::List(_) => "List",
+        Const::Vector(_) => "Vector",
+        Const::Pair(..) => "Pair",
+        Const::Unspecified => "Unspecified",
+    }
+}
+
+/// The distinct, recognizable name shown in a function's header (B16, spec
+/// 7.5): the top-level entry function gets its own placeholder (distinct
+/// from the anonymous-function one below), a `define`d/`define-macro`d/
+/// named-`let` function shows its real source name, and any other
+/// (`lambda`-only) function shows the anonymous placeholder.
+fn function_display_name(module: &Module, index: usize, chunk: &Chunk) -> String {
+    if index as u32 == module.entry_index {
+        "<toplevel>".to_string()
+    } else {
+        chunk
+            .name
+            .clone()
+            .unwrap_or_else(|| "<anonymous>".to_string())
+    }
+}
+
+/// Length, in bytes, of the operand a given opcode byte is followed by --
+/// every opcode in this bytecode format has a fixed operand length (no
+/// variable-length operands), so this alone is enough to skip correctly
+/// past any instruction without needing to know how to DISPLAY it.
+fn operand_len(opcode: u8) -> usize {
+    match opcode {
+        op if op == Op::Const as u8
+            || op == Op::GetGlobal as u8
+            || op == Op::DefGlobal as u8
+            || op == Op::SetGlobal as u8
+            || op == Op::MakeFunction as u8
+            || op == Op::Jump as u8
+            || op == Op::JumpIfFalse as u8 =>
+        {
+            4
+        }
+        op if op == Op::GetLocal as u8
+            || op == Op::SetLocal as u8
+            || op == Op::Call as u8
+            || op == Op::TailCall as u8 =>
+        {
+            1
+        }
+        op if op == Op::GetUpvalue as u8 || op == Op::SetUpvalue as u8 => 2,
+        _ => 0,
+    }
+}
+
+/// Counts the DISTINCT `(depth, slot)` pairs a function's own bytecode
+/// references via `GET_UPVALUE`/`SET_UPVALUE` -- i.e. how many different
+/// enclosing-scope variables it captures (B16's "upvalue count" header
+/// field), not how many read/write instructions reference them (reading
+/// the SAME captured variable twice is still one upvalue, not two). This
+/// architecture doesn't track a static per-function capture list anywhere
+/// else -- a closure captures its whole enclosing environment chain at
+/// runtime, addressed by depth/slot rather than through an indirect
+/// per-function capture-list -- so this is derived here by scanning the
+/// already-compiled bytecode directly, which also means it works
+/// correctly on a module freshly loaded from a `.mlbc` file, not just one
+/// still held in memory right after compiling it.
+fn count_captured_upvalues(chunk: &Chunk) -> usize {
+    let code = &chunk.code;
+    let mut ip = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    while ip < code.len() {
+        let opcode = code[ip];
+        let start = ip;
+        ip += 1;
+        if opcode == Op::GetUpvalue as u8 || opcode == Op::SetUpvalue as u8 {
+            if let (Some(&depth), Some(&slot)) = (code.get(ip), code.get(ip + 1)) {
+                seen.insert((depth, slot));
+            }
+        }
+        ip += operand_len(opcode);
+        ip = advance_past(start, ip);
+    }
+    seen.len()
+}
+
 fn describe_const_value(c: &Const) -> String {
     match c {
         Const::Int(n) => n.to_string(),
@@ -256,24 +346,30 @@ pub fn disassemble_chunk(chunk: &Chunk) -> String {
     out
 }
 
-/// Disassembles every function in a compiled module, labeling each with its
-/// index and marking the entry function.
+/// Disassembles every function in a compiled module (B16, spec 7.5): for
+/// each, a header (index, name/placeholder, arity, variadic flag, upvalue
+/// count), its constant pool (index, type, write-form value, one per
+/// entry), and its instructions (via [`disassemble_chunk`]).
 pub fn disassemble(module: &Module) -> String {
     let mut out = String::new();
     for (index, chunk) in module.functions.iter().enumerate() {
-        let marker = if index as u32 == module.entry_index {
-            " (entry)"
-        } else {
-            ""
-        };
+        let name = function_display_name(module, index, chunk);
+        let upvalues = count_captured_upvalues(chunk);
         let _ = writeln!(
             out,
-            "== function {index}{marker}: arity={}, has_rest={}, {} bytes code, {} constants ==",
-            chunk.arity,
-            chunk.has_rest,
-            chunk.code.len(),
-            chunk.constants.len()
+            "== function {index}: name={name}, arity={}, variadic={}, upvalues={upvalues} ==",
+            chunk.arity, chunk.has_rest,
         );
+        let _ = writeln!(out, "  constants:");
+        for (cidx, c) in chunk.constants.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "    {cidx}: {} {}",
+                const_type_name(c),
+                describe_const_value(c)
+            );
+        }
+        let _ = writeln!(out, "  code:");
         out.push_str(&disassemble_chunk(chunk));
     }
     out
@@ -414,9 +510,12 @@ mod tests {
 
     #[test]
     fn module_level_disassembly_marks_the_entry_function() {
+        // B16: the top-level entry function is shown under its own
+        // distinct name placeholder, `<toplevel>`, rather than a separate
+        // "(entry)" marker.
         let module = module_for("(define (f x) x)");
         let listing = disassemble(&module);
-        assert!(listing.contains("(entry)"), "{listing}");
+        assert!(listing.contains("<toplevel>"), "{listing}");
     }
 
     #[test]
@@ -567,9 +666,9 @@ mod tests {
         assert_eq!(function_headers.len(), 2, "{listing}");
         for (index, header) in function_headers.iter().enumerate() {
             if index as u32 == module.entry_index {
-                assert!(header.contains("(entry)"), "{header}");
+                assert!(header.contains("<toplevel>"), "{header}");
             } else {
-                assert!(!header.contains("(entry)"), "{header}");
+                assert!(!header.contains("<toplevel>"), "{header}");
             }
         }
     }

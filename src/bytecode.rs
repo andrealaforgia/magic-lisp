@@ -2,7 +2,12 @@
 
 pub const MAGIC: [u8; 4] = *b"MLBC";
 pub const VERSION_MAJOR: u8 = 1;
-pub const VERSION_MINOR: u8 = 1;
+/// Bumped for B16: each function's table entry now also carries its own
+/// source name (`Chunk::name`), needed so `magiclisp disasm` can show a
+/// named function's real name even when disassembling a `.mlbc` file
+/// loaded fresh from disk in a separate process invocation, not just a
+/// module still held in memory right after compiling it.
+pub const VERSION_MINOR: u8 = 2;
 
 /// Caps recursion depth when decoding nested `Const::List` constants from an
 /// MLBC file, so a maliciously crafted artifact with deeply nested list
@@ -88,6 +93,11 @@ pub struct Chunk {
     pub arity: u32,
     /// Whether the last parameter collects any extra arguments into a list.
     pub has_rest: bool,
+    /// The name this function was defined under (B16), e.g. `f` for
+    /// `(define (f x) ...)` -- `None` for an anonymous `(lambda ...)` and
+    /// for the top-level entry chunk (which has no name of its own; the
+    /// disassembler shows a distinct placeholder for that case instead).
+    pub name: Option<String>,
 }
 
 impl Chunk {
@@ -335,6 +345,14 @@ pub fn encode(module: &Module) -> Vec<u8> {
     for chunk in &module.functions {
         out.extend_from_slice(&chunk.arity.to_le_bytes());
         out.push(if chunk.has_rest { 1 } else { 0 });
+        match &chunk.name {
+            Some(name) => {
+                out.push(1);
+                out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&(chunk.code.len() as u32).to_le_bytes());
         out.extend_from_slice(&chunk.code);
         out.extend_from_slice(&(chunk.constants.len() as u32).to_le_bytes());
@@ -467,6 +485,13 @@ pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
     for _ in 0..fn_count {
         let arity = r.u32()?;
         let has_rest = r.u8()? != 0;
+        let name = if r.u8()? != 0 {
+            let name_len = r.u32()? as usize;
+            let raw = r.bytes_owned(name_len)?;
+            Some(String::from_utf8(raw).map_err(|_| BytecodeError::Truncated)?)
+        } else {
+            None
+        };
         let code_len = r.u32()? as usize;
         let code = r.bytes_owned(code_len)?;
         let const_count = r.u32()?;
@@ -479,6 +504,7 @@ pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
             constants,
             arity,
             has_rest,
+            name,
         });
     }
 
@@ -535,6 +561,35 @@ mod tests {
         let bytes = encode(&module);
         let decoded = decode(&bytes).expect("valid module should decode");
         assert_eq!(decoded, module);
+    }
+
+    #[test]
+    fn round_trips_a_named_functions_name_byte_for_byte() {
+        let mut chunk = Chunk::new();
+        chunk.name = Some("add-n".to_string());
+        chunk.emit_halt();
+        let module = Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        };
+        let bytes = encode(&module);
+        let decoded = decode(&bytes).expect("valid module should decode");
+        assert_eq!(decoded, module);
+        assert_eq!(decoded.functions[0].name.as_deref(), Some("add-n"));
+    }
+
+    #[test]
+    fn round_trips_an_anonymous_functions_absent_name_byte_for_byte() {
+        let mut chunk = Chunk::new();
+        assert_eq!(chunk.name, None);
+        chunk.emit_halt();
+        let module = Module {
+            entry_index: 0,
+            functions: vec![chunk],
+        };
+        let bytes = encode(&module);
+        let decoded = decode(&bytes).expect("valid module should decode");
+        assert_eq!(decoded.functions[0].name, None);
     }
 
     #[test]
