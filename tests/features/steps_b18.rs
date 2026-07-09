@@ -1,11 +1,16 @@
 //! Step definitions for features/B18-robustness.feature.
 
 use super::registry::Registry;
-use super::world::{run, stderr_of, temp_path, write_source, World};
+use super::world::{World, run, stderr_of, temp_path, write_source};
 use magiclisp::exitcode::{BAD_ARTIFACT, RUNTIME_ERROR, SOURCE_ERROR, SUCCESS, USAGE_ERROR};
 
-const ESTABLISHED_CODES: [i32; 5] =
-    [SUCCESS, USAGE_ERROR, SOURCE_ERROR, BAD_ARTIFACT, RUNTIME_ERROR];
+const ESTABLISHED_CODES: [i32; 5] = [
+    SUCCESS,
+    USAGE_ERROR,
+    SOURCE_ERROR,
+    BAD_ARTIFACT,
+    RUNTIME_ERROR,
+];
 
 fn exited_cleanly(output: &std::process::Output) -> bool {
     output.status.code().is_some()

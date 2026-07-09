@@ -207,7 +207,11 @@ fn read_completes_promptly_for_a_datum_that_lands_exactly_on_a_full_relay_read_b
 
     let mut stdin = child.stdin.take().unwrap();
     let datum = format!("\"{}\"", "a".repeat(8190));
-    assert_eq!(datum.len(), 8192, "datum must land exactly on the relay's read buffer size");
+    assert_eq!(
+        datum.len(),
+        8192,
+        "datum must land exactly on the relay's read buffer size"
+    );
     stdin.write_all(datum.as_bytes()).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -292,10 +296,7 @@ fn read_does_not_return_a_quote_wrapped_number_split_by_a_gap_until_all_its_digi
     // pre-fix: sending "'1" then, after a delay, "23" returned `(quote 1)`
     // instead of `(quote 123)` -- the process had already exited on the
     // first digit alone.
-    let file = write_source(
-        "b12-read-quoted-number-split-by-a-gap.ml",
-        "(write (read))",
-    );
+    let file = write_source("b12-read-quoted-number-split-by-a-gap.ml", "(write (read))");
     let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
         .arg("eval")
         .arg(&file)
@@ -579,10 +580,7 @@ fn read_completes_promptly_for_a_datum_delivered_in_far_more_than_sixty_four_sma
     // many separate small pieces -- for a datum comfortably past the old
     // 64-chunk threshold, then keeps stdin open afterward and asserts
     // completion anyway.
-    let file = write_source(
-        "b12-read-many-small-chunks.ml",
-        "(display (length (read)))",
-    );
+    let file = write_source("b12-read-many-small-chunks.ml", "(display (length (read)))");
     let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
         .arg("eval")
         .arg(&file)

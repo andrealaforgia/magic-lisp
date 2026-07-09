@@ -16,7 +16,10 @@ fn e1_a_line_comment_runs_to_end_of_line() {
 
 #[test]
 fn e2_demo2_a_single_block_comment_precedes_a_display() {
-    let out = eval_ok("b19-e2-demo2.ml", "#| a block comment |# (display 1) (newline)");
+    let out = eval_ok(
+        "b19-e2-demo2.ml",
+        "#| a block comment |# (display 1) (newline)",
+    );
     assert_eq!(out, "1\n");
 }
 
@@ -41,7 +44,10 @@ fn e3_demo1_a_stray_datum_between_two_numbers_in_a_sum_is_never_evaluated_or_inc
 fn e3_the_skipped_datum_may_itself_be_a_compound_structure() {
     // Proves the marker removes one WHOLE datum regardless of how many
     // tokens it spans, not just the next single token.
-    let out = eval_ok("b19-e3-compound.ml", "(display (+ 1 #;(a b c) 2)) (newline)");
+    let out = eval_ok(
+        "b19-e3-compound.ml",
+        "(display (+ 1 #;(a b c) 2)) (newline)",
+    );
     assert_eq!(out, "3\n");
 }
 
@@ -66,7 +72,10 @@ fn e4_alternate_base_integer_literals_read_to_the_correct_value() {
 
 #[test]
 fn e5_an_oversized_integer_literal_is_still_a_read_error() {
-    let file = write_source("b19-e5-oversized.ml", "(display 99999999999999999999999999999)");
+    let file = write_source(
+        "b19-e5-oversized.ml",
+        "(display 99999999999999999999999999999)",
+    );
     let out = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(SOURCE_ERROR));
     assert!(!stderr_of(&out).is_empty());
@@ -74,10 +83,7 @@ fn e5_an_oversized_integer_literal_is_still_a_read_error() {
 
 #[test]
 fn e5_integer_arithmetic_overflow_still_wraps() {
-    let out = eval_ok(
-        "b19-e5-wrap.ml",
-        "(display (+ 9223372036854775807 1))",
-    );
+    let out = eval_ok("b19-e5-wrap.ml", "(display (+ 9223372036854775807 1))");
     assert_eq!(out, "-9223372036854775808");
 }
 
@@ -178,10 +184,7 @@ fn e6_sample_100_hash_deterministic_insertion_order_keys() {
     // SPEC.md 9.5 '100-hash' officially specifies (keys shown via write, per
     // B11's own note: identical to display for a list of symbols):
     // '2\n(a b)\nnope\n#t\n#f\n'.
-    assert_eq!(
-        eval_ok("b19-e6-100.ml", src),
-        "2\n(a b)\nnope\n#t\n#f\n"
-    );
+    assert_eq!(eval_ok("b19-e6-100.ml", src), "2\n(a b)\nnope\n#t\n#f\n");
 }
 
 // --- E7 (integration): the four named DEMOs verbatim. ---
@@ -194,7 +197,10 @@ fn e7_demo1_skip_datum_marker_before_a_stray_value_between_a_sum() {
 
 #[test]
 fn e7_demo2_a_single_block_comment_then_displaying_1() {
-    let out = eval_ok("b19-e7-demo2.ml", "#| a block comment |# (display 1) (newline)");
+    let out = eval_ok(
+        "b19-e7-demo2.ml",
+        "#| a block comment |# (display 1) (newline)",
+    );
     assert_eq!(out, "1\n");
 }
 

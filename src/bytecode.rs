@@ -227,7 +227,10 @@ pub struct Module {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BytecodeError {
     BadMagic,
-    UnsupportedVersion { major: u8, minor: u8 },
+    UnsupportedVersion {
+        major: u8,
+        minor: u8,
+    },
     Truncated,
     OutOfRange(String),
     /// The reserved flags field (B18) is non-zero: this decoder defines no

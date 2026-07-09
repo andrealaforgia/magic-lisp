@@ -6,8 +6,7 @@ use magiclisp::bytecode::Op;
 use magiclisp::exitcode::{BAD_ARTIFACT, RUNTIME_ERROR, SOURCE_ERROR, SUCCESS, USAGE_ERROR};
 
 use super::helpers::{
-    assert_rejected_as_bad_artifact, compile_good_artifact, run, stderr_of, temp_path,
-    write_source,
+    assert_rejected_as_bad_artifact, compile_good_artifact, run, stderr_of, temp_path, write_source,
 };
 
 /// `true` iff the process ended via an ordinary exit code -- `None` on
@@ -18,8 +17,13 @@ fn exited_cleanly(status: &ExitStatus) -> bool {
     status.code().is_some()
 }
 
-const ESTABLISHED_CODES: [i32; 5] =
-    [SUCCESS, USAGE_ERROR, SOURCE_ERROR, BAD_ARTIFACT, RUNTIME_ERROR];
+const ESTABLISHED_CODES: [i32; 5] = [
+    SUCCESS,
+    USAGE_ERROR,
+    SOURCE_ERROR,
+    BAD_ARTIFACT,
+    RUNTIME_ERROR,
+];
 
 // --- E1: broken source text, five categories, each a clean source-error exit. ---
 
@@ -54,7 +58,10 @@ fn e1_raw_unescaped_newline_inside_a_string_is_a_source_error_not_a_crash() {
 
 #[test]
 fn e1_a_whole_number_literal_too_large_for_the_integer_range_is_a_source_error_not_a_crash() {
-    let file = write_source("b18-e1-overflow.ml", "(display 999999999999999999999999999)");
+    let file = write_source(
+        "b18-e1-overflow.ml",
+        "(display 999999999999999999999999999)",
+    );
     let out = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(SOURCE_ERROR));
     assert!(exited_cleanly(&out.status));
@@ -145,7 +152,10 @@ fn e3_an_instruction_byte_that_isnt_a_real_opcode_is_reported_not_crashed() {
     let run_out = run(&["run", artifact.to_str().unwrap()]);
     assert!(exited_cleanly(&run_out.status), "run must not crash");
     assert!(
-        matches!(run_out.status.code(), Some(RUNTIME_ERROR) | Some(BAD_ARTIFACT)),
+        matches!(
+            run_out.status.code(),
+            Some(RUNTIME_ERROR) | Some(BAD_ARTIFACT)
+        ),
         "run exit code: {:?}, stderr: {}",
         run_out.status.code(),
         stderr_of(&run_out)
@@ -177,7 +187,10 @@ fn e3_an_out_of_range_constant_index_is_reported_not_crashed() {
     let run_out = run(&["run", artifact.to_str().unwrap()]);
     assert!(exited_cleanly(&run_out.status), "run must not crash");
     assert!(
-        matches!(run_out.status.code(), Some(RUNTIME_ERROR) | Some(BAD_ARTIFACT)),
+        matches!(
+            run_out.status.code(),
+            Some(RUNTIME_ERROR) | Some(BAD_ARTIFACT)
+        ),
         "run exit code: {:?}, stderr: {}",
         run_out.status.code(),
         stderr_of(&run_out)
@@ -205,7 +218,10 @@ fn e3_an_entry_function_ending_mid_instruction_is_reported_not_crashed() {
     let run_out = run(&["run", artifact.to_str().unwrap()]);
     assert!(exited_cleanly(&run_out.status), "run must not crash");
     assert!(
-        matches!(run_out.status.code(), Some(RUNTIME_ERROR) | Some(BAD_ARTIFACT)),
+        matches!(
+            run_out.status.code(),
+            Some(RUNTIME_ERROR) | Some(BAD_ARTIFACT)
+        ),
         "run exit code: {:?}, stderr: {}",
         run_out.status.code(),
         stderr_of(&run_out)
@@ -298,7 +314,7 @@ fn corrupted_artifacts() -> Vec<Vec<u8>> {
 
 #[test]
 fn e5_a_genuine_breadth_of_malformed_source_never_crashes_and_always_lands_on_an_established_code()
- {
+{
     let snippets = malformed_source_snippets();
     let mut passed = 0;
     for (i, src) in snippets.iter().enumerate() {

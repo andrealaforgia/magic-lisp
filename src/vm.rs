@@ -489,9 +489,11 @@ fn value_to_sexpr_at_depth(
                 }
             }
         }
-        Value::Native(_) | Value::Closure(..) | Value::Hash(_) | Value::Eof | Value::Unspecified => {
-            Err(macro_err(v))
-        }
+        Value::Native(_)
+        | Value::Closure(..)
+        | Value::Hash(_)
+        | Value::Eof
+        | Value::Unspecified => Err(macro_err(v)),
     }
 }
 
@@ -1058,11 +1060,7 @@ pub(crate) fn eval_top_level_function(
     });
     let mut sink = std::io::sink();
     let result = vm.call_value(&Value::Closure(fn_index, env), args, &mut sink)?;
-    Ok((
-        result,
-        vm.gensym_counter,
-        vm.macro_step_budget.unwrap_or(0),
-    ))
+    Ok((result, vm.gensym_counter, vm.macro_step_budget.unwrap_or(0)))
 }
 
 /// Evaluates one REPL entry (B17), compiled via `compiler::compile_repl_
@@ -3242,9 +3240,14 @@ mod tests {
         let forms = read_program("(define (double x) (* x 2))").unwrap();
         let module = compile_program(&forms).unwrap();
         assert_eq!(module.entry_index, 1);
-        let (result, ..) =
-            eval_top_level_function(&module, 0, vec![Value::Int(21)], 0, MACRO_TRAMPOLINE_STEP_BUDGET)
-                .unwrap();
+        let (result, ..) = eval_top_level_function(
+            &module,
+            0,
+            vec![Value::Int(21)],
+            0,
+            MACRO_TRAMPOLINE_STEP_BUDGET,
+        )
+        .unwrap();
         assert_eq!(result, Value::Int(42));
     }
 
@@ -3269,7 +3272,10 @@ mod tests {
             MACRO_TRAMPOLINE_STEP_BUDGET,
         )
         .unwrap();
-        assert_eq!(result, Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)])));
+        assert_eq!(
+            result,
+            Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)]))
+        );
     }
 
     #[test]
@@ -3320,8 +3326,8 @@ mod tests {
         // never fires for it -- nothing else bounded it before this fix,
         // hanging the COMPILER itself (not the eventually-run program)
         // indefinitely.
-        let forms = read_program("(define (f) (letrec ((loop (lambda () (loop)))) (loop)))")
-            .unwrap();
+        let forms =
+            read_program("(define (f) (letrec ((loop (lambda () (loop)))) (loop)))").unwrap();
         let module = compile_program(&forms).unwrap();
         assert!(
             eval_top_level_function(&module, 0, vec![], 0, MACRO_TRAMPOLINE_STEP_BUDGET).is_err()
@@ -3340,9 +3346,10 @@ mod tests {
         // function table) while compiling `f`'s body, before `f`'s own
         // chunk is pushed once that finishes -- index 0 is `burn`, index
         // 1 is `f` itself.
-        let forms =
-            read_program("(define (f) (letrec ((burn (lambda (n) (if (= n 0) 0 (burn (- n 1)))))) (burn 10)))")
-                .unwrap();
+        let forms = read_program(
+            "(define (f) (letrec ((burn (lambda (n) (if (= n 0) 0 (burn (- n 1)))))) (burn 10)))",
+        )
+        .unwrap();
         let module = compile_program(&forms).unwrap();
         let (_, _, remaining_after_first) =
             eval_top_level_function(&module, 1, vec![], 0, 100).unwrap();
@@ -3355,8 +3362,14 @@ mod tests {
     #[test]
     fn value_to_sexpr_converts_every_simple_variant() {
         assert_eq!(value_to_sexpr(&Value::Int(5)).unwrap(), Sexpr::Int(5));
-        assert_eq!(value_to_sexpr(&Value::Float(1.5)).unwrap(), Sexpr::Float(1.5));
-        assert_eq!(value_to_sexpr(&Value::Bool(true)).unwrap(), Sexpr::Bool(true));
+        assert_eq!(
+            value_to_sexpr(&Value::Float(1.5)).unwrap(),
+            Sexpr::Float(1.5)
+        );
+        assert_eq!(
+            value_to_sexpr(&Value::Bool(true)).unwrap(),
+            Sexpr::Bool(true)
+        );
         assert_eq!(value_to_sexpr(&Value::Char('a')).unwrap(), Sexpr::Char('a'));
         assert_eq!(
             value_to_sexpr(&Value::Str(Rc::new("hi".to_string()))).unwrap(),
@@ -6969,8 +6982,7 @@ mod tests {
     }
 
     #[test]
-    fn read_correctly_decodes_a_multi_byte_character_split_exactly_across_a_relay_chunk_boundary()
-    {
+    fn read_correctly_decodes_a_multi_byte_character_split_exactly_across_a_relay_chunk_boundary() {
         // Regression guard for a gap warden security review msg #226/#227
         // flagged as verified only by hand, never committed: `run_with_stdin`
         // relays raw 8192-byte chunks with no regard for UTF-8 character

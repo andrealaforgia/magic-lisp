@@ -136,9 +136,8 @@ fn run_session(msg_tx: mpsc::Sender<Msg>, line_rx: mpsc::Receiver<Option<String>
                 // The unspecified value (e.g. a `define`'s own result)
                 // prints nothing at all, not even a blank line.
                 if !matches!(value, Value::Unspecified) {
-                    let _ = msg_tx.send(Msg::Write(
-                        format!("{}\n", write_repr(&value)).into_bytes(),
-                    ));
+                    let _ =
+                        msg_tx.send(Msg::Write(format!("{}\n", write_repr(&value)).into_bytes()));
                 }
             }
             Err(message) => {
@@ -163,7 +162,11 @@ fn eval_entry(
     globals: HashMap<String, Value>,
     state: compiler::ReplState,
     out: &mut impl Write,
-) -> (Result<Value, String>, HashMap<String, Value>, compiler::ReplState) {
+) -> (
+    Result<Value, String>,
+    HashMap<String, Value>,
+    compiler::ReplState,
+) {
     let forms = match reader::read_program(src) {
         Ok(forms) => forms,
         Err(e) => return (Err(e.to_string()), globals, state),
@@ -233,7 +236,10 @@ mod tests {
         let (out, err, code) = run_session("(define x 10)\n(car 5)\nx\n");
         assert_eq!(out, "> > > 10\n> ");
         assert_eq!(err.lines().count(), 1, "{err:?}");
-        assert!(err.lines().next().unwrap().starts_with("Error: "), "{err:?}");
+        assert!(
+            err.lines().next().unwrap().starts_with("Error: "),
+            "{err:?}"
+        );
         assert_eq!(code, exitcode::SUCCESS);
     }
 
@@ -247,11 +253,13 @@ mod tests {
 
     #[test]
     fn the_full_demo_sequence_produces_exactly_the_prescribed_transcript() {
-        let (out, err, code) =
-            run_session("(+ 1 2)\n(define x 10)\nx\n(car 5)\nx\n");
+        let (out, err, code) = run_session("(+ 1 2)\n(define x 10)\nx\n(car 5)\nx\n");
         assert_eq!(out, "> 3\n> > 10\n> > 10\n> ");
         assert_eq!(err.lines().count(), 1, "{err:?}");
-        assert!(err.lines().next().unwrap().starts_with("Error: "), "{err:?}");
+        assert!(
+            err.lines().next().unwrap().starts_with("Error: "),
+            "{err:?}"
+        );
         assert_eq!(code, exitcode::SUCCESS);
     }
 
@@ -343,12 +351,10 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(run_session("(define (f) 42)\n(f)\n"));
         });
-        let (out, err, code) = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect(
-                "REPL session did not terminate within 10s -- likely a reintroduced \
+        let (out, err, code) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "REPL session did not terminate within 10s -- likely a reintroduced \
                  infinite tail-call loop, not just a slow test",
-            );
+        );
         assert_eq!(out, "> > 42\n> ");
         assert!(err.is_empty(), "{err:?}");
         assert_eq!(code, exitcode::SUCCESS);
@@ -362,7 +368,10 @@ mod tests {
         let (out, err, code) = run_session("(begin (define y 5) (car 5))\ny\n");
         assert_eq!(out, "> > 5\n> ");
         assert_eq!(err.lines().count(), 1, "{err:?}");
-        assert!(err.lines().next().unwrap().starts_with("Error: "), "{err:?}");
+        assert!(
+            err.lines().next().unwrap().starts_with("Error: "),
+            "{err:?}"
+        );
         assert_eq!(code, exitcode::SUCCESS);
     }
 
@@ -377,7 +386,10 @@ mod tests {
             run_session("(define-macro (twice x) (list (quote begin) x x))\n(twice 1)\n");
         assert_eq!(out, "> > > ");
         assert_eq!(err.lines().count(), 1, "{err:?}");
-        assert!(err.lines().next().unwrap().starts_with("Error: "), "{err:?}");
+        assert!(
+            err.lines().next().unwrap().starts_with("Error: "),
+            "{err:?}"
+        );
         assert_eq!(code, exitcode::SUCCESS);
     }
 
@@ -389,7 +401,10 @@ mod tests {
         let (out, err, code) = run_session("(display (+ 1\n");
         assert_eq!(out, "> > ");
         assert_eq!(err.lines().count(), 1, "{err:?}");
-        assert!(err.lines().next().unwrap().starts_with("Error: "), "{err:?}");
+        assert!(
+            err.lines().next().unwrap().starts_with("Error: "),
+            "{err:?}"
+        );
         assert_eq!(code, exitcode::SUCCESS);
     }
 
@@ -401,7 +416,10 @@ mod tests {
         let (out, err, code) = run_session("(lambda)\n");
         assert_eq!(out, "> > ");
         assert_eq!(err.lines().count(), 1, "{err:?}");
-        assert!(err.lines().next().unwrap().starts_with("Error: "), "{err:?}");
+        assert!(
+            err.lines().next().unwrap().starts_with("Error: "),
+            "{err:?}"
+        );
         assert_eq!(code, exitcode::SUCCESS);
     }
 }

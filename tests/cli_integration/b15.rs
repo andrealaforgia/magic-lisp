@@ -26,7 +26,10 @@ fn b15_e1_error_irritants_of_different_types_including_a_string_are_shown_write_
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(RUNTIME_ERROR));
     let stderr = stderr_of(&output);
-    assert_eq!(stderr.lines().next().unwrap(), "Error: bad value 1 \"two\" three");
+    assert_eq!(
+        stderr.lines().next().unwrap(),
+        "Error: bad value 1 \"two\" three"
+    );
 }
 
 #[test]
@@ -62,18 +65,15 @@ fn b15_e2_wrong_argument_count_reports_the_same_uniform_error_and_exit_code() {
 
 #[test]
 fn b15_e2_referencing_an_undefined_name_reports_the_same_uniform_error_and_exit_code() {
-    let file = write_source(
-        "b15-e2-undefined.ml",
-        "(display this-name-does-not-exist)",
-    );
+    let file = write_source("b15-e2-undefined.ml", "(display this-name-does-not-exist)");
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(RUNTIME_ERROR));
     assert!(stderr_of(&output).starts_with("Error: "));
 }
 
 #[test]
-fn b15_e2_applying_an_operation_to_the_wrong_kind_of_value_reports_the_same_uniform_error_and_exit_code(
-) {
+fn b15_e2_applying_an_operation_to_the_wrong_kind_of_value_reports_the_same_uniform_error_and_exit_code()
+ {
     let file = write_source("b15-e2-wrongtype.ml", "(display (+ 1 \"a\"))");
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(RUNTIME_ERROR));

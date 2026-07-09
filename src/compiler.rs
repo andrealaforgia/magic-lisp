@@ -1140,24 +1140,24 @@ fn compile_define(
     // desugaring. An ordinary `(define x <non-lambda-expr>)` (including
     // one whose expression merely EVALUATES to a procedure value, e.g.
     // `(define x (if #t + -))`) takes the unnamed path below unchanged.
-    if let Sexpr::List(lambda_items) = &value_expr {
-        if matches!(lambda_items.first(), Some(Sexpr::Symbol(s)) if s == "lambda") {
-            let formals_sexpr = lambda_items
-                .get(1)
-                .ok_or_else(|| err("lambda requires a parameter list"))?;
-            let fn_index = compile_function(
-                formals_sexpr,
-                &lambda_items[2..],
-                comp,
-                depth,
-                ctx,
-                Some(name.clone()),
-            )?;
-            chunk.emit_make_function(fn_index);
-            let idx = chunk.add_const(Const::Symbol(name));
-            chunk.emit_def_global(idx);
-            return Ok(());
-        }
+    if let Sexpr::List(lambda_items) = &value_expr
+        && matches!(lambda_items.first(), Some(Sexpr::Symbol(s)) if s == "lambda")
+    {
+        let formals_sexpr = lambda_items
+            .get(1)
+            .ok_or_else(|| err("lambda requires a parameter list"))?;
+        let fn_index = compile_function(
+            formals_sexpr,
+            &lambda_items[2..],
+            comp,
+            depth,
+            ctx,
+            Some(name.clone()),
+        )?;
+        chunk.emit_make_function(fn_index);
+        let idx = chunk.add_const(Const::Symbol(name));
+        chunk.emit_def_global(idx);
+        return Ok(());
     }
     compile_expr(&value_expr, ctx, chunk, comp, depth + 1, false)?;
     let idx = chunk.add_const(Const::Symbol(name));
@@ -1315,14 +1315,14 @@ fn compile_macro_call(
             &result,
             &mut comp.macro_conversion_budget_remaining,
         )?;
-        if let Sexpr::List(next_items) = &expanded {
-            if let Some(Sexpr::Symbol(next_op)) = next_items.first() {
-                if !is_shadowed_by_a_binding(next_op, ctx)? && comp.macros.contains_key(next_op) {
-                    op = next_op.clone();
-                    operands = next_items[1..].to_vec();
-                    continue;
-                }
-            }
+        if let Sexpr::List(next_items) = &expanded
+            && let Some(Sexpr::Symbol(next_op)) = next_items.first()
+            && !is_shadowed_by_a_binding(next_op, ctx)?
+            && comp.macros.contains_key(next_op)
+        {
+            op = next_op.clone();
+            operands = next_items[1..].to_vec();
+            continue;
         }
         // A one-level safety margin, not the load-bearing part of this
         // guard, mirroring `compile_quasiquote`'s own identical `depth + 1`
@@ -3770,8 +3770,7 @@ mod tests {
     }
 
     #[test]
-    fn quasiquote_template_element_count_comfortably_under_the_configured_maximum_still_compiles()
-    {
+    fn quasiquote_template_element_count_comfortably_under_the_configured_maximum_still_compiles() {
         let program = [flat_quasiquoted_list(100)];
         assert!(compile_program(&program).is_ok());
     }

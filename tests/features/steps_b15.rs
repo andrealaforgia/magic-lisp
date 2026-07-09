@@ -1,7 +1,7 @@
 //! Step definitions for features/B15-errors-and-exit.feature.
 
 use super::registry::Registry;
-use super::world::{run, stderr_of, stdout_of, write_source, World};
+use super::world::{World, run, stderr_of, stdout_of, write_source};
 use magiclisp::exitcode::{RUNTIME_ERROR, SOURCE_ERROR, SUCCESS};
 
 /// Runs every pending MagicLisp source snippet queued in `world.pending`

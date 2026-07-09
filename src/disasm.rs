@@ -103,10 +103,10 @@ fn count_captured_upvalues(chunk: &Chunk) -> usize {
         let opcode = code[ip];
         let start = ip;
         ip += 1;
-        if opcode == Op::GetUpvalue as u8 || opcode == Op::SetUpvalue as u8 {
-            if let (Some(&depth), Some(&slot)) = (code.get(ip), code.get(ip + 1)) {
-                seen.insert((depth, slot));
-            }
+        if (opcode == Op::GetUpvalue as u8 || opcode == Op::SetUpvalue as u8)
+            && let (Some(&depth), Some(&slot)) = (code.get(ip), code.get(ip + 1))
+        {
+            seen.insert((depth, slot));
         }
         ip += operand_len(opcode);
         ip = advance_past(start, ip);

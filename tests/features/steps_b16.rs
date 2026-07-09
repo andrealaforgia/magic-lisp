@@ -3,9 +3,9 @@
 use super::registry::Registry;
 use super::world::{run, stdout_of, write_source};
 
-const DEMO1_SRC: &str =
-    "(define (add-n n) (lambda (x) (+ x n))) (display ((add-n 4) 3)) (newline)";
-const DEMO2_SRC: &str = "(define (sign n) (if (< n 0) (quote neg) (quote pos))) (display (sign -2)) (newline)";
+const DEMO1_SRC: &str = "(define (add-n n) (lambda (x) (+ x n))) (display ((add-n 4) 3)) (newline)";
+const DEMO2_SRC: &str =
+    "(define (sign n) (if (< n 0) (quote neg) (quote pos))) (display (sign -2)) (newline)";
 
 fn compile_then_disasm(label: &str, src: &str) -> String {
     let file = write_source(&format!("{label}.ml"), src);
@@ -94,9 +94,7 @@ pub(crate) fn registry() -> Registry {
                 let mut code_lines: Vec<&str> = Vec::new();
                 for line in listing.lines() {
                     let trimmed = line.trim();
-                    if line.starts_with("==") {
-                        in_code_section = false;
-                    } else if trimmed == "constants:" {
+                    if line.starts_with("==") || trimmed == "constants:" {
                         in_code_section = false;
                     } else if trimmed == "code:" {
                         in_code_section = true;
@@ -106,7 +104,7 @@ pub(crate) fn registry() -> Registry {
                 }
                 assert!(!code_lines.is_empty(), "{listing}");
                 for line in &code_lines {
-                    let offset_field = line.trim_start().split_whitespace().next().unwrap();
+                    let offset_field = line.split_whitespace().next().unwrap();
                     assert!(
                         offset_field.len() == 4
                             && offset_field.chars().all(|c| c.is_ascii_hexdigit()),

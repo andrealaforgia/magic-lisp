@@ -1,7 +1,7 @@
 //! Step definitions for features/B19-reader-edge-cases-and-conformance.feature.
 
 use super::registry::Registry;
-use super::world::{run, run_with_stdin, stderr_of, stdout_of, write_source, World};
+use super::world::{World, run, run_with_stdin, stderr_of, stdout_of, write_source};
 use magiclisp::exitcode::{RUNTIME_ERROR, SOURCE_ERROR, SUCCESS};
 
 /// Runs every queued full CLI invocation in `world.pending_commands`,

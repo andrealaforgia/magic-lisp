@@ -7,8 +7,8 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
 
 #[test]
-fn compiling_a_hand_built_deeply_nested_quasiquote_list_does_not_crash_on_a_severely_constrained_calling_thread(
-) {
+fn compiling_a_hand_built_deeply_nested_quasiquote_list_does_not_crash_on_a_severely_constrained_calling_thread()
+ {
     // Regression test for qa test-design WARNING msg #245: the prior unit
     // test for this fix (`compile_program_does_not_depend_on_the_calling_
     // threads_own_stack_size` in src/compiler.rs) passed identically
