@@ -3337,6 +3337,25 @@ mod tests {
     }
 
     #[test]
+    fn value_to_sexpr_accepts_a_flat_list_of_exactly_the_configured_maximum_element_count() {
+        // Distinguishes `>` from `>=` in the up-front `List`-arm size
+        // check, the same way the depth-guard boundary tests above do for
+        // that separate check -- a flat list is never a stack-depth risk
+        // (unlike the nested-value depth tests, no dedicated thread is
+        // needed here), so this is a plain, fast unit test.
+        let items = vec![Value::Int(0); MAX_MACRO_RESULT_ELEMENTS];
+        let v = Value::List(Rc::new(items));
+        assert!(value_to_sexpr(&v).is_ok());
+    }
+
+    #[test]
+    fn value_to_sexpr_rejects_a_flat_list_of_one_more_than_the_configured_maximum_element_count() {
+        let items = vec![Value::Int(0); MAX_MACRO_RESULT_ELEMENTS + 1];
+        let v = Value::List(Rc::new(items));
+        assert!(value_to_sexpr(&v).is_err());
+    }
+
+    #[test]
     fn value_to_sexpr_rejects_a_procedure_value_with_a_clear_error() {
         assert!(value_to_sexpr(&Value::Native("car".to_string())).is_err());
         assert!(value_to_sexpr(&Value::Eof).is_err());
