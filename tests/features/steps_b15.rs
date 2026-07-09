@@ -5,12 +5,16 @@ use super::world::{run, stderr_of, stdout_of, write_source, World};
 use magiclisp::exitcode::{RUNTIME_ERROR, SOURCE_ERROR, SUCCESS};
 
 /// Runs every pending MagicLisp source snippet queued in `world.pending`
-/// as a real, complete program (unlike `world::run_pending`, no
-/// `display`-wrapping -- every snippet here is already a full program),
-/// appending each real process `Output` to `world.outputs` -- the shared
-/// implementation behind the "each is run" When step, reused verbatim by
-/// E1/E2/E4/E6 (all four share this exact wording in the feature file)
-/// with different Givens queuing different snippets.
+/// as a real, complete program, appending each real process `Output` to
+/// `world.outputs` -- the shared implementation behind the "each is run"
+/// When step, reused verbatim by E1/E2/E4/E6 (all four share this exact
+/// wording in the feature file) with different Givens queuing different
+/// snippets. Distinct from `world::run_pending`: that helper is built on
+/// `eval_ok`, which panics on any non-success exit and only captures
+/// stdout as a bare string -- both fatal here, since every one of this
+/// feature's scenarios is specifically about non-zero exit codes and
+/// stderr content (not to mention needing no `display`-wrapping, since
+/// every snippet here is already a complete program).
 fn run_pending_as_programs(world: &mut World, label_prefix: &str) {
     let pending = std::mem::take(&mut world.pending);
     for (i, src) in pending.iter().enumerate() {
