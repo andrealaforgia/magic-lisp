@@ -35,20 +35,26 @@ fn too_deep() -> CompileError {
 }
 
 /// Caps how many elements a single quasiquote template list/vector may
-/// have -- a separate, much larger bound than `MAX_NESTING_DEPTH`
-/// (deliberately not reusing it: `expand_qq_sequence` builds its expanded
-/// `append`-chain tree with a few levels of surrounding overhead already
-/// spent by the time it starts, so testing right at `MAX_NESTING_DEPTH`
-/// itself would sometimes reject templates `compile_expr`'s own guard
-/// would otherwise have accepted). Its job isn't to duplicate that guard
-/// -- moderately-oversized templates are already caught cleanly by it --
-/// but to prevent a much rarer, much larger failure: at a large enough
-/// element count, DROPPING the expanded tree overflows the native stack
-/// on its own (ordinary recursive `Drop` glue, since `Sexpr` has no
-/// custom iterative one), regardless of whether `compile_expr`'s guard
-/// would otherwise have fired cleanly on it (warden security review:
-/// confirmed crash at ~110,000+ elements). Comfortably below that
-/// threshold, comfortably above any legitimate template size.
+/// have -- a separate, much larger bound than `MAX_NESTING_DEPTH`, and not
+/// interchangeable with it: this check runs BEFORE `expand_qq_sequence`
+/// builds its expanded `append`-chain tree at all, while `MAX_NESTING_DEPTH`
+/// is `compile_expr`'s own guard checked AFTER that tree already exists,
+/// while compiling it. For an ordinary flat list/vector template, that
+/// depth guard already rejects anything past ~511 elements on its own --
+/// this bound is not a second, independent acceptance threshold that ever
+/// decides accept-vs-reject in that shape's case (reusing
+/// `MAX_NESTING_DEPTH`'s own value here doesn't work either, though: the
+/// expansion carries a little depth overhead by the time `compile_expr`
+/// ever sees it, so testing exactly at that value directly would
+/// sometimes reject what the depth guard alone would still have
+/// accepted). Its real job is a much rarer, much larger failure the depth
+/// guard cannot reach in time to prevent: at a large enough element
+/// count, DROPPING the expanded tree overflows the native stack on its
+/// own (ordinary recursive `Drop` glue, since `Sexpr` has no custom
+/// iterative one) before or regardless of whatever `compile_expr` would
+/// have done with it (warden security review: confirmed crash at
+/// ~110,000+ elements). Comfortably below that threshold is all that
+/// actually matters here.
 const MAX_QUASIQUOTE_SEQUENCE_LEN: usize = 2_000;
 
 /// Threads the module being built and a counter for generating unique
