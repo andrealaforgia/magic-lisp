@@ -57,7 +57,18 @@ impl<'a> Scanner<'a> {
         self.chars.clone().collect()
     }
 
-    fn skip_atmosphere(&mut self) {
+    /// Skips whitespace and every comment form (spec 3.1): a `;` line
+    /// comment, a `#| ... |#` block comment (which NESTS -- a complete
+    /// `#| |#` fully inside an outer one is consumed as part of the
+    /// outer, not treated as ending it early), and a `#;` datum comment
+    /// (which discards exactly the one complete datum immediately
+    /// following it, via an ordinary recursive `read_form` call, as if
+    /// that datum had never been written).
+    ///
+    /// Fallible (unlike before B19): a `#|` that never finds its closing
+    /// `|#`, or a `#;` at the very end of input with no datum following
+    /// it to discard, are both read errors now, not silently accepted.
+    fn skip_atmosphere(&mut self) -> Result<(), ReadError> {
         loop {
             match self.chars.peek() {
                 Some(c) if c.is_whitespace() => {
@@ -70,7 +81,77 @@ impl<'a> Scanner<'a> {
                         }
                     }
                 }
+                Some('#') => {
+                    if !self.skip_hash_atmosphere()? {
+                        break;
+                    }
+                }
                 _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// The `#`-prefixed half of [`Self::skip_atmosphere`], split into its
+    /// own `#[inline(never)]` function so its extra local state (the
+    /// lookahead clone, the nested match) never inflates the stack frame
+    /// of the ordinary whitespace/`;`-comment path -- that path runs once
+    /// per level of `read_form`'s own list-nesting recursion, so growing
+    /// its frame size at all risks tipping an already precisely-
+    /// calibrated `MAX_NESTING_DEPTH` over into a real stack overflow
+    /// (confirmed: inlining this directly into `skip_atmosphere`
+    /// regressed `accepts_nesting_of_exactly_the_configured_maximum_depth`
+    /// from passing to a genuine native stack overflow, with no other
+    /// change to the recursion's own call count).
+    ///
+    /// Returns `true` if a comment was consumed (caller should keep
+    /// looping) and `false` if the `#` starts a real datum instead (`#t`,
+    /// `#x10`, `#(`, `#\a`, ...), left unconsumed for `read_form_body`'s
+    /// own dispatch to handle.
+    #[inline(never)]
+    fn skip_hash_atmosphere(&mut self) -> Result<bool, ReadError> {
+        let mut lookahead = self.chars.clone();
+        lookahead.next(); // '#'
+        match lookahead.peek() {
+            Some('|') => {
+                self.skip_block_comment()?;
+                Ok(true)
+            }
+            Some(';') => {
+                self.chars.next(); // '#'
+                self.chars.next(); // ';'
+                self.read_form()?
+                    .ok_or_else(|| err("expected a datum after '#;'"))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Consumes a `#| ... |#` block comment already confirmed to start at
+    /// the current position, tracking nesting depth with a plain counter
+    /// (not recursion, so no nesting-depth limit applies here the way it
+    /// does for datum structure -- a long CHAIN of nested markers costs no
+    /// native stack at all, just one loop iteration each).
+    fn skip_block_comment(&mut self) -> Result<(), ReadError> {
+        self.chars.next(); // '#'
+        self.chars.next(); // '|'
+        let mut depth = 1usize;
+        loop {
+            match self.chars.next() {
+                None => return Err(err("unterminated block comment: missing '|#'")),
+                Some('#') if self.chars.peek() == Some(&'|') => {
+                    self.chars.next();
+                    depth += 1;
+                }
+                Some('|') if self.chars.peek() == Some(&'#') => {
+                    self.chars.next();
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -106,7 +187,7 @@ impl<'a> Scanner<'a> {
     /// inside list-reading, so quote-shorthand nesting bypassed it entirely
     /// — a security-review finding on B2).
     fn read_form(&mut self) -> Result<Option<Sexpr>, ReadError> {
-        self.skip_atmosphere();
+        self.skip_atmosphere()?;
         if self.chars.peek().is_none() {
             return Ok(None);
         }
@@ -241,7 +322,7 @@ impl<'a> Scanner<'a> {
     fn read_vector_body(&mut self) -> Result<Sexpr, ReadError> {
         let mut items = Vec::new();
         loop {
-            self.skip_atmosphere();
+            self.skip_atmosphere()?;
             if let Some(')') = self.chars.peek() {
                 self.chars.next();
                 return Ok(Sexpr::Vector(items));
@@ -256,18 +337,18 @@ impl<'a> Scanner<'a> {
     fn read_list_body(&mut self) -> Result<Sexpr, ReadError> {
         let mut items = Vec::new();
         loop {
-            self.skip_atmosphere();
+            self.skip_atmosphere()?;
             if let Some(')') = self.chars.peek() {
                 self.chars.next();
                 return Ok(Sexpr::List(items));
             }
             if self.peek_is_lone_dot() {
                 self.chars.next(); // consume '.'
-                self.skip_atmosphere();
+                self.skip_atmosphere()?;
                 let tail = self
                     .read_form()?
                     .ok_or_else(|| err("expected a datum after '.' in a dotted list"))?;
-                self.skip_atmosphere();
+                self.skip_atmosphere()?;
                 return match self.chars.next() {
                     Some(')') => Ok(Sexpr::DottedList(items, Box::new(tail))),
                     _ => Err(err(
@@ -411,6 +492,34 @@ pub fn read_one(src: &str) -> Result<(Option<Sexpr>, String), ReadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `read_program` on a dedicated, fixed-size thread rather than
+    /// whatever thread the test harness happens to spawn a given test on
+    /// -- that harness default is neither controlled nor guaranteed by
+    /// this project (unlike the stack sizes deliberately chosen elsewhere
+    /// in this codebase, e.g. `COMPILE_STACK_SIZE`/`VM_STACK_SIZE`), so a
+    /// boundary-depth test pinned only to it is fragile against ordinary
+    /// codegen drift (B19: adding `#|`/`#;` support grew `read_form`'s own
+    /// recursive call chain just enough that several of these exact tests
+    /// started genuinely overflowing the stack under the harness's
+    /// previously-adequate default, with no change to their own logical
+    /// nesting depth). 8 MiB comfortably exceeds a typical OS process
+    /// main-thread stack (this reader has no dedicated big-stack thread
+    /// of its own in production either -- `cli.rs`'s `compile_source`
+    /// calls `read_program` directly, before `compile_program`'s own
+    /// dedicated thread ever starts), so this pins every boundary-depth
+    /// test to the same real-world budget production code actually runs
+    /// under, rather than an incidental, uncontrolled harness default.
+    fn read_program_on_a_fixed_stack(src: &str) -> Result<Vec<Sexpr>, ReadError> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, || read_program(src))
+                .expect("should spawn the fixed-size thread")
+                .join()
+                .expect("read_program itself must not crash the calling thread")
+        })
+    }
 
     #[test]
     fn reads_a_whole_number() {
@@ -558,6 +667,109 @@ mod tests {
                 Sexpr::Int(1),
             ])]
         );
+    }
+
+    // --- B19: block comments (#| |#, nesting) and the #; datum comment ---
+
+    #[test]
+    fn skips_a_single_block_comment() {
+        let src = "#| a block comment |# (display 1)";
+        assert_eq!(
+            read_program(src).unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("display".to_string()),
+                Sexpr::Int(1),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_block_comment_fully_containing_another_is_consumed_as_one_outer_comment() {
+        // The load-bearing nesting case: the inner `#| |#` must NOT end
+        // the outer one early -- if it did, " still outer |#" would be
+        // left as leftover (non-comment) source text and fail to read as
+        // a valid datum.
+        let src = "#| outer #| nested |# still outer |# (display 2)";
+        assert_eq!(
+            read_program(src).unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("display".to_string()),
+                Sexpr::Int(2),
+            ])]
+        );
+    }
+
+    #[test]
+    fn rejects_a_block_comment_missing_its_closing_marker() {
+        assert!(read_program("#| never closed (display 1)").is_err());
+    }
+
+    #[test]
+    fn a_bare_hash_inside_a_block_comment_not_followed_by_a_pipe_does_not_open_a_nested_comment() {
+        // A `#` on its own (not immediately followed by `|`) must not be
+        // mistaken for the start of a nested block comment -- otherwise
+        // the depth counter would over-count, and the comment would keep
+        // consuming source text (potentially past its own real closing
+        // marker) looking for an extra `|#` that was never opened.
+        let src = "#| a # b |# (display 1)";
+        assert_eq!(
+            read_program(src).unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("display".to_string()),
+                Sexpr::Int(1),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_bare_pipe_inside_a_block_comment_not_followed_by_a_hash_does_not_close_it_early() {
+        // Mirrors the bare-`#` case above: a `|` on its own (not
+        // immediately followed by `#`) must not be mistaken for a closing
+        // marker -- otherwise the comment would end early, right after
+        // the bare `|`, spilling the rest of the intended comment out as
+        // real source text.
+        let src = "#| a | b |# (display 2)";
+        assert_eq!(
+            read_program(src).unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("display".to_string()),
+                Sexpr::Int(2),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_datum_comment_removes_exactly_the_next_bare_datum() {
+        let src = "(+ 1 #;99 2)";
+        assert_eq!(
+            read_program(src).unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("+".to_string()),
+                Sexpr::Int(1),
+                Sexpr::Int(2),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_datum_comment_removes_one_whole_compound_datum_not_just_one_token() {
+        // Proves the marker discards an entire following datum regardless
+        // of how many tokens it spans -- a compound list, not just a bare
+        // atom -- rather than e.g. only swallowing the next single token.
+        let src = "(+ 1 #;(a b c) 2)";
+        assert_eq!(
+            read_program(src).unwrap(),
+            vec![Sexpr::List(vec![
+                Sexpr::Symbol("+".to_string()),
+                Sexpr::Int(1),
+                Sexpr::Int(2),
+            ])]
+        );
+    }
+
+    #[test]
+    fn rejects_a_datum_comment_with_no_datum_following_it() {
+        assert!(read_program("(display 1) #;").is_err());
     }
 
     #[test]
@@ -728,7 +940,7 @@ mod tests {
             "(".repeat(MAX_NESTING_DEPTH - 1),
             ")".repeat(MAX_NESTING_DEPTH - 1)
         );
-        assert!(read_program(&src).is_ok());
+        assert!(read_program_on_a_fixed_stack(&src).is_ok());
     }
 
     #[test]
@@ -741,7 +953,7 @@ mod tests {
             "(".repeat(MAX_NESTING_DEPTH + 1),
             ")".repeat(MAX_NESTING_DEPTH + 1)
         );
-        let err = read_program(&src).unwrap_err();
+        let err = read_program_on_a_fixed_stack(&src).unwrap_err();
         assert!(
             err.message.contains("nesting") && err.message.contains("depth"),
             "expected a nesting-depth error, got: {}",
@@ -856,7 +1068,7 @@ mod tests {
         // MAX_NESTING_DEPTH - 1, matching the analogous list-nesting boundary
         // test above (the trailing atom also consumes one unit of budget).
         let src = format!("{}x", "'".repeat(MAX_NESTING_DEPTH - 1));
-        assert!(read_program(&src).is_ok());
+        assert!(read_program_on_a_fixed_stack(&src).is_ok());
     }
 
     #[test]
@@ -867,7 +1079,7 @@ mod tests {
         // repeated quote characters could abort the process via native stack
         // overflow before this guard was consulted.
         let src = format!("{}x", "'".repeat(MAX_NESTING_DEPTH + 1));
-        let err = read_program(&src).unwrap_err();
+        let err = read_program_on_a_fixed_stack(&src).unwrap_err();
         assert!(
             err.message.contains("nesting") && err.message.contains("depth"),
             "expected a nesting-depth error, got: {}",
@@ -1091,7 +1303,7 @@ mod tests {
     #[test]
     fn quasiquote_shorthand_nesting_up_to_the_configured_maximum_still_succeeds() {
         let src = format!("{}x", "`".repeat(MAX_NESTING_DEPTH - 1));
-        assert!(read_program(&src).is_ok());
+        assert!(read_program_on_a_fixed_stack(&src).is_ok());
     }
 
     #[test]
@@ -1100,7 +1312,7 @@ mod tests {
         // and `,x` route through `self.read_form()`, the same depth-checked
         // entry point, not a bespoke unguarded recursion.
         let src = format!("{}x", "`".repeat(MAX_NESTING_DEPTH + 1));
-        let err = read_program(&src).unwrap_err();
+        let err = read_program_on_a_fixed_stack(&src).unwrap_err();
         assert!(
             err.message.contains("nesting") && err.message.contains("depth"),
             "expected a nesting-depth error, got: {}",
@@ -1115,7 +1327,7 @@ mod tests {
         // `,@` -- structurally identical in the code, but not directly
         // tested until now.
         let src = format!("{}x", ",".repeat(MAX_NESTING_DEPTH + 1));
-        let err = read_program(&src).unwrap_err();
+        let err = read_program_on_a_fixed_stack(&src).unwrap_err();
         assert!(
             err.message.contains("nesting") && err.message.contains("depth"),
             "expected a nesting-depth error, got: {}",
@@ -1126,7 +1338,7 @@ mod tests {
     #[test]
     fn unquote_splicing_shorthand_nesting_is_bounded_by_the_same_depth_limit_as_lists() {
         let src = format!("{}x", ",@".repeat(MAX_NESTING_DEPTH + 1));
-        let err = read_program(&src).unwrap_err();
+        let err = read_program_on_a_fixed_stack(&src).unwrap_err();
         assert!(
             err.message.contains("nesting") && err.message.contains("depth"),
             "expected a nesting-depth error, got: {}",
