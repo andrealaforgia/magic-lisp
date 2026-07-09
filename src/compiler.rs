@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Const, Module, Op};
 use crate::reader::Sexpr;
-use crate::vm::{eval_top_level_function, value_to_sexpr};
+use crate::vm::eval_top_level_function;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompileError {
@@ -87,6 +87,18 @@ fn too_many_macro_expansion_rounds() -> CompileError {
     ))
 }
 
+/// Shared by `sexpr_to_const_with_budget` here and
+/// `value_to_sexpr_at_depth` (vm.rs) -- both decrement the SAME cumulative
+/// `Compilation::macro_conversion_budget_remaining` counter and must report
+/// its exhaustion identically regardless of which conversion direction
+/// was spending it when the budget ran out.
+pub(crate) fn too_much_macro_conversion_work() -> CompileError {
+    err(format!(
+        "macro expansion exceeded the maximum supported conversion work ({}, across all macro expansion in this compilation) -- too much cumulative conversion cost across many expansions or call sites",
+        crate::vm::MAX_MACRO_CONVERSION_BUDGET
+    ))
+}
+
 /// Threads the module being built, a counter for generating unique internal
 /// names (see [`Ctx::aliases`]), and every `define-macro` seen so far
 /// (B14) — mapping a macro's name directly to the index of its already-
@@ -128,6 +140,21 @@ struct Compilation {
     /// reached 38 seconds of compile time this way despite no single
     /// round ever exceeding its own bound.
     macro_step_budget_remaining: usize,
+    /// The conversion-work budget remaining for ALL `value_to_sexpr`/
+    /// `sexpr_to_const` calls combined, across the whole `compile_program`
+    /// call -- threaded through `compile_macro_call` on every round
+    /// exactly like `macro_step_budget_remaining` above, for the same
+    /// reason. Warden security review msgs #292/#293: a native call like
+    /// `make-vector` costs the trampoline-step budget above essentially
+    /// nothing regardless of how many elements it allocates (it returns
+    /// directly from `call_native`, never re-entering the trampoline loop
+    /// that budget decrements), while still costing real, uncapped
+    /// conversion work every round -- a macro that re-expands into itself,
+    /// each round returning a fresh near-`MAX_MACRO_RESULT_ELEMENTS`-sized
+    /// value, paid that full per-round conversion cost every one of up to
+    /// `MAX_MACRO_EXPANSION_ROUNDS` rounds with nothing summing it, and
+    /// this compounds further across independent call sites in one file.
+    macro_conversion_budget_remaining: usize,
 }
 
 impl Compilation {
@@ -138,6 +165,7 @@ impl Compilation {
             macros: HashMap::new(),
             macro_gensym_counter: 0,
             macro_step_budget_remaining: crate::vm::MACRO_TRAMPOLINE_STEP_BUDGET,
+            macro_conversion_budget_remaining: crate::vm::MAX_MACRO_CONVERSION_BUDGET,
         }
     }
 
@@ -332,6 +360,32 @@ fn parse_formals(sexpr: &Sexpr) -> Result<Formals, CompileError> {
 }
 
 pub(crate) fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
+    // Deliberately unbounded (`usize::MAX`, not `MAX_MACRO_CONVERSION_BUDGET`):
+    // this plain entry point serves ordinary, non-cumulative callers
+    // (`quote`, `case` clause literals) whose cost is a single isolated
+    // conversion, not the repeated macro-expansion-round/call-site
+    // compounding that budget exists to cap -- warden security review msg
+    // #146 already established that even a legitimately huge literal
+    // (e.g. a million-element `quote`d list) must still succeed here.
+    let mut budget = usize::MAX;
+    sexpr_to_const_with_budget(sexpr, &mut budget)
+}
+
+/// Like [`sexpr_to_const`], but threads a conversion-work budget the
+/// caller controls the lifetime of -- used by `compile_macro_call` to pass
+/// `Compilation::macro_conversion_budget_remaining` so the same counter
+/// persists across every round and every macro call site in one
+/// `compile_program` call (mirroring `value_to_sexpr_with_budget`, vm.rs,
+/// for the identical reason), instead of each call getting its own fresh
+/// allowance the way the plain [`sexpr_to_const`] above does for ordinary,
+/// non-cumulative callers (`quote`, `case` clause literals).
+pub(crate) fn sexpr_to_const_with_budget(
+    sexpr: &Sexpr,
+    budget: &mut usize,
+) -> Result<Const, CompileError> {
+    *budget = budget
+        .checked_sub(1)
+        .ok_or_else(too_much_macro_conversion_work)?;
     Ok(match sexpr {
         Sexpr::Int(n) => Const::Int(*n),
         Sexpr::Float(n) => Const::Float(*n),
@@ -342,19 +396,22 @@ pub(crate) fn sexpr_to_const(sexpr: &Sexpr) -> Result<Const, CompileError> {
         Sexpr::List(items) => Const::List(
             items
                 .iter()
-                .map(sexpr_to_const)
+                .map(|item| sexpr_to_const_with_budget(item, budget))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Sexpr::Vector(items) => Const::Vector(
             items
                 .iter()
-                .map(sexpr_to_const)
+                .map(|item| sexpr_to_const_with_budget(item, budget))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Sexpr::DottedList(items, tail) => {
-            let mut acc = sexpr_to_const(tail)?;
+            let mut acc = sexpr_to_const_with_budget(tail, budget)?;
             for item in items.iter().rev() {
-                acc = Const::Pair(Box::new(sexpr_to_const(item)?), Box::new(acc));
+                acc = Const::Pair(
+                    Box::new(sexpr_to_const_with_budget(item, budget)?),
+                    Box::new(acc),
+                );
             }
             acc
         }
@@ -1049,7 +1106,10 @@ fn compile_macro_call(
             .expect("caller already confirmed this name is a registered macro");
         let args = operands
             .iter()
-            .map(|operand| sexpr_to_const(operand).map(|c| crate::vm::const_to_value(&c)))
+            .map(|operand| {
+                sexpr_to_const_with_budget(operand, &mut comp.macro_conversion_budget_remaining)
+                    .map(|c| crate::vm::const_to_value(&c))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let (result, updated_gensym_counter, updated_step_budget) = eval_top_level_function(
             &comp.module,
@@ -1061,7 +1121,10 @@ fn compile_macro_call(
         .map_err(|e| err(format!("error while expanding macro '{op}': {e}")))?;
         comp.macro_gensym_counter = updated_gensym_counter;
         comp.macro_step_budget_remaining = updated_step_budget;
-        let expanded = value_to_sexpr(&result)?;
+        let expanded = crate::vm::value_to_sexpr_with_budget(
+            &result,
+            &mut comp.macro_conversion_budget_remaining,
+        )?;
         if let Sexpr::List(next_items) = &expanded {
             if let Some(Sexpr::Symbol(next_op)) = next_items.first() {
                 if !is_shadowed_by_a_binding(next_op, ctx)? && comp.macros.contains_key(next_op) {

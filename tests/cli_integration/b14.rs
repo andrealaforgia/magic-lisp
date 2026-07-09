@@ -179,6 +179,37 @@ fn a_macro_re_expanding_across_many_rounds_cannot_multiply_its_step_budget_by_th
 }
 
 #[test]
+fn a_macro_re_expanding_across_many_rounds_cannot_multiply_its_conversion_cost_by_the_round_count()
+{
+    // Regression test for warden security review msgs #292/#293: unlike
+    // the trampoline-step budget above (which a bulk-allocating native
+    // like `make-vector` bypasses almost entirely, since it returns
+    // directly from `call_native` without re-entering the trampoline loop
+    // that budget decrements), the conversion cost of turning each round's
+    // returned near-`MAX_MACRO_RESULT_ELEMENTS`-sized value back into
+    // source code was NOT capped cumulatively -- a macro re-expanding
+    // hundreds of times, each round returning a fresh large vector, paid
+    // its full per-round conversion cost every round with nothing summing
+    // the total. Independently confirmed to complete in ~2s (previously
+    // capped at 0.56s under the old 100-round expansion limit) before this
+    // fix; must now fail cleanly and fast instead.
+    let file = write_source(
+        "b14-macro-cumulative-conversion-budget.ml",
+        "(define-macro (bomb n v) \
+           (if (= n 0) 42 (list (quote bomb) (- n 1) (make-vector 99999)))) \
+         (display (bomb 999 0))",
+    );
+    let output = run_with_stdin(&["eval", file.to_str().unwrap()], b"");
+    assert_eq!(
+        output.status.code(),
+        Some(SOURCE_ERROR),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
 fn a_macro_returning_a_self_referential_vector_fails_cleanly_not_a_crash() {
     // Regression test for qa test-design WARNING msg #259: `value_to_sexpr`
     // (converting a macro's returned data back into code) had cycle

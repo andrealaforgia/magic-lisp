@@ -253,6 +253,24 @@ pub(crate) fn const_to_value(c: &Const) -> Value {
 /// bounds compile-time cost, not expressible program behavior.
 const MAX_MACRO_RESULT_ELEMENTS: usize = 100_000;
 
+/// The total `value_to_sexpr`/`sexpr_to_const` conversion-work budget for
+/// ALL macro-expansion rounds and call sites combined within one
+/// `compile_program` call (`Compilation::macro_conversion_budget_remaining`,
+/// threaded through `compile_macro_call` exactly like
+/// `MACRO_TRAMPOLINE_STEP_BUDGET`, for the same reason -- see that
+/// constant's own doc comment). Warden security review msgs #292/#293:
+/// `MAX_MACRO_RESULT_ELEMENTS` alone only bounds a SINGLE conversion call's
+/// own cost; it does nothing to stop a macro that re-expands into itself
+/// many times, each round producing a fresh near-`MAX_MACRO_RESULT_ELEMENTS`-
+/// sized value, from paying that full conversion cost every round with
+/// nothing summing the total -- independently confirmed to turn a
+/// 115-byte source file into 2+ seconds of compile time once the round
+/// limit was raised to 1000, worse still across multiple call sites in
+/// one file. A shared node-visit counter decremented by every recursive
+/// step of either function closes this regardless of how many separate
+/// calls spend it or how high the round/call-site count goes.
+pub(crate) const MAX_MACRO_CONVERSION_BUDGET: usize = 1_000_000;
+
 /// The reverse of [`const_to_value`]/[`sexpr_to_const`]: turns a runtime
 /// [`Value`] back into the compile-time [`Sexpr`] it would need to be for
 /// `compile_expr` to treat it as code -- used by `define-macro`'s expansion
@@ -265,8 +283,34 @@ const MAX_MACRO_RESULT_ELEMENTS: usize = 100_000;
 /// have written literally, not a procedure or a mutable table, so
 /// returning one of these from a macro body is reported as a clear error
 /// rather than silently coerced into something misleading.
+///
+/// Test-only: the one production call site (`compile_macro_call`) needs
+/// the cumulative-budget-threading [`value_to_sexpr_with_budget`] instead,
+/// so this plain, fresh-budget-per-call wrapper only remains as this
+/// module's own direct-`Value`-conversion tests' convenience entry point.
+/// Deliberately unbounded (`usize::MAX`, not `MAX_MACRO_CONVERSION_BUDGET`)
+/// -- that budget exists to cap CUMULATIVE cost across many macro-
+/// expansion rounds/call sites, not a single isolated conversion, which
+/// already has its own independent bounds (`MAX_MACRO_RESULT_ELEMENTS`,
+/// `MAX_NESTING_DEPTH`).
+#[cfg(test)]
 pub(crate) fn value_to_sexpr(v: &Value) -> Result<Sexpr, crate::compiler::CompileError> {
-    value_to_sexpr_at_depth(v, 0)
+    let mut budget = usize::MAX;
+    value_to_sexpr_at_depth(v, 0, &mut budget)
+}
+
+/// Like [`value_to_sexpr`], but threads a conversion-work budget the
+/// caller controls the lifetime of -- used by `compile_macro_call` to pass
+/// `Compilation::macro_conversion_budget_remaining` so the same counter
+/// persists (and keeps decrementing) across every round and every macro
+/// call site in one `compile_program` call, instead of each call getting
+/// its own fresh allowance the way the plain [`value_to_sexpr`] above
+/// does for ordinary, non-cumulative callers (direct unit tests, chiefly).
+pub(crate) fn value_to_sexpr_with_budget(
+    v: &Value,
+    budget: &mut usize,
+) -> Result<Sexpr, crate::compiler::CompileError> {
+    value_to_sexpr_at_depth(v, 0, budget)
 }
 
 /// The depth bound below guards against two DISTINCT ways a macro's
@@ -291,6 +335,7 @@ pub(crate) fn value_to_sexpr(v: &Value) -> Result<Sexpr, crate::compiler::Compil
 fn value_to_sexpr_at_depth(
     v: &Value,
     depth: usize,
+    budget: &mut usize,
 ) -> Result<Sexpr, crate::compiler::CompileError> {
     let macro_err = |v: &Value| crate::compiler::CompileError {
         message: format!("macro expansion produced a value with no literal-code equivalent: {v}"),
@@ -308,6 +353,9 @@ fn value_to_sexpr_at_depth(
             ),
         });
     }
+    *budget = budget
+        .checked_sub(1)
+        .ok_or_else(crate::compiler::too_much_macro_conversion_work)?;
     match v {
         Value::Int(n) => Ok(Sexpr::Int(*n)),
         Value::Float(n) => Ok(Sexpr::Float(*n)),
@@ -328,7 +376,7 @@ fn value_to_sexpr_at_depth(
             Ok(Sexpr::List(
                 items
                     .iter()
-                    .map(|item| value_to_sexpr_at_depth(item, depth + 1))
+                    .map(|item| value_to_sexpr_at_depth(item, depth + 1, budget))
                     .collect::<Result<Vec<_>, _>>()?,
             ))
         }
@@ -340,7 +388,7 @@ fn value_to_sexpr_at_depth(
             Ok(Sexpr::Vector(
                 items
                     .iter()
-                    .map(|item| value_to_sexpr_at_depth(item, depth + 1))
+                    .map(|item| value_to_sexpr_at_depth(item, depth + 1, budget))
                     .collect::<Result<Vec<_>, _>>()?,
             ))
         }
@@ -387,7 +435,7 @@ fn value_to_sexpr_at_depth(
                         // nesting's own recursive `depth + 1` increments
                         // regardless of whether this one outer increment
                         // ever happened at all.
-                        items.push(value_to_sexpr_at_depth(&car, depth + 1)?);
+                        items.push(value_to_sexpr_at_depth(&car, depth + 1, budget)?);
                         if items.len() > MAX_MACRO_RESULT_ELEMENTS {
                             return Err(too_many_elements());
                         }
@@ -420,7 +468,7 @@ fn value_to_sexpr_at_depth(
                             // recursive `depth + 1` increments regardless
                             // of whether this particular outer increment
                             // happened at all.
-                            items.push(value_to_sexpr_at_depth(item, depth + 1)?);
+                            items.push(value_to_sexpr_at_depth(item, depth + 1, budget)?);
                             if items.len() > MAX_MACRO_RESULT_ELEMENTS {
                                 return Err(too_many_elements());
                             }
@@ -435,7 +483,7 @@ fn value_to_sexpr_at_depth(
                         // this `+ 1`, and is caught by its own recursive
                         // `depth + 1` increments regardless of whether
                         // this particular outer increment happened at all.
-                        let tail = value_to_sexpr_at_depth(&other, depth + 1)?;
+                        let tail = value_to_sexpr_at_depth(&other, depth + 1, budget)?;
                         return Ok(Sexpr::DottedList(items, Box::new(tail)));
                     }
                 }
