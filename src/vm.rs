@@ -718,6 +718,13 @@ pub fn run(module: &Module, out: &mut impl Write) -> Result<(), RuntimeError> {
     vm_result.and(flush_result)
 }
 
+/// How many bytes `run_with_stdin`'s relay loop asks for per read. Named
+/// (qa test-design review msg #243: tests that need to land a split
+/// exactly on a chunk boundary previously hard-coded this as a bare
+/// literal, invisible to drift if this value ever changed) so those tests
+/// reference the actual governing constant instead of a copy of its value.
+const RELAY_CHUNK_SIZE: usize = 8192;
+
 /// Like [`run`], but also makes `input` available to the `read`/`read-line`
 /// natives (spec 4.8), lazily: `input` (e.g. a locked stdin handle) isn't
 /// necessarily `Send`, so it can't be moved into the VM's own dedicated
@@ -762,7 +769,7 @@ pub fn run_with_stdin(
             // currently none), with no newline requirement -- see
             // `StdinChannel::next_chunk`'s doc comment for why that
             // requirement was a real bug, not just a design choice.
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; RELAY_CHUNK_SIZE];
             let chunk = match input.read(&mut buf) {
                 Ok(0) | Err(_) => None,
                 Ok(n) => Some(buf[..n].to_vec()),
@@ -5966,7 +5973,7 @@ mod tests {
         let accented_len = ACCENTED_LETTER.encode_utf8(&mut accented_bytes).len();
         assert_eq!(accented_len, 2, "fixture must be a 2-byte character");
 
-        let prefix_len = 8192 - 1; // leaves the character's 1st byte at offset 8191
+        let prefix_len = RELAY_CHUNK_SIZE - 1; // leaves the character's 1st byte at offset 8191
         let padding = "x".repeat(prefix_len - 1); // -1 for the opening quote
         let body = format!("{padding}{ACCENTED_LETTER}more text after the split");
         let stdin = format!("\"{body}\"");
@@ -6003,7 +6010,7 @@ mod tests {
         // SECOND chunk (offset 16383), so the split -- and the resulting
         // `Err` branch -- is only encountered once `fed_up_to` is already
         // nonzero.
-        let prefix_len = 2 * 8192 - 1;
+        let prefix_len = 2 * RELAY_CHUNK_SIZE - 1;
         let padding = "x".repeat(prefix_len - 1); // -1 for the opening quote
         let body = format!("{padding}{ACCENTED_LETTER}more text after the split");
         let stdin = format!("\"{body}\"");
@@ -6052,7 +6059,7 @@ mod tests {
         let accented_len = ACCENTED_LETTER.encode_utf8(&mut accented_bytes).len();
         assert_eq!(accented_len, 2, "fixture must be a 2-byte character");
 
-        let prefix_len = 8192;
+        let prefix_len = RELAY_CHUNK_SIZE;
         let padding = "x".repeat(prefix_len);
         let line = format!("{padding}{ACCENTED_LETTER}more text after the split");
         assert_eq!(
