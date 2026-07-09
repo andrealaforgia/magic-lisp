@@ -175,7 +175,14 @@ fn a_macro_re_expanding_across_many_rounds_cannot_multiply_its_step_budget_by_th
         "stderr: {}",
         stderr_of(&output)
     );
-    assert!(!stderr_of(&output).is_empty());
+    // qa test-design review msg #298: asserting only exit code + non-empty
+    // stderr would still pass if some OTHER unrelated guard fired first
+    // instead of this one -- assert the specific error this test targets.
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("maximum supported trampoline steps"),
+        "expected the cumulative step-budget guard's own error, got: {stderr}"
+    );
 }
 
 #[test]
@@ -206,7 +213,14 @@ fn a_macro_re_expanding_across_many_rounds_cannot_multiply_its_conversion_cost_b
         "stderr: {}",
         stderr_of(&output)
     );
-    assert!(!stderr_of(&output).is_empty());
+    // qa test-design review msg #298: asserting only exit code + non-empty
+    // stderr would still pass if some OTHER unrelated guard fired first
+    // instead of this one -- assert the specific error this test targets.
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("maximum supported conversion work"),
+        "expected the cumulative conversion-budget guard's own error, got: {stderr}"
+    );
 }
 
 #[test]
