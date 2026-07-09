@@ -3272,6 +3272,13 @@ mod tests {
         v
     }
 
+    /// Sized the same way this codebase's other dedicated-stack constants
+    /// (`COMPILE_STACK_SIZE`, `VM_STACK_SIZE`) are named rather than left
+    /// as inline magic numbers (qa test-design review msg #268) -- a
+    /// future increase to `MAX_NESTING_DEPTH` should have to touch this
+    /// value deliberately, not silently under-provision it.
+    const DEPTH_BOUNDARY_TEST_STACK_SIZE: usize = 64 * 1024 * 1024;
+
     /// Builds a `depth`-deep nested value AND runs `value_to_sexpr` on it,
     /// both entirely within one dedicated, generously-sized thread, rather
     /// than whatever stack the test harness happens to give this test's
@@ -3294,7 +3301,7 @@ mod tests {
     ) -> Result<Sexpr, crate::compiler::CompileError> {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
-                .stack_size(64 * 1024 * 1024)
+                .stack_size(DEPTH_BOUNDARY_TEST_STACK_SIZE)
                 .spawn_scoped(scope, move || {
                     value_to_sexpr(&nested_single_element_list_value(depth))
                 })
