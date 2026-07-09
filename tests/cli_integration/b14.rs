@@ -1,6 +1,6 @@
 //! B14: procedural macros (`define-macro`) and `gensym`.
 
-use super::helpers::{eval_ok, run, run_demo, stderr_of, write_source};
+use super::helpers::{eval_ok, run, run_demo, run_with_stdin, stderr_of, write_source};
 use magiclisp::exitcode::SOURCE_ERROR;
 
 #[test]
@@ -76,6 +76,34 @@ fn b14_e3_a_macro_that_always_expands_into_another_macro_call_fails_cleanly_not_
 }
 
 #[test]
+fn a_macro_body_containing_a_genuine_infinite_tail_recursive_loop_fails_cleanly_not_a_hang() {
+    // Regression test for warden security review msg #260 (Critical):
+    // unlike the round-limited macro-EXPANSION chain above (each round is
+    // a fresh, bounded compile_expr call), this loop lives entirely
+    // WITHIN one macro invocation's own execution, run via the same
+    // tail-call trampoline an ordinary program uses -- so it never trips
+    // MAX_CALL_DEPTH, and nothing else bounded it before this fix. Uses
+    // `run_with_stdin` (not the plain `run` helper) specifically because
+    // it enforces a real timeout+kill instead of blocking the whole test
+    // suite indefinitely if this regresses.
+    let file = write_source(
+        "b14-macro-body-infinite-loop.ml",
+        "(define-macro (evil) \
+           (letrec ((loop (lambda () (loop)))) \
+             (loop))) \
+         (evil)",
+    );
+    let output = run_with_stdin(&["eval", file.to_str().unwrap()], b"");
+    assert_eq!(
+        output.status.code(),
+        Some(SOURCE_ERROR),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
 fn a_macro_returning_a_self_referential_vector_fails_cleanly_not_a_crash() {
     // Regression test for qa test-design WARNING msg #259: `value_to_sexpr`
     // (converting a macro's returned data back into code) had cycle
@@ -108,6 +136,26 @@ fn a_macro_returning_a_deeply_nested_non_cyclic_value_fails_cleanly_not_a_crash(
            (let loop ((n 1000) (acc 1)) \
              (if (= n 0) acc (loop (- n 1) (list acc))))) \
          (deep)",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SOURCE_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
+fn a_macro_returning_an_excessively_large_flat_list_fails_cleanly_not_a_disproportionate_cost() {
+    // Regression test for qa/warden msg #260: unlike quasiquote templates
+    // or `make-vector`, nothing bounded how large a FLAT (not deep --
+    // `deep` above targets nesting specifically) list/vector a macro
+    // could build via ordinary recursive `cons` and return, letting a
+    // tiny source file force disproportionate compile-time cost purely by
+    // choosing a large numeric literal.
+    let file = write_source(
+        "b14-oversized-flat-macro-result.ml",
+        "(define-macro (huge) \
+           (let loop ((n 200000) (acc (quote ()))) \
+             (if (= n 0) (cons (quote quote) (cons acc (quote ()))) (loop (- n 1) (cons n acc))))) \
+         (huge)",
     );
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(SOURCE_ERROR));

@@ -211,6 +211,21 @@ pub(crate) fn const_to_value(c: &Const) -> Value {
     }
 }
 
+/// Caps how many elements a single flat list/vector `value_to_sexpr` will
+/// convert -- unlike quasiquote templates (`compiler::
+/// MAX_QUASIQUOTE_SEQUENCE_LEN`, 2,000, bounding SOURCE TEXT written by
+/// a person) or `make-vector` (`MAX_VECTOR_LENGTH`, 10,000,000, a single
+/// allocation at ordinary program RUNTIME), nothing bounded how large a
+/// flat structure a macro body could build via ordinary recursive `cons`
+/// and return as its compile-time expansion result (warden security
+/// review msg #260: confirmed a macro building a multi-million-element
+/// list from a source file well under 200 bytes disproportionately costs
+/// real compile-time seconds and hundreds of MB, purely by choosing a
+/// large numeric literal). Generous for anything a macro is actually
+/// generating CODE for -- this bounds compile-time cost, not expressible
+/// program behavior.
+const MAX_MACRO_RESULT_ELEMENTS: usize = 100_000;
+
 /// The reverse of [`const_to_value`]/[`sexpr_to_const`]: turns a runtime
 /// [`Value`] back into the compile-time [`Sexpr`] it would need to be for
 /// `compile_expr` to treat it as code -- used by `define-macro`'s expansion
@@ -253,6 +268,11 @@ fn value_to_sexpr_at_depth(
     let macro_err = |v: &Value| crate::compiler::CompileError {
         message: format!("macro expansion produced a value with no literal-code equivalent: {v}"),
     };
+    let too_many_elements = || crate::compiler::CompileError {
+        message: format!(
+            "macro expansion result has more than {MAX_MACRO_RESULT_ELEMENTS} elements in a single flat list/vector"
+        ),
+    };
     if depth > crate::compiler::MAX_NESTING_DEPTH {
         return Err(crate::compiler::CompileError {
             message: format!(
@@ -268,19 +288,35 @@ fn value_to_sexpr_at_depth(
         Value::Char(c) => Ok(Sexpr::Char(*c)),
         Value::Str(s) => Ok(Sexpr::Str((**s).clone())),
         Value::Symbol(s) => Ok(Sexpr::Symbol(s.clone())),
-        Value::List(items) => Ok(Sexpr::List(
-            items
-                .iter()
-                .map(|item| value_to_sexpr_at_depth(item, depth + 1))
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        Value::Vector(items) => Ok(Sexpr::Vector(
-            items
-                .borrow()
-                .iter()
-                .map(|item| value_to_sexpr_at_depth(item, depth + 1))
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
+        Value::List(items) => {
+            // Checked BEFORE converting a single element, matching
+            // `expand_qq_sequence`'s own `MAX_QUASIQUOTE_SEQUENCE_LEN`
+            // check (compiler.rs) -- the length is already known up
+            // front for this variant, unlike the `Pair`-chain walk below,
+            // so there's no reason to pay for converting any elements at
+            // all once it's already too large.
+            if items.len() > MAX_MACRO_RESULT_ELEMENTS {
+                return Err(too_many_elements());
+            }
+            Ok(Sexpr::List(
+                items
+                    .iter()
+                    .map(|item| value_to_sexpr_at_depth(item, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        Value::Vector(items) => {
+            let items = items.borrow();
+            if items.len() > MAX_MACRO_RESULT_ELEMENTS {
+                return Err(too_many_elements());
+            }
+            Ok(Sexpr::Vector(
+                items
+                    .iter()
+                    .map(|item| value_to_sexpr_at_depth(item, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
         Value::Pair(cell) => {
             // Iterative, cycle-detecting cdr walk -- mirrors
             // `fmt_pair_chain`'s own (value.rs) and `list_to_vec`'s own
@@ -309,6 +345,9 @@ fn value_to_sexpr_at_depth(
                             (borrowed.0.clone(), borrowed.1.clone())
                         };
                         items.push(value_to_sexpr_at_depth(&car, depth + 1)?);
+                        if items.len() > MAX_MACRO_RESULT_ELEMENTS {
+                            return Err(too_many_elements());
+                        }
                         current = cdr;
                     }
                     Value::List(ref tail_items) if tail_items.is_empty() => {
@@ -327,6 +366,9 @@ fn value_to_sexpr_at_depth(
                     Value::List(tail_items) => {
                         for item in tail_items.iter() {
                             items.push(value_to_sexpr_at_depth(item, depth + 1)?);
+                            if items.len() > MAX_MACRO_RESULT_ELEMENTS {
+                                return Err(too_many_elements());
+                            }
                         }
                         return Ok(Sexpr::List(items));
                     }
@@ -426,11 +468,48 @@ struct Vm<'m> {
     /// itself can ever produce from source text (`Scanner::is_delimiter`
     /// stops a symbol's token at the first whitespace) -- so no ordinary,
     /// plausible-looking source-written symbol (`'g1`, `'gensym`, anything
-    /// else typeable) can ever collide with a generated one, and two
-    /// different calls never collide with each other since the counter
-    /// only advances.
+    /// else typeable) can ever collide with a generated one.
+    ///
+    /// Two calls WITHIN one running `Vm` never collide with each other,
+    /// since the counter only advances -- but this field alone can't make
+    /// that true across separate `eval_top_level_function` invocations,
+    /// each of which constructs its OWN fresh `Vm`: `compile_macro_call`
+    /// (compiler.rs) is responsible for threading a compilation-wide
+    /// counter value in and back out across every macro invocation in one
+    /// `compile_program` call (warden security review msg #260: a
+    /// counter reset to 0 on every separate invocation reproduced `gensym`
+    /// silently returning the identical symbol from unrelated macro calls
+    /// -- a real, silent variable-capture risk, not merely cosmetic).
     gensym_counter: u64,
+    /// `Some(n)` only for a `Vm` created to run one `define-macro` body
+    /// during compilation (`eval_top_level_function`); always `None` for
+    /// the ordinary program-execution `Vm`s `run`/`run_with_stdin`
+    /// construct, where nothing should ever cap how long a legitimately
+    /// long-running tail-recursive loop may run (an existing test,
+    /// `a_self_tail_recursive_loop_runs_far_beyond_max_call_depth_without_
+    /// error`, locks in that guarantee for ordinary execution).
+    ///
+    /// Decremented once per trampoline hop in `exec`'s outer loop (warden
+    /// security review msg #260, Critical): a macro body that tail-loops
+    /// forever (e.g. `(letrec ((loop (lambda () (loop)))) (loop))`) runs
+    /// in O(1) stack via the same trampoline ordinary tail calls use, so
+    /// `MAX_CALL_DEPTH` never fires for it either -- nothing bounded it at
+    /// all before this, hanging the COMPILER itself (not the eventually-
+    /// run program) indefinitely on an ordinary-looking, tiny source file.
+    /// Distinct from `exec`'s own per-chunk-pass `remaining_steps`: that
+    /// one is deliberately rearmed on every trampoline hop (guards against
+    /// a broken operand-advance within a single pass, not against many
+    /// legitimate hops), so it can never catch this.
+    macro_step_budget: Option<usize>,
 }
+
+/// How many trampoline hops one `define-macro` body invocation may run
+/// before compilation gives up on it -- generous for any macro actually
+/// generating code (which does a small, fixed amount of work over its
+/// operands), while still turning a genuine infinite tail loop into a
+/// fast, clean compile error instead of a hang with no way to recover
+/// short of killing the process externally.
+const MACRO_TRAMPOLINE_STEP_BUDGET: usize = 1_000_000;
 
 /// A lazy, on-demand relay to the real stdin reader living on the thread
 /// that called [`run_with_stdin`], used because that reader (e.g. a locked
@@ -530,6 +609,23 @@ impl<'m> Vm<'m> {
         // again, so a chain of tail calls of any length reuses this single
         // native stack frame — the whole point of tail-call optimization.
         'trampoline: loop {
+            // Distinct from `remaining_steps` below (which is deliberately
+            // rearmed every hop, guarding a single pass against a broken
+            // operand-advance): this counts hops THEMSELVES, and only when
+            // running a `define-macro` body during compilation (see
+            // `macro_step_budget`'s own doc comment) -- a genuine infinite
+            // tail-recursive loop runs in O(1) stack via this exact
+            // trampoline, so it never trips `MAX_CALL_DEPTH` either, and
+            // nothing else would ever stop it (warden security review msg
+            // #260, Critical).
+            if let Some(remaining_hops) = self.macro_step_budget {
+                if remaining_hops == 0 {
+                    return Err(error(format!(
+                        "macro body exceeded the maximum supported trampoline steps ({MACRO_TRAMPOLINE_STEP_BUDGET}) -- possible infinite loop in a macro's own code"
+                    )));
+                }
+                self.macro_step_budget = Some(remaining_hops - 1);
+            }
             let mut stack: Vec<Value> = Vec::new();
             let code = &chunk.code;
             let mut ip = 0usize;
@@ -815,21 +911,24 @@ pub(crate) fn eval_top_level_function(
     module: &Module,
     fn_index: u32,
     args: Vec<Value>,
-) -> Result<Value, RuntimeError> {
+    gensym_counter: u64,
+) -> Result<(Value, u64), RuntimeError> {
     let mut vm = Vm {
         module,
         globals: default_globals(),
         call_depth: 0,
         stdin_buffer: Vec::new(),
         stdin_channel: StdinChannel::none(),
-        gensym_counter: 0,
+        gensym_counter,
+        macro_step_budget: Some(MACRO_TRAMPOLINE_STEP_BUDGET),
     };
     let env = Rc::new(Env {
         locals: Vec::new(),
         parent: None,
     });
     let mut sink = std::io::sink();
-    vm.call_value(&Value::Closure(fn_index, env), args, &mut sink)
+    let result = vm.call_value(&Value::Closure(fn_index, env), args, &mut sink)?;
+    Ok((result, vm.gensym_counter))
 }
 
 fn bind_arguments(
@@ -998,6 +1097,7 @@ fn run_on_this_thread(
         stdin_buffer: Vec::new(),
         stdin_channel,
         gensym_counter: 0,
+        macro_step_budget: None,
     };
     let entry = module
         .functions
@@ -2938,7 +3038,7 @@ mod tests {
         let forms = read_program("(define (double x) (* x 2))").unwrap();
         let module = compile_program(&forms).unwrap();
         assert_eq!(module.entry_index, 1);
-        let result = eval_top_level_function(&module, 0, vec![Value::Int(21)]).unwrap();
+        let (result, _) = eval_top_level_function(&module, 0, vec![Value::Int(21)], 0).unwrap();
         assert_eq!(result, Value::Int(42));
     }
 
@@ -2946,7 +3046,7 @@ mod tests {
     fn eval_top_level_function_can_call_native_procedures() {
         let forms = read_program("(define (f) (gensym))").unwrap();
         let module = compile_program(&forms).unwrap();
-        let result = eval_top_level_function(&module, 0, vec![]).unwrap();
+        let (result, _) = eval_top_level_function(&module, 0, vec![], 0).unwrap();
         assert!(matches!(result, Value::Symbol(_)));
     }
 
@@ -2954,8 +3054,8 @@ mod tests {
     fn eval_top_level_function_binds_a_rest_parameter_as_a_list() {
         let forms = read_program("(define (f . rest) rest)").unwrap();
         let module = compile_program(&forms).unwrap();
-        let result =
-            eval_top_level_function(&module, 0, vec![Value::Int(1), Value::Int(2)]).unwrap();
+        let (result, _) =
+            eval_top_level_function(&module, 0, vec![Value::Int(1), Value::Int(2)], 0).unwrap();
         assert_eq!(result, Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)])));
     }
 
@@ -2963,7 +3063,38 @@ mod tests {
     fn eval_top_level_function_reports_a_wrong_argument_count_as_a_clean_error() {
         let forms = read_program("(define (f x y) x)").unwrap();
         let module = compile_program(&forms).unwrap();
-        assert!(eval_top_level_function(&module, 0, vec![Value::Int(1)]).is_err());
+        assert!(eval_top_level_function(&module, 0, vec![Value::Int(1)], 0).is_err());
+    }
+
+    #[test]
+    fn eval_top_level_function_starts_gensym_from_the_passed_in_counter_and_returns_it_updated() {
+        // Regression test for warden security review msg #260: gensym's
+        // counter must be threaded IN and back OUT across separate
+        // invocations, not reset to 0 every time -- otherwise two
+        // unrelated macro calls within the same compilation silently
+        // produce the identical "unique" symbol.
+        let forms = read_program("(define (f) (gensym))").unwrap();
+        let module = compile_program(&forms).unwrap();
+        let (first, counter_after_first) = eval_top_level_function(&module, 0, vec![], 0).unwrap();
+        assert_eq!(first, Value::Symbol("gensym 1".to_string()));
+        let (second, counter_after_second) =
+            eval_top_level_function(&module, 0, vec![], counter_after_first).unwrap();
+        assert_eq!(second, Value::Symbol("gensym 2".to_string()));
+        assert_eq!(counter_after_second, 2);
+    }
+
+    #[test]
+    fn eval_top_level_function_fails_cleanly_not_a_hang_on_a_macro_body_that_tail_loops_forever() {
+        // Regression test for warden security review msg #260 (Critical):
+        // a genuine infinite tail-recursive loop runs in O(1) stack via
+        // the same trampoline any other tail call uses, so MAX_CALL_DEPTH
+        // never fires for it -- nothing else bounded it before this fix,
+        // hanging the COMPILER itself (not the eventually-run program)
+        // indefinitely.
+        let forms = read_program("(define (f) (letrec ((loop (lambda () (loop)))) (loop)))")
+            .unwrap();
+        let module = compile_program(&forms).unwrap();
+        assert!(eval_top_level_function(&module, 0, vec![], 0).is_err());
     }
 
     #[test]
@@ -3378,6 +3509,7 @@ mod tests {
                         stdin_buffer: Vec::new(),
                         stdin_channel: StdinChannel::none(),
                         gensym_counter: 0,
+                        macro_step_budget: None,
                     };
                     let mut out = Vec::new();
                     let entry = &module.functions[module.entry_index as usize];
@@ -4859,6 +4991,7 @@ mod tests {
             stdin_buffer: Vec::new(),
             stdin_channel: StdinChannel::none(),
             gensym_counter: 0,
+            macro_step_budget: None,
         };
         let mut out = Vec::new();
         let entry = &module.functions[module.entry_index as usize];

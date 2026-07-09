@@ -103,6 +103,18 @@ struct Compilation {
     module: Module,
     gensym_counter: u32,
     macros: HashMap<String, u32>,
+    /// The runtime `gensym` native's own counter (B14), persisted here and
+    /// threaded through every `eval_top_level_function` call in
+    /// `compile_macro_call` -- distinct from `gensym_counter` above (this
+    /// struct's own compiler-internal hygiene-alias counter, an unrelated
+    /// mechanism with a different naming scheme). Warden security review
+    /// msg #260: without this, each macro invocation got its OWN fresh
+    /// `Vm` with its `gensym` counter reset to 0, so `(gensym)` silently
+    /// returned the identical symbol from separate macro calls within the
+    /// same compilation -- a real, silent variable-capture risk for any
+    /// macro (like this feature's own `swap` demo) that relies on
+    /// `gensym` for hygiene.
+    macro_gensym_counter: u64,
 }
 
 impl Compilation {
@@ -111,6 +123,7 @@ impl Compilation {
             module: Module::default(),
             gensym_counter: 0,
             macros: HashMap::new(),
+            macro_gensym_counter: 0,
         }
     }
 
@@ -1024,8 +1037,10 @@ fn compile_macro_call(
             .iter()
             .map(|operand| sexpr_to_const(operand).map(|c| crate::vm::const_to_value(&c)))
             .collect::<Result<Vec<_>, _>>()?;
-        let result = eval_top_level_function(&comp.module, fn_index, args)
-            .map_err(|e| err(format!("error while expanding macro '{op}': {e}")))?;
+        let (result, updated_gensym_counter) =
+            eval_top_level_function(&comp.module, fn_index, args, comp.macro_gensym_counter)
+                .map_err(|e| err(format!("error while expanding macro '{op}': {e}")))?;
+        comp.macro_gensym_counter = updated_gensym_counter;
         let expanded = value_to_sexpr(&result)?;
         if let Sexpr::List(next_items) = &expanded {
             if let Some(Sexpr::Symbol(next_op)) = next_items.first() {
