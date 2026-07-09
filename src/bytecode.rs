@@ -230,6 +230,12 @@ pub enum BytecodeError {
     UnsupportedVersion { major: u8, minor: u8 },
     Truncated,
     OutOfRange(String),
+    /// The reserved flags field (B18) is non-zero: this decoder defines no
+    /// flag bits at all, so any set bit means either a foreign/future
+    /// producer or a corrupted file -- neither is safe to silently ignore
+    /// and proceed with, unlike a container format that reserves specific
+    /// bits for genuinely optional, safely-ignorable extensions.
+    UnsupportedFlags(u16),
 }
 
 impl std::fmt::Display for BytecodeError {
@@ -242,6 +248,9 @@ impl std::fmt::Display for BytecodeError {
             BytecodeError::Truncated => write!(f, "MLBC file is truncated or corrupted"),
             BytecodeError::OutOfRange(what) => {
                 write!(f, "MLBC file has an invalid pointer: {what}")
+            }
+            BytecodeError::UnsupportedFlags(flags) => {
+                write!(f, "MLBC file sets unsupported flags: {flags:#06x}")
             }
         }
     }
@@ -472,7 +481,10 @@ pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
     if major != VERSION_MAJOR || minor != VERSION_MINOR {
         return Err(BytecodeError::UnsupportedVersion { major, minor });
     }
-    let _flags = r.u16()?;
+    let flags = r.u16()?;
+    if flags != 0 {
+        return Err(BytecodeError::UnsupportedFlags(flags));
+    }
     let entry_index = r.u32()?;
     let fn_count = r.u32()?;
 
@@ -763,6 +775,27 @@ mod tests {
             BytecodeError::OutOfRange("entry_index 5".to_string()).to_string(),
             "MLBC file has an invalid pointer: entry_index 5"
         );
+        assert_eq!(
+            BytecodeError::UnsupportedFlags(1).to_string(),
+            "MLBC file sets unsupported flags: 0x0001"
+        );
+    }
+
+    #[test]
+    fn rejects_a_nonzero_reserved_flags_field() {
+        // B18 E2: this decoder defines no flag bits, so any set bit must be
+        // rejected rather than silently ignored -- before this, the flags
+        // field was read and discarded unconditionally.
+        let mut bytes = encode(&sample_module());
+        bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(decode(&bytes), Err(BytecodeError::UnsupportedFlags(1)));
+    }
+
+    #[test]
+    fn accepts_an_all_zero_reserved_flags_field() {
+        // The ordinary, current-encoder-produced case must still decode.
+        let bytes = encode(&sample_module());
+        assert!(decode(&bytes).is_ok());
     }
 
     fn nested_list_const(depth: usize) -> Const {
