@@ -28,7 +28,18 @@ fn err(message: impl Into<String>) -> CompileError {
 /// Caps expression-nesting depth so a pathologically deep (but structurally
 /// valid) expression tree fails cleanly instead of risking a native stack
 /// overflow while compiling.
-const MAX_NESTING_DEPTH: usize = 512;
+///
+/// `pub(crate)`, not private: `vm::value_to_sexpr` (B14 macro expansion)
+/// reuses this exact bound rather than an independently-chosen one, since
+/// a macro's expansion result exceeding it would be rejected by THIS
+/// module's own `compile_expr` guard anyway once compiled -- failing at
+/// the same threshold while still just converting the data, before ever
+/// reaching that point, turns what would otherwise be a native stack
+/// overflow (qa test-design WARNING, msg #259: confirmed crashing on a
+/// sufficiently deep, non-cyclic macro-returned value, since
+/// `value_to_sexpr`'s own recursion had no bound of its own to catch it
+/// first) into the same clean, already-expected kind of error.
+pub(crate) const MAX_NESTING_DEPTH: usize = 512;
 
 fn too_deep() -> CompileError {
     err(format!(

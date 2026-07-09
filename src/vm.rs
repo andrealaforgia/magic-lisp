@@ -224,9 +224,43 @@ pub(crate) fn const_to_value(c: &Const) -> Value {
 /// returning one of these from a macro body is reported as a clear error
 /// rather than silently coerced into something misleading.
 pub(crate) fn value_to_sexpr(v: &Value) -> Result<Sexpr, crate::compiler::CompileError> {
+    value_to_sexpr_at_depth(v, 0)
+}
+
+/// The depth bound below guards against two DISTINCT ways a macro's
+/// returned value could otherwise crash the compiling thread instead of
+/// failing cleanly (qa test-design WARNING, msg #259, both independently
+/// reproduced): a `Vector` containing itself (via `vector-set!`, e.g. `(let
+/// ((v (vector 1 2))) (vector-set! v 0 v) v)`) recurses back into this
+/// exact function on the exact same `Vector` forever -- unlike the `Pair`
+/// arm below, nothing here was tracking "already visiting this address" at
+/// all -- and a value nested merely very deep but NOT cyclic (e.g. built
+/// by a loop inside a macro body, millions of levels) was never bounded by
+/// anything either, since `compile_expr`'s own `MAX_NESTING_DEPTH` guard
+/// only ever gets a chance to run on the tree this function already
+/// finished building -- too late if building it is itself what crashes.
+/// One counter bounds both failure shapes at once: a self-referential
+/// value just keeps "descending" into the same object rather than reaching
+/// a base case, so it hits this same limit almost immediately, the same
+/// way genuine deep-but-finite nesting does at a larger count.
+///
+/// Reuses `compiler::MAX_NESTING_DEPTH` itself rather than an
+/// independently-chosen bound -- see that constant's own doc comment.
+fn value_to_sexpr_at_depth(
+    v: &Value,
+    depth: usize,
+) -> Result<Sexpr, crate::compiler::CompileError> {
     let macro_err = |v: &Value| crate::compiler::CompileError {
         message: format!("macro expansion produced a value with no literal-code equivalent: {v}"),
     };
+    if depth > crate::compiler::MAX_NESTING_DEPTH {
+        return Err(crate::compiler::CompileError {
+            message: format!(
+                "macro expansion result nesting exceeds the maximum supported depth ({})",
+                crate::compiler::MAX_NESTING_DEPTH
+            ),
+        });
+    }
     match v {
         Value::Int(n) => Ok(Sexpr::Int(*n)),
         Value::Float(n) => Ok(Sexpr::Float(*n)),
@@ -235,13 +269,16 @@ pub(crate) fn value_to_sexpr(v: &Value) -> Result<Sexpr, crate::compiler::Compil
         Value::Str(s) => Ok(Sexpr::Str((**s).clone())),
         Value::Symbol(s) => Ok(Sexpr::Symbol(s.clone())),
         Value::List(items) => Ok(Sexpr::List(
-            items.iter().map(value_to_sexpr).collect::<Result<Vec<_>, _>>()?,
+            items
+                .iter()
+                .map(|item| value_to_sexpr_at_depth(item, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?,
         )),
         Value::Vector(items) => Ok(Sexpr::Vector(
             items
                 .borrow()
                 .iter()
-                .map(value_to_sexpr)
+                .map(|item| value_to_sexpr_at_depth(item, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         Value::Pair(cell) => {
@@ -252,7 +289,12 @@ pub(crate) fn value_to_sexpr(v: &Value) -> Result<Sexpr, crate::compiler::Compil
             // arbitrarily long (recursing here once per element would
             // crash the compiling thread on an ordinary large macro
             // result), and can be circular via `set-cdr!` (which must
-            // become a clean error here too, not an infinite loop).
+            // become a clean error here too, not an infinite loop). This
+            // is INDEPENDENT of the depth bound above: that bound catches
+            // deep/cyclic CAR values (this chain's own elements), while
+            // this loop's own `seen` set catches a cyclic CDR spine, which
+            // a per-element depth counter would never even reach (walking
+            // the spine itself is a plain loop here, not recursion).
             let mut items = Vec::new();
             let mut current = Value::Pair(cell.clone());
             let mut seen = HashSet::new();
@@ -266,14 +308,14 @@ pub(crate) fn value_to_sexpr(v: &Value) -> Result<Sexpr, crate::compiler::Compil
                             let borrowed = cell.borrow();
                             (borrowed.0.clone(), borrowed.1.clone())
                         };
-                        items.push(value_to_sexpr(&car)?);
+                        items.push(value_to_sexpr_at_depth(&car, depth + 1)?);
                         current = cdr;
                     }
                     Value::List(ref tail_items) if tail_items.is_empty() => {
                         return Ok(Sexpr::List(items));
                     }
                     other => {
-                        let tail = value_to_sexpr(&other)?;
+                        let tail = value_to_sexpr_at_depth(&other, depth + 1)?;
                         return Ok(Sexpr::DottedList(items, Box::new(tail)));
                     }
                 }

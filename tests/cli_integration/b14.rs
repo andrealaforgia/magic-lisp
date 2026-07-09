@@ -76,6 +76,45 @@ fn b14_e3_a_macro_that_always_expands_into_another_macro_call_fails_cleanly_not_
 }
 
 #[test]
+fn a_macro_returning_a_self_referential_vector_fails_cleanly_not_a_crash() {
+    // Regression test for qa test-design WARNING msg #259: `value_to_sexpr`
+    // (converting a macro's returned data back into code) had cycle
+    // detection for a self-referential `Pair` chain but not for a
+    // self-referential `Vector` (`vector-set!`ing one of its own elements
+    // back to itself) -- confirmed to crash the compiling process outright
+    // before the fix.
+    let file = write_source(
+        "b14-vector-cycle.ml",
+        "(define-macro (bad) \
+           (let ((v (vector 1 2))) (vector-set! v 0 v) v)) \
+         (bad)",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SOURCE_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
+fn a_macro_returning_a_deeply_nested_non_cyclic_value_fails_cleanly_not_a_crash() {
+    // Regression test for qa test-design WARNING msg #259: a macro
+    // returning a value nested (not cyclic) far deeper than
+    // `MAX_NESTING_DEPTH` crashed the compiling process outright before
+    // the fix -- `value_to_sexpr` had no depth bound of its own, and
+    // `compile_expr`'s own downstream guard on the fully-converted tree
+    // never got a chance to run if converting it was itself what crashed.
+    let file = write_source(
+        "b14-deeply-nested-macro-result.ml",
+        "(define-macro (deep) \
+           (let loop ((n 1000) (acc 1)) \
+             (if (= n 0) acc (loop (- n 1) (list acc))))) \
+         (deep)",
+    );
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SOURCE_ERROR));
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
 fn b14_e4_gensym_produces_a_symbol_distinct_from_every_other_symbol() {
     assert_eq!(
         eval_ok("b14-e4a.ml", "(display (eq? (gensym) (gensym)))"),
