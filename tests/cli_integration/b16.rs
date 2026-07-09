@@ -73,15 +73,28 @@ fn b16_e3_instructions_carry_a_numeric_offset_mnemonic_and_operands() {
     assert!(listing.contains("CALL"), "{listing}");
     assert!(listing.contains("POP"), "{listing}");
     assert!(listing.contains("HALT"), "{listing}");
-    // Every instruction line (the "code:" section) carries a numeric
-    // offset -- a hex-formatted line-start on every actual instruction
-    // line, none missing.
-    let code_lines: Vec<&str> = listing
-        .lines()
-        .skip_while(|l| l.trim() != "code:")
-        .skip(1)
-        .take_while(|l| !l.starts_with("=="))
-        .collect();
+    // Every instruction line in EVERY function's "code:" section carries a
+    // numeric offset -- a hex-formatted line-start on every actual
+    // instruction line, none missing. Tracked via a small state machine
+    // across the whole multi-function dump (qa test-design review msg
+    // #322: a `skip_while`/`take_while` pair anchored on the FIRST "code:"
+    // section only ever inspects that one function, leaving a real,
+    // demonstrated blind spot for a corrupted offset in any LATER
+    // function's own code section).
+    let mut in_code_section = false;
+    let mut code_lines: Vec<&str> = Vec::new();
+    for line in listing.lines() {
+        let trimmed = line.trim();
+        if line.starts_with("==") {
+            in_code_section = false;
+        } else if trimmed == "constants:" {
+            in_code_section = false;
+        } else if trimmed == "code:" {
+            in_code_section = true;
+        } else if in_code_section {
+            code_lines.push(line);
+        }
+    }
     assert!(!code_lines.is_empty(), "{listing}");
     for line in &code_lines {
         let offset_field = line.trim_start().split_whitespace().next().unwrap();
