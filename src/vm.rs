@@ -353,14 +353,27 @@ fn value_to_sexpr_at_depth(
                             let borrowed = cell.borrow();
                             (borrowed.0.clone(), borrowed.1.clone())
                         };
+                        // `depth` itself never changes across this walk's
+                        // own iterations (it's this function's fixed
+                        // incoming parameter, not a per-spine-position
+                        // counter) -- only each car's OWN nested content,
+                        // if any, recurses further from `depth + 1`. A
+                        // long chain of simple (non-nested) elements, like
+                        // this file's own exact-boundary tests use, never
+                        // exercises more than that single `+ 1` regardless
+                        // of chain length, mirroring `compile_macro_call`'s
+                        // own identical `depth + 1` margin (compiler.rs):
+                        // a one-level safety margin, not the load-bearing
+                        // part of the depth bound, since a car whose OWN
+                        // nesting reaches the limit is caught by that
+                        // nesting's own recursive `depth + 1` increments
+                        // regardless of whether this one outer increment
+                        // ever happened at all.
                         items.push(value_to_sexpr_at_depth(&car, depth + 1)?);
                         if items.len() > MAX_MACRO_RESULT_ELEMENTS {
                             return Err(too_many_elements());
                         }
                         current = cdr;
-                    }
-                    Value::List(ref tail_items) if tail_items.is_empty() => {
-                        return Ok(Sexpr::List(items));
                     }
                     // A `cons`/`list` hybrid like `(cons 1 (list 2 3))` is
                     // semantically the proper list `(1 2 3)`, not a dotted
@@ -371,7 +384,12 @@ fn value_to_sexpr_at_depth(
                     // parameter-list syntax (`compile_expr` rejects it
                     // anywhere else), so treating a genuinely proper list
                     // as dotted here would make an ordinary macro-returned
-                    // list fail to compile at all.
+                    // list fail to compile at all. No separate empty-tail
+                    // arm needed: an empty `tail_items` just makes this
+                    // loop run zero times before returning the same
+                    // `Ok(Sexpr::List(items))`, so a dedicated special
+                    // case would be genuinely redundant code, not merely
+                    // an unobservable mutation target.
                     Value::List(tail_items) => {
                         for item in tail_items.iter() {
                             items.push(value_to_sexpr_at_depth(item, depth + 1)?);
