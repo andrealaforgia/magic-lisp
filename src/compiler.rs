@@ -337,7 +337,45 @@ fn expect_do_bindings(sexpr: &Sexpr) -> Result<Vec<(String, Sexpr, Sexpr)>, Comp
     }
 }
 
+/// Matches `src/vm.rs`'s own `VM_STACK_SIZE`: compiling, like running, can
+/// recurse deeply enough (through `compile_expr`'s ordinary nesting, or
+/// through `expand_quasiquote`/`expand_qq_sequence`'s mutual recursion) that
+/// how much native stack is actually available shouldn't be left to
+/// whatever the CALLING thread happens to have -- a platform default, a
+/// constrained embedding context, or simply a smaller stack than this
+/// process's own main thread gets. Running on a thread with an explicit,
+/// generous size of our own choosing makes every depth guard's safety
+/// margin a fixed, known quantity instead of one that silently varies with
+/// the caller (warden security review msg #242: confirmed by sweeping
+/// stack sizes that an identical logical nesting depth crashes below one
+/// threshold for one template shape but a different, lower one for
+/// another, purely from how many real stack frames each shape's recursion
+/// costs per depth unit -- decoupling from the caller's stack removes that
+/// variable entirely rather than trying to keep re-tuning depth limits
+/// against it).
+///
+/// Matches `VM_STACK_SIZE`'s own value exactly, deliberately -- not
+/// independently tuned. Mutation testing can't observe the exact
+/// multiplier here: even shrinking this expression to ~3 MiB (the last
+/// `*` folded into a `+`) still comfortably clears the ~1.5-2 MiB crash
+/// threshold msg #242 measured for this codebase's own test depths, so no
+/// committed test distinguishes "generously oversized" from "some smaller
+/// but still-sufficient value" without hard-coding a fragile assumption
+/// about exactly how deep those tests happen to recurse.
+const COMPILE_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
+
 pub fn compile_program(forms: &[Sexpr]) -> Result<Module, CompileError> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(COMPILE_STACK_SIZE)
+            .spawn_scoped(scope, || compile_program_on_this_thread(forms))
+            .map_err(|e| err(format!("failed to spawn compiler thread: {e}")))?
+            .join()
+            .unwrap_or_else(|_| Err(err("internal error: compiler thread panicked")))
+    })
+}
+
+fn compile_program_on_this_thread(forms: &[Sexpr]) -> Result<Module, CompileError> {
     let mut comp = Compilation::new();
     let mut entry = Chunk::new();
     let ctx = Ctx::top_level();
@@ -3140,6 +3178,43 @@ mod tests {
             "expected expand_quasiquote's own nesting-depth error, got: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn compile_program_does_not_depend_on_the_calling_threads_own_stack_size() {
+        // Regression test for warden security review msg #242: the depth
+        // counter above correctly costs one logical unit per real nesting
+        // level, but the plain nested-list template shape still costs
+        // TWO real Rust stack frames per unit (one hop into
+        // `expand_qq_sequence`, one back into `expand_quasiquote`), versus
+        // one for the repeated-quasiquote-FORMS shape the guard was
+        // originally sized for -- so the same logical depth limit leaves a
+        // smaller real-stack safety margin for this shape than the other.
+        // Confirmed by hand (sweeping thread stack sizes) that a small
+        // enough calling thread crashes on the list shape well before it
+        // would on the forms shape. `compile_program` now runs on its own
+        // dedicated, generously-sized thread specifically so this never
+        // depends on the caller at all -- calling it from a deliberately
+        // tiny (1 MiB) thread, at a depth safely past the ordinary
+        // `MAX_NESTING_DEPTH` guard, must still return a clean `Err`, not
+        // inherit the tiny caller's stack.
+        // Built on this (ordinary-stack) thread, not inside the
+        // constrained one below: dropping a 5,000-deep `Sexpr` tree uses
+        // Rust's default recursive `Drop` glue (a separate, already-
+        // documented limitation, not what this test targets), which
+        // would itself crash a 1 MiB stack regardless of anything this
+        // test is actually checking. Only borrowed into the constrained
+        // thread, never owned/dropped there.
+        let program = [nested_quasiquoted_list(5000)];
+        let result = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn_scoped(scope, || compile_program(&program))
+                .expect("should spawn the constrained calling thread")
+                .join()
+                .expect("compile_program itself must not crash the calling thread")
+        });
+        assert!(result.is_err());
     }
 
     fn nested_quasiquoted_list(depth: usize) -> Sexpr {
