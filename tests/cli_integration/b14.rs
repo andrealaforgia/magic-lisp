@@ -29,6 +29,23 @@ fn b14_e1_operands_are_handed_to_the_macro_body_as_literal_unevaluated_data() {
 }
 
 #[test]
+fn a_macro_returning_a_cons_list_hybrid_compiles_as_a_proper_list_not_a_dotted_pair() {
+    // Regression test for qa test-design review msg #262: `(cons '+ '(1
+    // 2 3))` is semantically the proper list `(+ 1 2 3)`, not a dotted
+    // pair whose tail happens to be a list -- the existing unit test for
+    // this fix only constructs the `Value::Pair`/`Value::List` tree
+    // directly in Rust; this exercises the same code path through real
+    // MagicLisp source, as this project's convention requires.
+    assert_eq!(
+        eval_ok(
+            "b14-cons-list-hybrid.ml",
+            "(define-macro (m) (cons (quote +) (quote (1 2 3)))) (display (m))"
+        ),
+        "6"
+    );
+}
+
+#[test]
 fn b14_e2_the_expansion_is_itself_evaluated_and_macros_are_visible_in_later_defined_functions() {
     assert_eq!(
         eval_ok(
