@@ -22,12 +22,21 @@ Feature: B17 — The interactive REPL
     #   $ printf '"hi"\n' | magiclisp repl -> "> \"hi\"\n> ", exit 0 (quoted — write style)
     #   $ printf '(define x 10)\n' | magiclisp repl -> "> > ", exit 0 (nothing between the two prompts)
 
-  Scenario: E3 — a definition persists across entries, and the latest redefinition wins
-    Given x defined, then referenced, then redefined, then referenced again
+  Scenario: E3 — a definition persists across entries, and the latest redefinition wins — for both plain values and functions
+    Given x defined, then referenced, then redefined, then referenced again; a single function defined and called with an argument from a later entry; two functions each defined in their own entry with the first called from a third entry; and a zero-argument function defined and called from a later entry
     When each entry is evaluated in sequence
-    Then the first reference sees the original value and the second reference sees the redefined value
+    Then the first reference sees the original value and the second sees the redefined value, and every function case calls the CORRECT function's body with the correct result — no wrong-function execution, no spurious arity error, and no hang
     # Evidence: $ printf '(define x 10)\nx\n(define x 20)\nx\n' | magiclisp repl
     #   -> "> > 10\n> > 20\n> ", exit 0
+    #   $ printf '(define (inc n) (+ n 1))\n(inc 5)\n' | magiclisp repl -> "> > 6\n> ", exit 0
+    #   $ printf '(define g (lambda (n) (+ n 1)))\n(define h (lambda (x) (* x 100)))\n(g 3)\n' | magiclisp repl
+    #   -> "> > > 4\n> ", exit 0 (calls g's body correctly, not h's — a critical bug found and fixed here:
+    #   cross-entry function calls previously either executed the wrong function's body, threw a
+    #   spurious arity error, or — for a zero-argument function — hung indefinitely)
+    #   $ perl -e 'alarm 10; exec @ARGV' bash -c "printf '(define (f) 42)\n(f)\n' | magiclisp repl"
+    #   -> "> > 42\n> ", exit 0, well within a 10-second watchdog (no hang)
+    #   Independently re-verified all four cases against the release binary, including the
+    #   zero-argument case under a watchdog.
 
   Scenario: E4 — a runtime error reports exactly one error line, recovers, and leaves bindings intact
     Given a definition, then an entry that misuses a built-in and errors, then a reference to the earlier definition
