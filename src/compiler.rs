@@ -115,6 +115,19 @@ struct Compilation {
     /// macro (like this feature's own `swap` demo) that relies on
     /// `gensym` for hygiene.
     macro_gensym_counter: u64,
+    /// The trampoline-hop budget remaining for ALL `define-macro` body
+    /// execution combined, across the whole `compile_program` call --
+    /// threaded through `eval_top_level_function` on every invocation
+    /// exactly like `macro_gensym_counter` above, decremented cumulatively
+    /// regardless of which macro, which re-expansion round, or which call
+    /// site is spending it. Warden security review msg #265: a per-
+    /// invocation-only budget let a macro that legitimately re-expands
+    /// into itself (each round individually well under budget) cost up to
+    /// (budget x round count), multiplying further with however many
+    /// independent call sites a file contains -- a 173-byte source file
+    /// reached 38 seconds of compile time this way despite no single
+    /// round ever exceeding its own bound.
+    macro_step_budget_remaining: usize,
 }
 
 impl Compilation {
@@ -124,6 +137,7 @@ impl Compilation {
             gensym_counter: 0,
             macros: HashMap::new(),
             macro_gensym_counter: 0,
+            macro_step_budget_remaining: crate::vm::MACRO_TRAMPOLINE_STEP_BUDGET,
         }
     }
 
@@ -1037,10 +1051,16 @@ fn compile_macro_call(
             .iter()
             .map(|operand| sexpr_to_const(operand).map(|c| crate::vm::const_to_value(&c)))
             .collect::<Result<Vec<_>, _>>()?;
-        let (result, updated_gensym_counter) =
-            eval_top_level_function(&comp.module, fn_index, args, comp.macro_gensym_counter)
-                .map_err(|e| err(format!("error while expanding macro '{op}': {e}")))?;
+        let (result, updated_gensym_counter, updated_step_budget) = eval_top_level_function(
+            &comp.module,
+            fn_index,
+            args,
+            comp.macro_gensym_counter,
+            comp.macro_step_budget_remaining,
+        )
+        .map_err(|e| err(format!("error while expanding macro '{op}': {e}")))?;
         comp.macro_gensym_counter = updated_gensym_counter;
+        comp.macro_step_budget_remaining = updated_step_budget;
         let expanded = value_to_sexpr(&result)?;
         if let Sexpr::List(next_items) = &expanded {
             if let Some(Sexpr::Symbol(next_op)) = next_items.first() {

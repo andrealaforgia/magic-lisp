@@ -121,6 +121,38 @@ fn a_macro_body_containing_a_genuine_infinite_tail_recursive_loop_fails_cleanly_
 }
 
 #[test]
+fn a_macro_re_expanding_across_many_rounds_cannot_multiply_its_step_budget_by_the_round_count() {
+    // Regression test for warden security review msg #265: the per-round
+    // step budget alone isn't enough -- a macro that legitimately
+    // re-expands into itself (the same mechanism b14_e3 above tests) and
+    // burns close to a full budget's worth of trampoline hops on EACH of
+    // its rounds could previously cost up to (budget x round count), and
+    // that cost multiplies further with however many independent call
+    // sites a file contains, since nothing tracked cumulative hops across
+    // rounds or call sites. A tiny source file could still reach tens of
+    // seconds of compile time despite no single round ever exceeding its
+    // own bound. Uses `run_with_stdin` for the same real timeout+kill
+    // safety net as the single-round case above.
+    let file = write_source(
+        "b14-macro-cumulative-step-budget.ml",
+        "(define-macro (loopy k) \
+           (letrec ((burn (lambda (n) (if (= n 0) 0 (burn (- n 1)))))) \
+             (if (= k 0) \
+                 42 \
+                 (begin (burn 999000) (list (quote loopy) (- k 1)))))) \
+         (loopy 99)",
+    );
+    let output = run_with_stdin(&["eval", file.to_str().unwrap()], b"");
+    assert_eq!(
+        output.status.code(),
+        Some(SOURCE_ERROR),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(!stderr_of(&output).is_empty());
+}
+
+#[test]
 fn a_macro_returning_a_self_referential_vector_fails_cleanly_not_a_crash() {
     // Regression test for qa test-design WARNING msg #259: `value_to_sexpr`
     // (converting a macro's returned data back into code) had cycle

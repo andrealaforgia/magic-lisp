@@ -509,16 +509,35 @@ struct Vm<'m> {
     /// one is deliberately rearmed on every trampoline hop (guards against
     /// a broken operand-advance within a single pass, not against many
     /// legitimate hops), so it can never catch this.
+    ///
+    /// Seeded from a COMPILATION-WIDE remaining value each
+    /// `eval_top_level_function` call passes in and gets back out
+    /// (mirroring `gensym_counter`'s own cross-invocation threading, see
+    /// `compile_macro_call`) -- not reset to a fresh constant every call
+    /// (warden security review msg #265: a macro that legitimately
+    /// re-expands into itself, each round individually well under budget,
+    /// could still cost up to `MACRO_TRAMPOLINE_STEP_BUDGET` times the
+    /// round count, multiplying further with however many independent
+    /// call sites a file contains -- a 173-byte source file reached 38
+    /// seconds of compile time this way. One cumulative budget, spent
+    /// across every hop in every invocation in one `compile_program`
+    /// call regardless of round or call site, bounds the aggregate
+    /// directly instead of relying on the product of several independent
+    /// factors happening to stay small.
     macro_step_budget: Option<usize>,
 }
 
-/// How many trampoline hops one `define-macro` body invocation may run
-/// before compilation gives up on it -- generous for any macro actually
-/// generating code (which does a small, fixed amount of work over its
-/// operands), while still turning a genuine infinite tail loop into a
-/// fast, clean compile error instead of a hang with no way to recover
-/// short of killing the process externally.
-const MACRO_TRAMPOLINE_STEP_BUDGET: usize = 1_000_000;
+/// The total trampoline-hop budget for ALL `define-macro` body execution
+/// within one `compile_program` call, combined -- every round of every
+/// re-expansion at every macro call site draws from this single pool
+/// (`Compilation::macro_step_budget_remaining`, threaded through
+/// `eval_top_level_function` exactly like `macro_gensym_counter`), not a
+/// fresh allowance per invocation. Generous for any ordinary program's
+/// macro use (which does a small, fixed amount of work per expansion),
+/// while still turning both a single genuine infinite tail loop AND many
+/// individually-bounded-but-numerous rounds/call sites into a fast, clean
+/// compile error instead of a hang or a disproportionate aggregate delay.
+pub(crate) const MACRO_TRAMPOLINE_STEP_BUDGET: usize = 1_000_000;
 
 /// A lazy, on-demand relay to the real stdin reader living on the thread
 /// that called [`run_with_stdin`], used because that reader (e.g. a locked
@@ -630,7 +649,7 @@ impl<'m> Vm<'m> {
             if let Some(remaining_hops) = self.macro_step_budget {
                 if remaining_hops == 0 {
                     return Err(error(format!(
-                        "macro body exceeded the maximum supported trampoline steps ({MACRO_TRAMPOLINE_STEP_BUDGET}) -- possible infinite loop in a macro's own code"
+                        "macro expansion exceeded the maximum supported trampoline steps ({MACRO_TRAMPOLINE_STEP_BUDGET}, across all macro execution in this compilation) -- an infinite loop in a macro's own code, or too much cumulative work across many expansions"
                     )));
                 }
                 self.macro_step_budget = Some(remaining_hops - 1);
@@ -921,7 +940,8 @@ pub(crate) fn eval_top_level_function(
     fn_index: u32,
     args: Vec<Value>,
     gensym_counter: u64,
-) -> Result<(Value, u64), RuntimeError> {
+    step_budget_remaining: usize,
+) -> Result<(Value, u64, usize), RuntimeError> {
     let mut vm = Vm {
         module,
         globals: default_globals(),
@@ -929,7 +949,7 @@ pub(crate) fn eval_top_level_function(
         stdin_buffer: Vec::new(),
         stdin_channel: StdinChannel::none(),
         gensym_counter,
-        macro_step_budget: Some(MACRO_TRAMPOLINE_STEP_BUDGET),
+        macro_step_budget: Some(step_budget_remaining),
     };
     let env = Rc::new(Env {
         locals: Vec::new(),
@@ -937,7 +957,11 @@ pub(crate) fn eval_top_level_function(
     });
     let mut sink = std::io::sink();
     let result = vm.call_value(&Value::Closure(fn_index, env), args, &mut sink)?;
-    Ok((result, vm.gensym_counter))
+    Ok((
+        result,
+        vm.gensym_counter,
+        vm.macro_step_budget.unwrap_or(0),
+    ))
 }
 
 fn bind_arguments(
@@ -3047,7 +3071,9 @@ mod tests {
         let forms = read_program("(define (double x) (* x 2))").unwrap();
         let module = compile_program(&forms).unwrap();
         assert_eq!(module.entry_index, 1);
-        let (result, _) = eval_top_level_function(&module, 0, vec![Value::Int(21)], 0).unwrap();
+        let (result, ..) =
+            eval_top_level_function(&module, 0, vec![Value::Int(21)], 0, MACRO_TRAMPOLINE_STEP_BUDGET)
+                .unwrap();
         assert_eq!(result, Value::Int(42));
     }
 
@@ -3055,7 +3081,8 @@ mod tests {
     fn eval_top_level_function_can_call_native_procedures() {
         let forms = read_program("(define (f) (gensym))").unwrap();
         let module = compile_program(&forms).unwrap();
-        let (result, _) = eval_top_level_function(&module, 0, vec![], 0).unwrap();
+        let (result, ..) =
+            eval_top_level_function(&module, 0, vec![], 0, MACRO_TRAMPOLINE_STEP_BUDGET).unwrap();
         assert!(matches!(result, Value::Symbol(_)));
     }
 
@@ -3063,8 +3090,14 @@ mod tests {
     fn eval_top_level_function_binds_a_rest_parameter_as_a_list() {
         let forms = read_program("(define (f . rest) rest)").unwrap();
         let module = compile_program(&forms).unwrap();
-        let (result, _) =
-            eval_top_level_function(&module, 0, vec![Value::Int(1), Value::Int(2)], 0).unwrap();
+        let (result, ..) = eval_top_level_function(
+            &module,
+            0,
+            vec![Value::Int(1), Value::Int(2)],
+            0,
+            MACRO_TRAMPOLINE_STEP_BUDGET,
+        )
+        .unwrap();
         assert_eq!(result, Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)])));
     }
 
@@ -3072,7 +3105,16 @@ mod tests {
     fn eval_top_level_function_reports_a_wrong_argument_count_as_a_clean_error() {
         let forms = read_program("(define (f x y) x)").unwrap();
         let module = compile_program(&forms).unwrap();
-        assert!(eval_top_level_function(&module, 0, vec![Value::Int(1)], 0).is_err());
+        assert!(
+            eval_top_level_function(
+                &module,
+                0,
+                vec![Value::Int(1)],
+                0,
+                MACRO_TRAMPOLINE_STEP_BUDGET
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3084,10 +3126,17 @@ mod tests {
         // produce the identical "unique" symbol.
         let forms = read_program("(define (f) (gensym))").unwrap();
         let module = compile_program(&forms).unwrap();
-        let (first, counter_after_first) = eval_top_level_function(&module, 0, vec![], 0).unwrap();
+        let (first, counter_after_first, _) =
+            eval_top_level_function(&module, 0, vec![], 0, MACRO_TRAMPOLINE_STEP_BUDGET).unwrap();
         assert_eq!(first, Value::Symbol("gensym 1".to_string()));
-        let (second, counter_after_second) =
-            eval_top_level_function(&module, 0, vec![], counter_after_first).unwrap();
+        let (second, counter_after_second, _) = eval_top_level_function(
+            &module,
+            0,
+            vec![],
+            counter_after_first,
+            MACRO_TRAMPOLINE_STEP_BUDGET,
+        )
+        .unwrap();
         assert_eq!(second, Value::Symbol("gensym 2".to_string()));
         assert_eq!(counter_after_second, 2);
     }
@@ -3103,7 +3152,33 @@ mod tests {
         let forms = read_program("(define (f) (letrec ((loop (lambda () (loop)))) (loop)))")
             .unwrap();
         let module = compile_program(&forms).unwrap();
-        assert!(eval_top_level_function(&module, 0, vec![], 0).is_err());
+        assert!(
+            eval_top_level_function(&module, 0, vec![], 0, MACRO_TRAMPOLINE_STEP_BUDGET).is_err()
+        );
+    }
+
+    #[test]
+    fn eval_top_level_function_threads_the_cumulative_step_budget_in_and_back_out() {
+        // Regression test for warden security review msg #265: the step
+        // budget must be threaded IN and back OUT across separate
+        // invocations, exactly like gensym's counter -- a fresh budget on
+        // every call would let cumulative cost across many invocations
+        // grow unbounded even though each individual one stays within its
+        // own allowance.
+        // `burn`'s own lambda is compiled (and pushed to the module's
+        // function table) while compiling `f`'s body, before `f`'s own
+        // chunk is pushed once that finishes -- index 0 is `burn`, index
+        // 1 is `f` itself.
+        let forms =
+            read_program("(define (f) (letrec ((burn (lambda (n) (if (= n 0) 0 (burn (- n 1)))))) (burn 10)))")
+                .unwrap();
+        let module = compile_program(&forms).unwrap();
+        let (_, _, remaining_after_first) =
+            eval_top_level_function(&module, 1, vec![], 0, 100).unwrap();
+        assert!(remaining_after_first < 100);
+        let (_, _, remaining_after_second) =
+            eval_top_level_function(&module, 1, vec![], 0, remaining_after_first).unwrap();
+        assert!(remaining_after_second < remaining_after_first);
     }
 
     #[test]
