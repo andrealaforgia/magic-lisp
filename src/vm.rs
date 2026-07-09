@@ -1422,63 +1422,71 @@ struct DatumBoundaryScan {
 }
 
 impl DatumBoundaryScan {
-    /// Feeds newly-arrived, already UTF-8-boundary-safe text through the
-    /// tracker. Must be called with every chunk in arrival order, and with
-    /// the buffer's own pre-existing contents first if resuming on a
-    /// buffer that already had some in it.
-    fn feed(&mut self, new_text: &str) {
-        for c in new_text.chars() {
-            if self.char_literal_pending {
-                // Exactly one character after `#\` (spec 3.1's character
-                // literal), consumed verbatim -- `(`/`)`/`"`/`;` here are
-                // just that character's own datum, not real delimiters.
-                self.char_literal_pending = false;
+    /// Feeds ONE newly-arrived, already UTF-8-boundary-safe character
+    /// through the tracker.
+    ///
+    /// Deliberately per-character, not per-chunk: checking
+    /// `possible_boundary` only once after a whole chunk is fed would miss
+    /// a complete datum immediately followed, within that SAME chunk, by
+    /// the start of an incomplete second construct -- bracket depth would
+    /// already have left zero again by the time anyone looked, silently
+    /// masking a datum that was genuinely ready (warden security review
+    /// msg #237: `1(display` sent as one write, stream then held open,
+    /// stalled indefinitely despite `1` sitting complete at the front the
+    /// whole time). `native_read` below checks after every character
+    /// instead, so a transient dip through the boundary condition is never
+    /// missed no matter what follows it in the same arrival.
+    fn feed_char(&mut self, c: char) {
+        if self.char_literal_pending {
+            // Exactly one character after `#\` (spec 3.1's character
+            // literal), consumed verbatim -- `(`/`)`/`"`/`;` here are
+            // just that character's own datum, not real delimiters.
+            self.char_literal_pending = false;
+            self.seen_token = true;
+            return;
+        }
+        if self.in_comment {
+            if c == '\n' {
+                self.in_comment = false;
+            }
+            return;
+        }
+        if self.in_string {
+            if self.string_escape_next {
+                self.string_escape_next = false;
+            } else if c == '\\' {
+                self.string_escape_next = true;
+            } else if c == '"' {
+                self.in_string = false;
+            }
+            return;
+        }
+        let after_hash = std::mem::take(&mut self.after_hash);
+        if after_hash && c == '\\' {
+            self.char_literal_pending = true;
+            self.seen_token = true;
+            return;
+        }
+        match c {
+            '#' => {
+                self.after_hash = true;
                 self.seen_token = true;
-                continue;
             }
-            if self.in_comment {
-                if c == '\n' {
-                    self.in_comment = false;
-                }
-                continue;
-            }
-            if self.in_string {
-                if self.string_escape_next {
-                    self.string_escape_next = false;
-                } else if c == '\\' {
-                    self.string_escape_next = true;
-                } else if c == '"' {
-                    self.in_string = false;
-                }
-                continue;
-            }
-            let after_hash = std::mem::take(&mut self.after_hash);
-            if after_hash && c == '\\' {
-                self.char_literal_pending = true;
+            ';' => self.in_comment = true,
+            '"' => {
+                self.in_string = true;
                 self.seen_token = true;
-                continue;
             }
-            match c {
-                '#' => {
-                    self.after_hash = true;
-                    self.seen_token = true;
-                }
-                ';' => self.in_comment = true,
-                '"' => {
-                    self.in_string = true;
-                    self.seen_token = true;
-                }
-                '(' => {
-                    self.depth += 1;
-                    self.seen_token = true;
-                }
-                ')' => {
-                    self.depth -= 1;
-                    self.seen_token = true;
-                }
-                c if c.is_whitespace() => {}
-                _ => self.seen_token = true,
+            '(' => {
+                self.depth += 1;
+                self.seen_token = true;
             }
+            ')' => {
+                self.depth -= 1;
+                self.seen_token = true;
+            }
+            c if c.is_whitespace() => {}
+            _ => self.seen_token = true,
         }
     }
 
@@ -1491,66 +1499,147 @@ impl DatumBoundaryScan {
     fn possible_boundary(&self) -> bool {
         self.seen_token && !self.in_string && !self.in_comment && self.depth <= 0
     }
+
+    #[cfg(test)]
+    fn feed(&mut self, text: &str) {
+        for c in text.chars() {
+            self.feed_char(c);
+        }
+    }
 }
 
-fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
-    let mut boundary = DatumBoundaryScan::default();
-    // How much of `vm.stdin_buffer` has been fed to `boundary` so far --
-    // re-decoding the whole buffer every time (like `read_one` itself
-    // does) would defeat the point; only ever feeding the NEW, already-
-    // validated suffix keeps this genuinely incremental. Never re-derived
-    // from a chunk in isolation (a chunk boundary can legitimately split
-    // a multi-byte character) -- always from the buffer as a whole, via
-    // `Utf8Error::valid_up_to` when it's not (yet) fully valid.
-    let mut fed_up_to = 0;
-    let feed_buffer = |vm: &Vm, boundary: &mut DatumBoundaryScan, fed_up_to: &mut usize| {
-        let valid_up_to = match std::str::from_utf8(&vm.stdin_buffer) {
-            Ok(text) => text.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        // No `valid_up_to > *fed_up_to` guard: `vm.stdin_buffer` only ever
-        // grows within one `native_read` call, so `valid_up_to` is never
-        // less than the previous call's `*fed_up_to` -- when they're
-        // equal (nothing new to feed), the slice below is simply empty
-        // and this is a no-op, exactly as a guard would have produced.
-        if let Ok(new_text) = std::str::from_utf8(&vm.stdin_buffer[*fed_up_to..valid_up_to]) {
-            boundary.feed(new_text);
-        }
-        *fed_up_to = valid_up_to;
+/// Feeds every not-yet-fed byte of `vm.stdin_buffer` through `boundary`,
+/// attempting a real `read_one` immediately at every point where a
+/// possible boundary is found -- not just once after the whole batch --
+/// and reporting a completed datum the instant one is confirmed.
+///
+/// `*fed_up_to` tracks how much of the buffer has already been fed, so
+/// re-scanning never happens (`read_one` itself re-tokenizing from
+/// scratch is the O(N^2) risk this whole design exists to avoid -- see
+/// `native_read`'s own doc comment). Validated for UTF-8 boundary safety
+/// incrementally too: only `vm.stdin_buffer[*fed_up_to..]` is ever
+/// decoded, not the whole buffer from byte 0 on every call (warden
+/// security review msg #237: re-validating the full buffer every time
+/// reintroduces the same O(N^2) cost this function otherwise avoids, for
+/// any transport that delivers many small chunks over a large payload).
+fn advance_and_maybe_read(
+    vm: &mut Vm,
+    boundary: &mut DatumBoundaryScan,
+    fed_up_to: &mut usize,
+) -> Option<Result<Value, RuntimeError>> {
+    let valid_up_to = match std::str::from_utf8(&vm.stdin_buffer[*fed_up_to..]) {
+        Ok(text) => *fed_up_to + text.len(),
+        Err(e) => *fed_up_to + e.valid_up_to(),
     };
-    feed_buffer(vm, &mut boundary, &mut fed_up_to);
-    loop {
-        if boundary.possible_boundary() {
-            // A chunk boundary can legitimately split a multi-byte UTF-8
-            // character in the middle -- that decode failure is ambiguous
-            // the same way "not enough to parse yet" already is, and is
-            // resolved the same way: try again once more bytes arrive. A
-            // genuinely invalid encoding (not just a split character) is
-            // instead reported once the stream is exhausted, below, the
-            // same way a genuine parse error is.
-            if let Ok(text) = std::str::from_utf8(&vm.stdin_buffer) {
-                match reader::read_one(text) {
-                    Ok((Some(sexpr), remaining)) => {
-                        let consumed = text.len() - remaining.len();
-                        vm.stdin_buffer.drain(..consumed);
-                        let c = sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
-                        return Ok(const_to_value(&c));
-                    }
-                    // Either nothing parseable yet (just whitespace so far)
-                    // or a genuine parse error (e.g. an unterminated list)
-                    // -- both are ambiguous until we know whether more
-                    // input is still coming, since a multi-chunk datum
-                    // looks identical to malformed input until its closing
-                    // delimiter actually arrives. Only once the stream is
-                    // truly exhausted (below) is either outcome final.
-                    Ok((None, _)) | Err(_) => {}
+    while *fed_up_to < valid_up_to {
+        // Safe to unwrap: `[*fed_up_to, valid_up_to)` was just confirmed
+        // to decode as UTF-8 above, and `chars().next()` always finds the
+        // first character of any non-empty valid UTF-8 slice.
+        let c = std::str::from_utf8(&vm.stdin_buffer[*fed_up_to..valid_up_to])
+            .unwrap()
+            .chars()
+            .next()
+            .unwrap();
+        boundary.feed_char(c);
+        // Deliberately `+=`, not `*=`: `*fed_up_to` starts at 0, and 0
+        // multiplied by anything stays 0 forever, turning this into an
+        // infinite loop reprocessing the same first character on every
+        // iteration -- confirmed by reasoning rather than by running it
+        // (an actual hang isn't something to safely reproduce in a
+        // committed test), the same way the flat-list stack-overflow
+        // crash elsewhere in this codebase is verified without literally
+        // triggering the crash it prevents.
+        *fed_up_to += c.len_utf8();
+        if !boundary.possible_boundary() {
+            continue;
+        }
+        // A chunk boundary can legitimately split a multi-byte UTF-8
+        // character in the middle -- that decode failure is ambiguous the
+        // same way "not enough to parse yet" already is, and is resolved
+        // the same way: try again once more bytes arrive. A genuinely
+        // invalid encoding (not just a split character) is instead
+        // reported once the stream is exhausted, in `native_read` below,
+        // the same way a genuine parse error is.
+        if let Ok(text) = std::str::from_utf8(&vm.stdin_buffer) {
+            match reader::read_one(text) {
+                Ok((Some(sexpr), remaining)) => {
+                    let consumed = text.len() - remaining.len();
+                    vm.stdin_buffer.drain(..consumed);
+                    return Some(
+                        sexpr_to_const(&sexpr)
+                            .map(|c| const_to_value(&c))
+                            .map_err(|e| error(format!("read: {e}"))),
+                    );
                 }
+                // Either nothing parseable yet (just whitespace so far) or
+                // a genuine parse error (e.g. an unterminated list) --
+                // both are ambiguous until we know whether more input is
+                // still coming, since a multi-chunk datum looks identical
+                // to malformed input until its closing delimiter actually
+                // arrives. Only once the stream is truly exhausted (in
+                // `native_read` below) is either outcome final. Resets
+                // `seen_token` (not `depth`/`in_string`/`in_comment`,
+                // which stay accurate) so a LATER character -- one that
+                // doesn't itself change bracket depth, e.g. completing a
+                // symbol after a lone quote/backquote/comma marker at the
+                // buffer's current end -- still gets its own fresh chance
+                // to trigger another attempt once it arrives, rather than
+                // this same already-tried state silently never re-firing.
+                Ok((None, _)) | Err(_) => boundary.seen_token = false,
             }
         }
+    }
+    None
+}
+
+/// Reads one complete datum from standard input as DATA, not code -- the
+/// result is never evaluated (spec 4.8), only parsed and converted the same
+/// way a quoted literal is at compile time (`sexpr_to_const`, then
+/// `const_to_value`), so `(+ 1 2)` on stdin reads back as the 3-element
+/// list `(+ 1 2)`, not the number `3`. Consumes exactly one datum's worth
+/// of `vm.stdin_buffer`, leaving the rest for a subsequent `read`/
+/// `read-line` call to continue from.
+///
+/// Incrementally tracks just enough lexical state -- bracket depth,
+/// whether we're inside a string or a comment -- to know when a complete
+/// top-level datum MIGHT now be sitting at the front of a growing buffer,
+/// examining only newly-arrived text each call rather than re-scanning
+/// from the start. This is `native_read`'s way out of a genuine dilemma:
+/// `read_one` re-tokenizes its whole input from scratch every call (it has
+/// no state to resume from), so retrying it after every single new chunk
+/// pulled in for a datum spread across N chunks costs O(current size) per
+/// chunk x O(N) chunks = O(N^2) total in the worst case (warden security
+/// review msg #208) -- but skipping some of those retries based on a guess
+/// about the transport (chunk count, buffer size, whether the last relay
+/// read was "full" or "short") is fundamentally unsound: whatever proxy is
+/// picked, a datum finishing just past it sits unread indefinitely on any
+/// stream that stays open afterward, since nothing else ever prompts
+/// another attempt. Three fixes in that family were each defeated in turn
+/// (warden msgs #218/#226/#231/#232, qa msg #227).
+///
+/// This sidesteps the dilemma instead of picking a side: it's not a full
+/// parser (it never rejects malformed input -- that's still `read_one`'s
+/// job) and deliberately errs toward MORE frequent real attempts whenever
+/// its simplified view of the grammar is unsure, since an extra attempt
+/// only costs a little time while missing a real boundary would silently
+/// reintroduce the exact stall this exists to prevent. It mirrors only the
+/// handful of `Scanner` rules that affect whether a `(`/`)` is "real" --
+/// comments, string escapes, and the `#\c` single-character-literal
+/// exception (so `#\(` and `#\)` don't miscount as brackets) -- everything
+/// else is treated uniformly as ordinary token text.
+fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
+    let mut boundary = DatumBoundaryScan::default();
+    let mut fed_up_to = 0;
+    if let Some(result) = advance_and_maybe_read(vm, &mut boundary, &mut fed_up_to) {
+        return result;
+    }
+    loop {
         match vm.stdin_channel.next_chunk() {
             Some(chunk) => {
                 vm.stdin_buffer.extend_from_slice(&chunk);
-                feed_buffer(vm, &mut boundary, &mut fed_up_to);
+                if let Some(result) = advance_and_maybe_read(vm, &mut boundary, &mut fed_up_to) {
+                    return result;
+                }
             }
             None => {
                 let text = std::str::from_utf8(&vm.stdin_buffer)
@@ -5885,6 +5974,43 @@ mod tests {
             &stdin.as_bytes()[8190..8193],
             [b'x', accented_bytes[0], accented_bytes[1]],
             "the accented character's bytes must straddle offsets 8191/8192"
+        );
+
+        let out = eval_with_stdin("(display (string-length (read)))", &stdin).unwrap();
+        assert_eq!(out, body.chars().count().to_string());
+    }
+
+    #[test]
+    fn read_correctly_decodes_a_multi_byte_character_split_across_a_later_relay_chunk_boundary_after_fed_up_to_has_already_advanced()
+     {
+        // Regression guard for `advance_and_maybe_read`'s incremental
+        // UTF-8 validity check: `*fed_up_to + e.valid_up_to()` must ADD
+        // the error's offset (relative to the UNFED suffix) to how much
+        // has already been fed, not (e.g.) multiply them -- a distinction
+        // invisible while `*fed_up_to` is still 0 (its value at the very
+        // first chunk, which `+`/`*` treat identically), so this
+        // specifically needs the split to land on a LATER chunk boundary,
+        // after an earlier chunk has already fully decoded and advanced
+        // `fed_up_to` to something nonzero.
+        use crate::unicode_fixtures::ACCENTED_LETTER;
+        let mut accented_bytes = [0u8; 4];
+        let accented_len = ACCENTED_LETTER.encode_utf8(&mut accented_bytes).len();
+        assert_eq!(accented_len, 2, "fixture must be a 2-byte character");
+
+        // First chunk (bytes 0..8192) is entirely plain ASCII, so it
+        // decodes fully and advances `fed_up_to` to 8192. The accented
+        // character's first byte then lands at the very end of the
+        // SECOND chunk (offset 16383), so the split -- and the resulting
+        // `Err` branch -- is only encountered once `fed_up_to` is already
+        // nonzero.
+        let prefix_len = 2 * 8192 - 1;
+        let padding = "x".repeat(prefix_len - 1); // -1 for the opening quote
+        let body = format!("{padding}{ACCENTED_LETTER}more text after the split");
+        let stdin = format!("\"{body}\"");
+        assert_eq!(
+            &stdin.as_bytes()[16382..16385],
+            [b'x', accented_bytes[0], accented_bytes[1]],
+            "the accented character's bytes must straddle offsets 16383/16384"
         );
 
         let out = eval_with_stdin("(display (string-length (read)))", &stdin).unwrap();

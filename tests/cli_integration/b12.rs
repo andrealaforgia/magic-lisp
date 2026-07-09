@@ -1,6 +1,6 @@
 //! B12: input reading and the write/display output distinction (spec 3.2, 4.8).
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -232,6 +232,68 @@ fn read_completes_promptly_for_a_datum_that_lands_exactly_on_a_full_relay_read_b
     };
     drop(stdin);
     assert!(status.success(), "expected a clean exit, got: {status:?}");
+}
+
+#[test]
+fn read_completes_promptly_when_a_complete_datum_is_immediately_followed_by_an_incomplete_second_construct()
+ {
+    // Regression test for warden security review msg #237: checking for a
+    // possible boundary only once, after a whole newly-arrived chunk was
+    // fed, misses a complete datum that's immediately followed, within
+    // that SAME chunk, by the start of an unrelated incomplete second
+    // construct -- bracket depth has already left zero again by the time
+    // anyone looks, masking a datum that was genuinely complete and ready
+    // to return. Sends `1(display` in a single write (a complete `1`
+    // immediately followed by the unclosed start of a second, unrelated
+    // list) then holds the stream open with no more data -- `(read)`
+    // should still return `1` promptly, never waiting on the second,
+    // irrelevant construct to ever complete.
+    let file = write_source(
+        "b12-read-masked-by-incomplete-second-construct.ml",
+        "(display (read))",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"1(display").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not complete within 5s while stdin stayed open \
+                 after a complete datum immediately followed by an incomplete \
+                 second construct -- the masked-boundary stall regression"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(status.success(), "expected a clean exit, got: {status:?}");
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(stdout, "1");
 }
 
 #[test]
