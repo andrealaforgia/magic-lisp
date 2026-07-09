@@ -584,6 +584,42 @@ mod tests {
     }
 
     #[test]
+    fn upvalue_count_reports_two_for_two_distinct_captured_variables() {
+        // Regression test for qa test-design WARNING msg #314: the one
+        // non-trivial line in `count_captured_upvalues` is the `HashSet`
+        // dedup -- this is meaningless to verify with only ever a single
+        // captured variable, since a naive per-reference counter would
+        // report the same number in that case. Two DISTINCT captures (a
+        // and b) must report upvalues=2, not some other count.
+        let module = module_for("(lambda (a b) (lambda () (+ a b)))");
+        let inner = &module.functions[0];
+        let listing = disassemble(&module);
+        assert!(
+            listing.contains("upvalues=2"),
+            "expected exactly 2 distinct captured upvalues: {listing}"
+        );
+        assert_eq!(count_captured_upvalues(inner), 2);
+    }
+
+    #[test]
+    fn upvalue_count_collapses_repeated_references_to_the_same_captured_variable_to_one() {
+        // The other half of the same regression: reading (and writing) the
+        // SAME captured variable more than once must still report
+        // upvalues=1, not one per reference -- this is exactly what
+        // distinguishes the `HashSet`-based distinct-pair count from a
+        // naive instruction counter, which this test would catch
+        // regressing to.
+        let module = module_for("(lambda (a) (lambda () (set! a (+ a 1)) a))");
+        let inner = &module.functions[0];
+        let listing = disassemble(&module);
+        assert!(
+            listing.contains("upvalues=1"),
+            "expected the repeated get/set references to the same variable to collapse to 1: {listing}"
+        );
+        assert_eq!(count_captured_upvalues(inner), 1);
+    }
+
+    #[test]
     fn names_set_upvalue_for_a_nested_lambda_mutating_an_enclosing_local() {
         let module = module_for("(lambda (x) (lambda () (set! x 1)))");
         let inner = &module.functions[0];

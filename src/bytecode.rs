@@ -670,6 +670,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_minor_version_mismatch_even_when_the_major_version_matches() {
+        // Regression test for qa test-design WARNING msg #314: the sibling
+        // test above only ever mutates the MAJOR version byte -- this is
+        // the exact scenario B16's own minor-version bump (1 -> 2, for the
+        // new per-function name field) exists to guard against: an older
+        // artifact with a matching major version but a stale minor one
+        // must still be cleanly rejected, not misparsed as if the newer
+        // per-function name field were present.
+        let mut bytes = encode(&sample_module());
+        bytes[5] = VERSION_MINOR - 1;
+        assert_eq!(
+            decode(&bytes),
+            Err(BytecodeError::UnsupportedVersion {
+                major: VERSION_MAJOR,
+                minor: VERSION_MINOR - 1,
+            })
+        );
+    }
+
+    #[test]
     fn rejects_truncated_content() {
         let bytes = encode(&sample_module());
         let truncated = &bytes[..bytes.len() - 3];
