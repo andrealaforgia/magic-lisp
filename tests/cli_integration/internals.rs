@@ -41,6 +41,15 @@ fn compiling_a_hand_built_deeply_nested_quasiquote_list_does_not_crash_on_a_seve
     // the compiler's own `MAX_NESTING_DEPTH` guard (512), confirming the
     // crash is a genuine native stack overflow during the bounded
     // recursion up to that guard, not the guard failing to fire at all.
+    //
+    // This is Unix-only (`ulimit -s`, POSIX-specific) and, being tuned
+    // against this compiler's current codegen, could in principle stop
+    // discriminating again after a Rust toolchain upgrade or a release-
+    // profile change shifts real per-frame stack usage enough (qa
+    // test-design review msg #257) -- the same failure mode its
+    // predecessor had, just pushed further out. If this test ever starts
+    // passing identically fixed-vs-reverted again, re-sweep both constants
+    // the same way, rather than assuming the fix itself regressed.
     let probe = env!("CARGO_BIN_EXE_quasiquote_list_stack_probe");
     let output = Command::new("sh")
         .arg("-c")

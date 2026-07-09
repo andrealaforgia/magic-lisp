@@ -28,7 +28,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
     }
 }
 
-const NATIVE_NAMES: [&str; 124] = [
+const NATIVE_NAMES: [&str; 125] = [
     "display",
     "newline",
     "+",
@@ -160,6 +160,8 @@ const NATIVE_NAMES: [&str; 124] = [
     "read-line",
     "eof-object?",
     "write",
+    // B14: procedural macros and gensym.
+    "gensym",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -169,7 +171,7 @@ pub fn default_globals() -> HashMap<String, Value> {
         .collect()
 }
 
-fn const_to_value(c: &Const) -> Value {
+pub(crate) fn const_to_value(c: &Const) -> Value {
     match c {
         Const::Int(n) => Value::Int(*n),
         Const::Float(n) => Value::Float(*n),
@@ -206,6 +208,80 @@ fn const_to_value(c: &Const) -> Value {
             acc
         }
         Const::Unspecified => Value::Unspecified,
+    }
+}
+
+/// The reverse of [`const_to_value`]/[`sexpr_to_const`]: turns a runtime
+/// [`Value`] back into the compile-time [`Sexpr`] it would need to be for
+/// `compile_expr` to treat it as code -- used by `define-macro`'s expansion
+/// (B14), where a macro's body computes and returns *data* describing the
+/// replacement code, which then has to become an actual `Sexpr` again
+/// before it can be compiled in the original call's place.
+///
+/// `Native`/`Closure`/`Hash`/`Eof`/`Unspecified` have no `Sexpr`
+/// equivalent -- a macro's expansion result has to be data a program could
+/// have written literally, not a procedure or a mutable table, so
+/// returning one of these from a macro body is reported as a clear error
+/// rather than silently coerced into something misleading.
+pub(crate) fn value_to_sexpr(v: &Value) -> Result<Sexpr, crate::compiler::CompileError> {
+    let macro_err = |v: &Value| crate::compiler::CompileError {
+        message: format!("macro expansion produced a value with no literal-code equivalent: {v}"),
+    };
+    match v {
+        Value::Int(n) => Ok(Sexpr::Int(*n)),
+        Value::Float(n) => Ok(Sexpr::Float(*n)),
+        Value::Bool(b) => Ok(Sexpr::Bool(*b)),
+        Value::Char(c) => Ok(Sexpr::Char(*c)),
+        Value::Str(s) => Ok(Sexpr::Str((**s).clone())),
+        Value::Symbol(s) => Ok(Sexpr::Symbol(s.clone())),
+        Value::List(items) => Ok(Sexpr::List(
+            items.iter().map(value_to_sexpr).collect::<Result<Vec<_>, _>>()?,
+        )),
+        Value::Vector(items) => Ok(Sexpr::Vector(
+            items
+                .borrow()
+                .iter()
+                .map(value_to_sexpr)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Value::Pair(cell) => {
+            // Iterative, cycle-detecting cdr walk -- mirrors
+            // `fmt_pair_chain`'s own (value.rs) and `list_to_vec`'s own
+            // (above) walk of the same `Pair`-chain shape, for the same
+            // two reasons: a chain built at runtime via `cons` can be
+            // arbitrarily long (recursing here once per element would
+            // crash the compiling thread on an ordinary large macro
+            // result), and can be circular via `set-cdr!` (which must
+            // become a clean error here too, not an infinite loop).
+            let mut items = Vec::new();
+            let mut current = Value::Pair(cell.clone());
+            let mut seen = HashSet::new();
+            loop {
+                match current {
+                    Value::Pair(cell) => {
+                        if !seen.insert(Rc::as_ptr(&cell) as usize) {
+                            return Err(macro_err(&Value::Pair(cell)));
+                        }
+                        let (car, cdr) = {
+                            let borrowed = cell.borrow();
+                            (borrowed.0.clone(), borrowed.1.clone())
+                        };
+                        items.push(value_to_sexpr(&car)?);
+                        current = cdr;
+                    }
+                    Value::List(ref tail_items) if tail_items.is_empty() => {
+                        return Ok(Sexpr::List(items));
+                    }
+                    other => {
+                        let tail = value_to_sexpr(&other)?;
+                        return Ok(Sexpr::DottedList(items, Box::new(tail)));
+                    }
+                }
+            }
+        }
+        Value::Native(_) | Value::Closure(..) | Value::Hash(_) | Value::Eof | Value::Unspecified => {
+            Err(macro_err(v))
+        }
     }
 }
 
@@ -286,6 +362,16 @@ struct Vm<'m> {
     /// each validate/decode as much as they can use and leave the rest.
     stdin_buffer: Vec<u8>,
     stdin_channel: StdinChannel,
+    /// Monotonic counter backing the `gensym` native (spec-adjacent B14):
+    /// each call produces `Value::Symbol(format!("gensym {n}"))`, and a
+    /// space is guaranteed to never appear inside any symbol the reader
+    /// itself can ever produce from source text (`Scanner::is_delimiter`
+    /// stops a symbol's token at the first whitespace) -- so no ordinary,
+    /// plausible-looking source-written symbol (`'g1`, `'gensym`, anything
+    /// else typeable) can ever collide with a generated one, and two
+    /// different calls never collide with each other since the counter
+    /// only advances.
+    gensym_counter: u64,
 }
 
 /// A lazy, on-demand relay to the real stdin reader living on the thread
@@ -641,6 +727,53 @@ impl<'m> Vm<'m> {
     }
 }
 
+/// Runs one already-compiled top-level function (by its index into
+/// `module`'s function table) directly to completion, on whatever thread
+/// calls this, and hands back its return `Value` -- used by `define-macro`
+/// expansion (B14): a macro's body is compiled into `module` exactly like
+/// an ordinary function (see `compile_function`), and expanding a call to
+/// it means actually *running* that body against the call's own
+/// (unevaluated) operand data to get the replacement code, not just
+/// compiling it.
+///
+/// Always a fresh [`Vm`] with fresh [`default_globals`] and no captured
+/// environment (`Env { locals: vec![], parent: None }`, the same "empty,
+/// parentless" shape every top-level closure already gets per
+/// `Op::MakeFunction`'s own doc comment above) -- a macro body can call
+/// any native procedure (this is how the swap-macro demo's own body uses
+/// `gensym`, for instance) but, unlike an ordinary function call at
+/// runtime, cannot reach any other top-level `define`d name: the compiler
+/// has no persistent, incrementally-executed global environment to hand
+/// it one from (compiling and running a whole program are still two
+/// entirely separate phases everywhere else in this codebase). Not
+/// exercised by any of this behaviour's required demos, which only need
+/// macro bodies built from natives, quasiquote, and other macro calls.
+///
+/// No dedicated big stack thread of its own: this is always called from
+/// within `compile_program`'s own dedicated `COMPILE_STACK_SIZE` thread
+/// (3 GiB, matching `VM_STACK_SIZE` exactly), so running here directly
+/// reuses that same budget rather than spending a redundant nested spawn.
+pub(crate) fn eval_top_level_function(
+    module: &Module,
+    fn_index: u32,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    let mut vm = Vm {
+        module,
+        globals: default_globals(),
+        call_depth: 0,
+        stdin_buffer: Vec::new(),
+        stdin_channel: StdinChannel::none(),
+        gensym_counter: 0,
+    };
+    let env = Rc::new(Env {
+        locals: Vec::new(),
+        parent: None,
+    });
+    let mut sink = std::io::sink();
+    vm.call_value(&Value::Closure(fn_index, env), args, &mut sink)
+}
+
 fn bind_arguments(
     chunk: &Chunk,
     mut args: Vec<Value>,
@@ -806,6 +939,7 @@ fn run_on_this_thread(
         call_depth: 0,
         stdin_buffer: Vec::new(),
         stdin_channel,
+        gensym_counter: 0,
     };
     let entry = module
         .functions
@@ -1195,6 +1329,16 @@ fn call_native(
                 .ok_or_else(|| error("write expects exactly 1 argument"))?;
             write!(out, "{}", write_repr(value)).map_err(|e| error(e.to_string()))?;
             Ok(Value::Unspecified)
+        }
+        "gensym" => {
+            if !args.is_empty() {
+                return Err(error(format!(
+                    "gensym expects exactly 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            vm.gensym_counter += 1;
+            Ok(Value::Symbol(format!("gensym {}", vm.gensym_counter)))
         }
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
@@ -2727,6 +2871,115 @@ mod tests {
         assert!(run(&module, &mut FailingWriter).is_err());
     }
 
+    #[test]
+    fn eval_top_level_function_runs_an_already_compiled_functions_body_directly() {
+        // `double`'s own lambda chunk is pushed to `module.functions` before
+        // the synthetic entry chunk `compile_program` always appends last —
+        // for a program with exactly this one top-level define, that makes
+        // index 0 `double`'s own body.
+        let forms = read_program("(define (double x) (* x 2))").unwrap();
+        let module = compile_program(&forms).unwrap();
+        assert_eq!(module.entry_index, 1);
+        let result = eval_top_level_function(&module, 0, vec![Value::Int(21)]).unwrap();
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn eval_top_level_function_can_call_native_procedures() {
+        let forms = read_program("(define (f) (gensym))").unwrap();
+        let module = compile_program(&forms).unwrap();
+        let result = eval_top_level_function(&module, 0, vec![]).unwrap();
+        assert!(matches!(result, Value::Symbol(_)));
+    }
+
+    #[test]
+    fn eval_top_level_function_binds_a_rest_parameter_as_a_list() {
+        let forms = read_program("(define (f . rest) rest)").unwrap();
+        let module = compile_program(&forms).unwrap();
+        let result =
+            eval_top_level_function(&module, 0, vec![Value::Int(1), Value::Int(2)]).unwrap();
+        assert_eq!(result, Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)])));
+    }
+
+    #[test]
+    fn eval_top_level_function_reports_a_wrong_argument_count_as_a_clean_error() {
+        let forms = read_program("(define (f x y) x)").unwrap();
+        let module = compile_program(&forms).unwrap();
+        assert!(eval_top_level_function(&module, 0, vec![Value::Int(1)]).is_err());
+    }
+
+    #[test]
+    fn value_to_sexpr_converts_every_simple_variant() {
+        assert_eq!(value_to_sexpr(&Value::Int(5)).unwrap(), Sexpr::Int(5));
+        assert_eq!(value_to_sexpr(&Value::Float(1.5)).unwrap(), Sexpr::Float(1.5));
+        assert_eq!(value_to_sexpr(&Value::Bool(true)).unwrap(), Sexpr::Bool(true));
+        assert_eq!(value_to_sexpr(&Value::Char('a')).unwrap(), Sexpr::Char('a'));
+        assert_eq!(
+            value_to_sexpr(&Value::Str(Rc::new("hi".to_string()))).unwrap(),
+            Sexpr::Str("hi".to_string())
+        );
+        assert_eq!(
+            value_to_sexpr(&Value::Symbol("foo".to_string())).unwrap(),
+            Sexpr::Symbol("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_converts_a_proper_list_built_via_cons_into_a_list_not_a_dotted_list() {
+        let list = Value::Pair(Rc::new(RefCell::new((
+            Value::Int(1),
+            Value::Pair(Rc::new(RefCell::new((
+                Value::Int(2),
+                Value::List(Rc::new(vec![])),
+            )))),
+        ))));
+        assert_eq!(
+            value_to_sexpr(&list).unwrap(),
+            Sexpr::List(vec![Sexpr::Int(1), Sexpr::Int(2)])
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_converts_a_flat_runtime_list_the_same_way_as_a_cons_chain() {
+        let list = Value::List(Rc::new(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(
+            value_to_sexpr(&list).unwrap(),
+            Sexpr::List(vec![Sexpr::Int(1), Sexpr::Int(2)])
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_converts_a_pair_whose_cdr_is_not_a_list_into_a_dotted_list() {
+        let pair = Value::Pair(Rc::new(RefCell::new((Value::Int(1), Value::Int(2)))));
+        assert_eq!(
+            value_to_sexpr(&pair).unwrap(),
+            Sexpr::DottedList(vec![Sexpr::Int(1)], Box::new(Sexpr::Int(2)))
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_converts_a_vector() {
+        let v = Value::Vector(Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)])));
+        assert_eq!(
+            value_to_sexpr(&v).unwrap(),
+            Sexpr::Vector(vec![Sexpr::Int(1), Sexpr::Int(2)])
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_reports_a_circular_list_as_a_clean_error_not_an_infinite_loop() {
+        let cell = Rc::new(RefCell::new((Value::Int(1), Value::Unspecified)));
+        cell.borrow_mut().1 = Value::Pair(cell.clone());
+        assert!(value_to_sexpr(&Value::Pair(cell)).is_err());
+    }
+
+    #[test]
+    fn value_to_sexpr_rejects_a_procedure_value_with_a_clear_error() {
+        assert!(value_to_sexpr(&Value::Native("car".to_string())).is_err());
+        assert!(value_to_sexpr(&Value::Eof).is_err());
+        assert!(value_to_sexpr(&Value::Unspecified).is_err());
+    }
+
     // --- upvalue error paths (qa test-design review, msg #87/#89): these
     // three defensive checks in resolve_env/upvalue_cell are only ever
     // reachable via a hand-crafted .mlbc artifact (the compiler never emits
@@ -3048,6 +3301,7 @@ mod tests {
                         call_depth: 0,
                         stdin_buffer: Vec::new(),
                         stdin_channel: StdinChannel::none(),
+                        gensym_counter: 0,
                     };
                     let mut out = Vec::new();
                     let entry = &module.functions[module.entry_index as usize];
@@ -4528,6 +4782,7 @@ mod tests {
             call_depth: 0,
             stdin_buffer: Vec::new(),
             stdin_channel: StdinChannel::none(),
+            gensym_counter: 0,
         };
         let mut out = Vec::new();
         let entry = &module.functions[module.entry_index as usize];

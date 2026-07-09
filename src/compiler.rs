@@ -1,10 +1,12 @@
 //! Compiles reader output into bytecode.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Const, Module, Op};
 use crate::reader::Sexpr;
+use crate::vm::{eval_top_level_function, value_to_sexpr};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompileError {
@@ -57,11 +59,39 @@ fn too_deep() -> CompileError {
 /// actually matters here.
 const MAX_QUASIQUOTE_SEQUENCE_LEN: usize = 2_000;
 
-/// Threads the module being built and a counter for generating unique
-/// internal names — see [`Ctx::aliases`].
+/// Caps how many times a single macro call site's expansion result may
+/// itself turn out to be another macro call before giving up (B14, E3): a
+/// macro engineered to always expand into another macro call (possibly
+/// itself) never reaches a non-macro-call result on its own, and without
+/// this bound `compile_macro_call`'s repeat-until-done loop would spin
+/// forever instead of failing. Not interchangeable with
+/// `MAX_NESTING_DEPTH`: that guard bounds how deep an expression TREE
+/// nests; this one bounds how many times ONE call site gets re-expanded in
+/// place before compiling whatever it settles on.
+const MAX_MACRO_EXPANSION_ROUNDS: usize = 100;
+
+fn too_many_macro_expansion_rounds() -> CompileError {
+    err(format!(
+        "macro expansion exceeded the maximum supported rounds ({MAX_MACRO_EXPANSION_ROUNDS}) -- possible infinite macro recursion"
+    ))
+}
+
+/// Threads the module being built, a counter for generating unique internal
+/// names (see [`Ctx::aliases`]), and every `define-macro` seen so far
+/// (B14) — mapping a macro's name directly to the index of its already-
+/// compiled body in `module.functions` (compiled once, at `define-macro`
+/// time, exactly like an ordinary function; reused unchanged at every call
+/// site rather than recompiled each time).
+///
+/// Deliberately NOT part of `Ctx`: `Ctx` is cloned and extended per lexical
+/// scope (see its own doc comment), but a macro, once defined, stays
+/// visible everywhere afterward in the program regardless of lexical
+/// nesting — the same "flat, whole-compilation" visibility `Compilation`
+/// itself already has, unlike a lexically-scoped binding.
 struct Compilation {
     module: Module,
     gensym_counter: u32,
+    macros: HashMap<String, u32>,
 }
 
 impl Compilation {
@@ -69,6 +99,7 @@ impl Compilation {
         Compilation {
             module: Module::default(),
             gensym_counter: 0,
+            macros: HashMap::new(),
         }
     }
 
@@ -873,6 +904,132 @@ fn compile_define(
     Ok(())
 }
 
+/// Splits `define-macro`'s `(name . formals)` head into the macro's name
+/// and a standalone formals `Sexpr` -- the same shape [`extract_define_
+/// binding`] extracts for `define`'s own function shorthand, kept as its
+/// own small function rather than reusing that one directly since it
+/// returns a formals `Sexpr` alone (fed straight to [`compile_function`]),
+/// not a synthetic `lambda` form wrapping a name/value pair.
+fn split_define_macro_head(head: &Sexpr) -> Result<(String, Sexpr), CompileError> {
+    match head {
+        Sexpr::List(head_items) => {
+            let (name_sexpr, formal_items) = head_items
+                .split_first()
+                .ok_or_else(|| err("define-macro's head cannot be empty"))?;
+            let name = expect_symbol_name(name_sexpr)?;
+            Ok((name, Sexpr::List(formal_items.to_vec())))
+        }
+        Sexpr::DottedList(head_items, tail) => {
+            let (name_sexpr, formal_items) = head_items
+                .split_first()
+                .ok_or_else(|| err("define-macro's head cannot be empty"))?;
+            let name = expect_symbol_name(name_sexpr)?;
+            let formals = if formal_items.is_empty() {
+                (**tail).clone()
+            } else {
+                Sexpr::DottedList(formal_items.to_vec(), tail.clone())
+            };
+            Ok((name, formals))
+        }
+        other => Err(err(format!(
+            "define-macro requires a (name . formals) head, got: {other:?}"
+        ))),
+    }
+}
+
+/// `(define-macro (name . formals) body...)` (B14): compiles the macro's
+/// body exactly like an ordinary function -- reusing [`compile_function`]
+/// directly, not wrapped in a synthetic `lambda` `Sexpr` -- and registers
+/// `name` in `comp.macros` pointing at that compiled body's index. Nothing
+/// observable happens at runtime: unlike `define`, no global is created
+/// (a macro is a compile-time-only construct; expanding a call to it never
+/// goes through `GET_GLOBAL`), so this just leaves the same `Unspecified`
+/// placeholder on the stack every top-level form needs for the `POP`
+/// `compile_program` emits after it.
+fn compile_define_macro(
+    items: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<(), CompileError> {
+    let head = items
+        .get(1)
+        .ok_or_else(|| err("define-macro requires a (name . formals) head"))?;
+    let (name, formals_sexpr) = split_define_macro_head(head)?;
+    let fn_index = compile_function(&formals_sexpr, &items[2..], comp, depth, ctx)?;
+    comp.macros.insert(name, fn_index);
+    let idx = chunk.add_const(Const::Unspecified);
+    chunk.emit_const(idx);
+    Ok(())
+}
+
+/// True if `name` is shadowed by an ordinary binding visible at `ctx` --
+/// exactly the same three lookups, in the same order, [`compile_expr`]'s
+/// own `Sexpr::Symbol` arm already checks before falling back to a global
+/// reference. Used to decide whether `(name ...)` should be treated as a
+/// macro call at all (B14, E5): a macro whose name is shadowed by a local
+/// variable, parameter, or `let`/`letrec` binding in the enclosing scope
+/// must compile as an ordinary call against that binding, not a macro
+/// expansion -- the same rule that already applies to a bare reference to
+/// the name.
+fn is_shadowed_by_a_binding(name: &str, ctx: &Ctx) -> Result<bool, CompileError> {
+    Ok(ctx.resolve_local(name).is_some()
+        || ctx.resolve_alias(name).is_some()
+        || ctx.resolve_upvalue(name)?.is_some())
+}
+
+/// Expands a macro call in place and compiles whatever it settles on.
+///
+/// Each round: the operands (still raw, unevaluated `Sexpr`s at this
+/// point) become literal-data `Value`s via the same `sexpr_to_const` this
+/// file already uses for `quote` (B14, E1 -- an operand referencing an
+/// undefined name must never be evaluated, only handed over as the data
+/// describing it), the macro's already-compiled body is actually run
+/// against them via `eval_top_level_function`, and its return `Value`
+/// becomes an `Sexpr` again via `value_to_sexpr` -- the replacement code.
+/// If THAT replacement is itself a call to a (still-unshadowed) macro, the
+/// same process repeats on it instead of compiling it directly (E3), up to
+/// `MAX_MACRO_EXPANSION_ROUNDS` rounds before giving up with a clean error
+/// rather than looping forever on a macro that always expands into
+/// another macro call.
+fn compile_macro_call(
+    initial_op: &str,
+    initial_operands: &[Sexpr],
+    ctx: &Ctx,
+    chunk: &mut Chunk,
+    comp: &mut Compilation,
+    depth: usize,
+    tail: bool,
+) -> Result<(), CompileError> {
+    let mut op = initial_op.to_string();
+    let mut operands = initial_operands.to_vec();
+    for _ in 0..MAX_MACRO_EXPANSION_ROUNDS {
+        let fn_index = *comp
+            .macros
+            .get(&op)
+            .expect("caller already confirmed this name is a registered macro");
+        let args = operands
+            .iter()
+            .map(|operand| sexpr_to_const(operand).map(|c| crate::vm::const_to_value(&c)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = eval_top_level_function(&comp.module, fn_index, args)
+            .map_err(|e| err(format!("error while expanding macro '{op}': {e}")))?;
+        let expanded = value_to_sexpr(&result)?;
+        if let Sexpr::List(next_items) = &expanded {
+            if let Some(Sexpr::Symbol(next_op)) = next_items.first() {
+                if !is_shadowed_by_a_binding(next_op, ctx)? && comp.macros.contains_key(next_op) {
+                    op = next_op.clone();
+                    operands = next_items[1..].to_vec();
+                    continue;
+                }
+            }
+        }
+        return compile_expr(&expanded, ctx, chunk, comp, depth + 1, tail);
+    }
+    Err(too_many_macro_expansion_rounds())
+}
+
 fn compile_lambda(
     items: &[Sexpr],
     ctx: &Ctx,
@@ -1466,6 +1623,9 @@ fn compile_expr(
                     }
                     "if" => return compile_if(items, ctx, chunk, comp, depth, tail),
                     "define" => return compile_define(items, ctx, chunk, comp, depth),
+                    "define-macro" => {
+                        return compile_define_macro(items, ctx, chunk, comp, depth);
+                    }
                     "lambda" => return compile_lambda(items, ctx, chunk, comp, depth),
                     "begin" => {
                         return compile_sequence(&items[1..], ctx, chunk, comp, depth + 1, tail);
@@ -1498,6 +1658,9 @@ fn compile_expr(
                         ));
                     }
                     _ => {}
+                }
+                if comp.macros.contains_key(op.as_str()) && !is_shadowed_by_a_binding(op, ctx)? {
+                    return compile_macro_call(op, &items[1..], ctx, chunk, comp, depth, tail);
                 }
             }
             let (callee, args) = items
