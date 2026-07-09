@@ -23,6 +23,8 @@ mod steps_b11;
 mod steps_b12;
 #[path = "features/steps_b13.rs"]
 mod steps_b13;
+#[path = "features/steps_b14.rs"]
+mod steps_b14;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -132,4 +134,10 @@ fn b12_io_read_write_display() {
 fn b13_quasiquotation() {
     let src = include_str!("../features/B13-quasiquotation.feature");
     registry::run_feature("B13-quasiquotation", src, &steps_b13::registry());
+}
+
+#[test]
+fn b14_macros_and_gensym() {
+    let src = include_str!("../features/B14-macros-and-gensym.feature");
+    registry::run_feature("B14-macros-and-gensym", src, &steps_b14::registry());
 }
