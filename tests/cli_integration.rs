@@ -10,6 +10,8 @@
 
 #[path = "cli_integration/helpers.rs"]
 mod helpers;
+#[path = "cli_integration/internals.rs"]
+mod internals;
 
 #[path = "cli_integration/b1.rs"]
 mod b1;

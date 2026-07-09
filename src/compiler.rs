@@ -3190,14 +3190,25 @@ mod tests {
         // one for the repeated-quasiquote-FORMS shape the guard was
         // originally sized for -- so the same logical depth limit leaves a
         // smaller real-stack safety margin for this shape than the other.
-        // Confirmed by hand (sweeping thread stack sizes) that a small
-        // enough calling thread crashes on the list shape well before it
-        // would on the forms shape. `compile_program` now runs on its own
-        // dedicated, generously-sized thread specifically so this never
-        // depends on the caller at all -- calling it from a deliberately
-        // tiny (1 MiB) thread, at a depth safely past the ordinary
-        // `MAX_NESTING_DEPTH` guard, must still return a clean `Err`, not
-        // inherit the tiny caller's stack.
+        // `compile_program` now runs on its own dedicated, generously-sized
+        // thread specifically so this never depends on the caller at all.
+        //
+        // qa test-design WARNING msg #245: at THIS depth (5,000) and stack
+        // size (1 MiB), this test does not actually discriminate fixed
+        // from reverted under `cargo test --release` -- the profile this
+        // whole review process tests in -- release's smaller stack frames
+        // mean neither variant crashes here. It's kept anyway as a fast,
+        // always-run smoke check that this exact call shape returns a
+        // clean `Err` rather than hanging or panicking; the actual
+        // fixed-vs-reverted discriminating regression coverage for this
+        // fix lives in `tests/cli_integration/internals.rs`
+        // (`compiling_a_hand_built_deeply_nested_quasiquote_list_does_not_crash_on_a_severely_constrained_calling_thread`),
+        // which observes a real OS process from outside itself and so can
+        // register a genuine stack overflow (which aborts, not unwinds --
+        // something `.join()` here structurally cannot catch either way)
+        // as an ordinary, targeted test failure instead of taking the
+        // whole suite down.
+        //
         // Built on this (ordinary-stack) thread, not inside the
         // constrained one below: dropping a 5,000-deep `Sexpr` tree uses
         // Rust's default recursive `Drop` glue (a separate, already-
