@@ -180,6 +180,61 @@ fn read_completes_promptly_even_when_stdin_stays_open_after_a_complete_datum() {
 }
 
 #[test]
+fn read_completes_promptly_for_a_datum_that_lands_exactly_on_a_full_relay_read_boundary() {
+    // Regression test for warden security review msg #231/#232: the
+    // short-vs-full-read signal is a much better proxy than chunk count,
+    // but it's still a guess about the transport, not a fact about the
+    // grammar -- when a complete datum's last byte happens to land
+    // exactly at the end of a FULL relay read (the relay's fixed 8192-
+    // byte buffer, see `run_with_stdin` in src/vm.rs), the old logic
+    // concluded "more is probably still coming" and never retried,
+    // stalling indefinitely even though nothing more was ever coming.
+    // Sends a complete, valid 8192-byte string-literal datum (`"` + 8190
+    // `a`s + `"`) in a single write, landing as exactly one full 8192-byte
+    // relay read, then holds the stream open with no further data.
+    let file = write_source(
+        "b12-read-full-boundary.ml",
+        "(display (string-length (read)))",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let datum = format!("\"{}\"", "a".repeat(8190));
+    assert_eq!(datum.len(), 8192, "datum must land exactly on the relay's read buffer size");
+    stdin.write_all(datum.as_bytes()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not complete within 5s while stdin stayed open \
+                 after a datum landing exactly on the 8192-byte relay read \
+                 boundary -- the full-read-boundary stall regression"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(status.success(), "expected a clean exit, got: {status:?}");
+}
+
+#[test]
 fn read_completes_promptly_for_a_datum_delivered_in_far_more_than_sixty_four_small_chunks() {
     // Regression test for warden security review msg #226 and qa msg #227:
     // the previous fix for the test above only retried eagerly for the

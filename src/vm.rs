@@ -301,23 +301,14 @@ struct Vm<'m> {
 /// short, already-closed pipe.
 struct StdinChannel {
     request: mpsc::Sender<()>,
-    response: mpsc::Receiver<Option<(Vec<u8>, bool)>>,
+    response: mpsc::Receiver<Option<Vec<u8>>>,
 }
 
 impl StdinChannel {
     /// Requests and returns the next raw chunk -- however many bytes are
-    /// immediately available, not line-delimited -- alongside whether that
-    /// read was "full" (returned as many bytes as the relay's fixed-size
-    /// buffer could hold), or `None` once the underlying stream is
-    /// genuinely exhausted (or, for [`Self::none`], unconditionally).
-    ///
-    /// The `bool` is a short-read signal, not a chunk-count/size proxy: a
-    /// full read means the OS *might* already have more sitting in its
-    /// buffer, ready to hand over without blocking, so it's worth reading
-    /// again before spending time re-parsing; a short read (`false`) means
-    /// the source had no more to give RIGHT NOW, which is the caller's one
-    /// reliable, immediate signal that this is the moment to actually try
-    /// parsing what's accumulated so far, however many chunks that took.
+    /// immediately available, not line-delimited -- or `None` once the
+    /// underlying stream is genuinely exhausted (or, for [`Self::none`],
+    /// unconditionally).
     ///
     /// Deliberately NOT line-oriented (an earlier version used
     /// `BufRead::read_line`, one line per chunk): `read_line` blocks until
@@ -329,7 +320,7 @@ impl StdinChannel {
     /// (warden security review msg #218's interactive-stall finding).
     /// Reading whatever's already available, with no delimiter
     /// requirement, has no such gap.
-    fn next_chunk(&self) -> Option<(Vec<u8>, bool)> {
+    fn next_chunk(&self) -> Option<Vec<u8>> {
         self.request.send(()).ok()?;
         self.response.recv().ok().flatten()
     }
@@ -745,7 +736,7 @@ pub fn run_with_stdin(
 ) -> Result<(), RuntimeError> {
     let mut buffer = Vec::new();
     let (req_tx, req_rx) = mpsc::channel::<()>();
-    let (resp_tx, resp_rx) = mpsc::channel::<Option<(Vec<u8>, bool)>>();
+    let (resp_tx, resp_rx) = mpsc::channel::<Option<Vec<u8>>>();
     let stdin_channel = StdinChannel {
         request: req_tx,
         response: resp_rx,
@@ -774,7 +765,7 @@ pub fn run_with_stdin(
             let mut buf = [0u8; 8192];
             let chunk = match input.read(&mut buf) {
                 Ok(0) | Err(_) => None,
-                Ok(n) => Some((buf[..n].to_vec(), n == buf.len())),
+                Ok(n) => Some(buf[..n].to_vec()),
             };
             if resp_tx.send(chunk).is_err() {
                 break;
@@ -1388,38 +1379,148 @@ fn find_hash_value(entries: &Rc<RefCell<Vec<(Value, Value)>>>, key: &Value) -> O
 /// of `vm.stdin_buffer`, leaving the rest for a subsequent `read`/
 /// `read-line` call to continue from.
 ///
+/// Incrementally tracks just enough lexical state -- bracket depth,
+/// whether we're inside a string or a comment -- to know when a complete
+/// top-level datum MIGHT now be sitting at the front of a growing buffer,
+/// examining only newly-arrived text each call rather than re-scanning
+/// from the start. This is `native_read`'s way out of a genuine dilemma:
 /// `read_one` re-tokenizes its whole input from scratch every call (it has
-/// no state to resume from), so naively retrying it after every single new
-/// chunk pulled in for a datum spread across N chunks costs O(current
-/// size) per chunk x O(N) chunks = O(N^2) total (warden security review
-/// msg #208, confirmed with measured quadratic scaling). Two earlier fixes
-/// gated retries behind chunk-count/buffer-size thresholds instead, but
-/// both only relocated warden security review msg #218's interactive
-/// stall rather than fixing it: whatever proxy threshold is picked, a
-/// datum that finishes just short of it sits unread indefinitely on any
+/// no state to resume from), so retrying it after every single new chunk
+/// pulled in for a datum spread across N chunks costs O(current size) per
+/// chunk x O(N) chunks = O(N^2) total in the worst case (warden security
+/// review msg #208) -- but skipping some of those retries based on a guess
+/// about the transport (chunk count, buffer size, whether the last relay
+/// read was "full" or "short") is fundamentally unsound: whatever proxy is
+/// picked, a datum finishing just past it sits unread indefinitely on any
 /// stream that stays open afterward, since nothing else ever prompts
-/// another attempt (warden msg #226, qa msg #227, both independently
-/// reproducing the identical stall for datums spread across enough
-/// chunks).
+/// another attempt. Three fixes in that family were each defeated in turn
+/// (warden msgs #218/#226/#231/#232, qa msg #227).
 ///
-/// The actual fix retries based on the one signal that reflects genuine
-/// stream state instead of guessing from chunk count or buffer size:
-/// whether the most recent read from the relay was "full" (returned as
-/// many bytes as its fixed-size buffer could hold) or "short" (fewer). A
-/// full read means the OS may already have more sitting in its buffer,
-/// essentially free to fetch, so it's worth pulling that in before paying
-/// for a re-parse; a short read means the source had nothing more to give
-/// at that instant -- which is exactly the moment to attempt a parse,
-/// regardless of how many chunks it took to get there. This keeps a
-/// large, fully-buffered datum's total cost close to linear (few, if any,
-/// short reads occur until its very end) while an interactive or
-/// segmented source -- which returns short reads almost every time, by
-/// definition -- gets retried after every single chunk, with no threshold
-/// to overshoot.
+/// This sidesteps the dilemma instead of picking a side: it's not a full
+/// parser (it never rejects malformed input -- that's still `read_one`'s
+/// job) and deliberately errs toward MORE frequent real attempts whenever
+/// its simplified view of the grammar is unsure, since an extra attempt
+/// only costs a little time while missing a real boundary would silently
+/// reintroduce the exact stall this exists to prevent. It mirrors only the
+/// handful of `Scanner` rules that affect whether a `(`/`)` is "real" --
+/// comments, string escapes, and the `#\c` single-character-literal
+/// exception (so `#\(` and `#\)` don't miscount as brackets) -- everything
+/// else is treated uniformly as ordinary token text.
+#[derive(Default)]
+struct DatumBoundaryScan {
+    depth: i64,
+    in_string: bool,
+    in_comment: bool,
+    string_escape_next: bool,
+    /// Set right after an unconsumed `#`, to recognize a following `\` as
+    /// starting spec 3.1's `#\c` character literal (see
+    /// `char_literal_pending`) -- `#(` (a vector literal) instead falls
+    /// through to ordinary bracket handling on the very same character.
+    after_hash: bool,
+    char_literal_pending: bool,
+    seen_token: bool,
+}
+
+impl DatumBoundaryScan {
+    /// Feeds newly-arrived, already UTF-8-boundary-safe text through the
+    /// tracker. Must be called with every chunk in arrival order, and with
+    /// the buffer's own pre-existing contents first if resuming on a
+    /// buffer that already had some in it.
+    fn feed(&mut self, new_text: &str) {
+        for c in new_text.chars() {
+            if self.char_literal_pending {
+                // Exactly one character after `#\` (spec 3.1's character
+                // literal), consumed verbatim -- `(`/`)`/`"`/`;` here are
+                // just that character's own datum, not real delimiters.
+                self.char_literal_pending = false;
+                self.seen_token = true;
+                continue;
+            }
+            if self.in_comment {
+                if c == '\n' {
+                    self.in_comment = false;
+                }
+                continue;
+            }
+            if self.in_string {
+                if self.string_escape_next {
+                    self.string_escape_next = false;
+                } else if c == '\\' {
+                    self.string_escape_next = true;
+                } else if c == '"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            let after_hash = std::mem::take(&mut self.after_hash);
+            if after_hash && c == '\\' {
+                self.char_literal_pending = true;
+                self.seen_token = true;
+                continue;
+            }
+            match c {
+                '#' => {
+                    self.after_hash = true;
+                    self.seen_token = true;
+                }
+                ';' => self.in_comment = true,
+                '"' => {
+                    self.in_string = true;
+                    self.seen_token = true;
+                }
+                '(' => {
+                    self.depth += 1;
+                    self.seen_token = true;
+                }
+                ')' => {
+                    self.depth -= 1;
+                    self.seen_token = true;
+                }
+                c if c.is_whitespace() => {}
+                _ => self.seen_token = true,
+            }
+        }
+    }
+
+    /// True once the tracker has seen some real content and its (possibly
+    /// imprecise, always safely-biased) view of bracket depth has returned
+    /// to zero or below outside a string/comment -- the earliest point a
+    /// complete datum could possibly be present. Doesn't itself guarantee
+    /// a *valid* datum is there; only that attempting a real parse is now
+    /// worth its cost.
+    fn possible_boundary(&self) -> bool {
+        self.seen_token && !self.in_string && !self.in_comment && self.depth <= 0
+    }
+}
+
 fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
-    let mut should_attempt = true;
+    let mut boundary = DatumBoundaryScan::default();
+    // How much of `vm.stdin_buffer` has been fed to `boundary` so far --
+    // re-decoding the whole buffer every time (like `read_one` itself
+    // does) would defeat the point; only ever feeding the NEW, already-
+    // validated suffix keeps this genuinely incremental. Never re-derived
+    // from a chunk in isolation (a chunk boundary can legitimately split
+    // a multi-byte character) -- always from the buffer as a whole, via
+    // `Utf8Error::valid_up_to` when it's not (yet) fully valid.
+    let mut fed_up_to = 0;
+    let feed_buffer = |vm: &Vm, boundary: &mut DatumBoundaryScan, fed_up_to: &mut usize| {
+        let valid_up_to = match std::str::from_utf8(&vm.stdin_buffer) {
+            Ok(text) => text.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        // No `valid_up_to > *fed_up_to` guard: `vm.stdin_buffer` only ever
+        // grows within one `native_read` call, so `valid_up_to` is never
+        // less than the previous call's `*fed_up_to` -- when they're
+        // equal (nothing new to feed), the slice below is simply empty
+        // and this is a no-op, exactly as a guard would have produced.
+        if let Ok(new_text) = std::str::from_utf8(&vm.stdin_buffer[*fed_up_to..valid_up_to]) {
+            boundary.feed(new_text);
+        }
+        *fed_up_to = valid_up_to;
+    };
+    feed_buffer(vm, &mut boundary, &mut fed_up_to);
     loop {
-        if should_attempt {
+        if boundary.possible_boundary() {
             // A chunk boundary can legitimately split a multi-byte UTF-8
             // character in the middle -- that decode failure is ambiguous
             // the same way "not enough to parse yet" already is, and is
@@ -1447,9 +1548,9 @@ fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
             }
         }
         match vm.stdin_channel.next_chunk() {
-            Some((chunk, was_full_read)) => {
+            Some(chunk) => {
                 vm.stdin_buffer.extend_from_slice(&chunk);
-                should_attempt = !was_full_read;
+                feed_buffer(vm, &mut boundary, &mut fed_up_to);
             }
             None => {
                 let text = std::str::from_utf8(&vm.stdin_buffer)
@@ -1484,7 +1585,7 @@ fn native_read_line(vm: &mut Vm) -> Result<Value, RuntimeError> {
             return Ok(Value::Str(Rc::new(line)));
         }
         match vm.stdin_channel.next_chunk() {
-            Some((chunk, _)) => vm.stdin_buffer.extend_from_slice(&chunk),
+            Some(chunk) => vm.stdin_buffer.extend_from_slice(&chunk),
             None if vm.stdin_buffer.is_empty() => return Ok(Value::Eof),
             None => {
                 let line_bytes = std::mem::take(&mut vm.stdin_buffer);
@@ -5660,6 +5761,150 @@ mod tests {
     }
 
     #[test]
+    fn datum_boundary_scan_a_bare_atom_is_a_boundary_immediately() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed("42");
+        assert!(b.possible_boundary());
+    }
+
+    #[test]
+    fn datum_boundary_scan_leading_whitespace_alone_is_not_yet_a_boundary() {
+        // Leading whitespace shouldn't count as "seen a token" on its own
+        // -- otherwise a datum preceded by blank lines would trigger a
+        // (harmless but wasted) parse attempt on the very first space
+        // rather than waiting for real content to actually start.
+        let mut b = DatumBoundaryScan::default();
+        b.feed("   \n\t  ");
+        assert!(!b.possible_boundary());
+        b.feed("1");
+        assert!(b.possible_boundary());
+    }
+
+    #[test]
+    fn datum_boundary_scan_stays_not_a_boundary_while_a_list_is_still_open() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(1 2 3");
+        assert!(!b.possible_boundary());
+        b.feed(")");
+        assert!(b.possible_boundary());
+    }
+
+    #[test]
+    fn datum_boundary_scan_ignores_unbalanced_parens_inside_a_string() {
+        // Regression guard for the exact risk this tracker exists to
+        // avoid: a string literal containing an unmatched `(` must NOT
+        // permanently desync the depth counter, or a real, later boundary
+        // would never register (the stall this whole design prevents).
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display \"only one (\")");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_ignores_an_escaped_quote_inside_a_string() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed(r#"(display "a\" (still inside)")"#);
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_ignores_parens_inside_a_line_comment() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display 1) ; a comment with ((( unmatched parens\n");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_does_not_miscount_parens_inside_a_character_literal() {
+        // `#\(` and `#\)` are spec 3.1 character literals for the '(' and
+        // ')' characters themselves, not real brackets -- confirmed via
+        // the actual reader shape this mirrors (`read_program("#\\(")`
+        // elsewhere reads as `Sexpr::Char('(')`, not a list open).
+        let mut b = DatumBoundaryScan::default();
+        b.feed(r"(display #\( )");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_does_not_miscount_a_close_paren_character_literal() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed(r"(display #\) )");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_a_vector_literal_open_still_counts_as_a_real_bracket() {
+        // Unlike `#\(`, a bare `#(` (no backslash) is spec 3.1's vector
+        // literal, closed by an ordinary `)` -- must still count normally.
+        let mut b = DatumBoundaryScan::default();
+        b.feed("#(1 2 3");
+        assert!(!b.possible_boundary());
+        b.feed(")");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_a_construct_split_across_two_feed_calls_still_tracks_correctly() {
+        // Exercises the actual use case: chunks arrive piecemeal, and a
+        // tricky construct (a character literal, here) can straddle a
+        // chunk boundary exactly like any other text.
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display #");
+        b.feed(r"\( )");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn read_correctly_decodes_a_multi_byte_character_split_exactly_across_a_relay_chunk_boundary()
+    {
+        // Regression guard for a gap warden security review msg #226/#227
+        // flagged as verified only by hand, never committed: `run_with_stdin`
+        // relays raw 8192-byte chunks with no regard for UTF-8 character
+        // boundaries (by design -- splitting on bytes, not `char`s, is what
+        // makes byte-based buffering correct at all here), so a multi-byte
+        // character can legitimately have its bytes land in two different
+        // chunks. Pads with exactly enough ASCII bytes that the accented
+        // character's two UTF-8 bytes straddle the 8192-byte boundary.
+        use crate::unicode_fixtures::ACCENTED_LETTER;
+        let mut accented_bytes = [0u8; 4];
+        let accented_len = ACCENTED_LETTER.encode_utf8(&mut accented_bytes).len();
+        assert_eq!(accented_len, 2, "fixture must be a 2-byte character");
+
+        let prefix_len = 8192 - 1; // leaves the character's 1st byte at offset 8191
+        let padding = "x".repeat(prefix_len - 1); // -1 for the opening quote
+        let body = format!("{padding}{ACCENTED_LETTER}more text after the split");
+        let stdin = format!("\"{body}\"");
+        assert_eq!(
+            &stdin.as_bytes()[8190..8193],
+            [b'x', accented_bytes[0], accented_bytes[1]],
+            "the accented character's bytes must straddle offsets 8191/8192"
+        );
+
+        let out = eval_with_stdin("(display (string-length (read)))", &stdin).unwrap();
+        assert_eq!(out, body.chars().count().to_string());
+    }
+
+    #[test]
+    fn read_completes_promptly_for_a_datum_containing_unbalanced_parens_inside_a_string_spread_across_many_chunks()
+     {
+        // End-to-end regression guard: a long string literal (spanning
+        // many relay chunks) containing an unmatched `(` must not fool
+        // the boundary tracker into thinking depth never returns to zero,
+        // which would silently reintroduce a stall for this exact shape.
+        let body = format!("only one ( then padding: {}", "x".repeat(20_000));
+        let stdin = format!("\"{body}\"");
+        let out = eval_with_stdin("(display (string-length (read)))", &stdin).unwrap();
+        assert_eq!(out, body.len().to_string());
+    }
+
+    #[test]
     fn eof_object_predicate_is_true_for_the_eof_marker_and_false_for_an_ordinary_value() {
         let out = eval_with_stdin(
             "(display (eof-object? (read))) (display (eof-object? (read)))",
@@ -5670,6 +5915,30 @@ mod tests {
     }
 
     // --- B12 E2: read-line, terminator genuinely stripped (spec 4.8) ---
+
+    #[test]
+    fn read_line_correctly_decodes_a_multi_byte_character_split_exactly_across_a_relay_chunk_boundary()
+     {
+        // Same regression guard as `read`'s own version above, for
+        // `read-line`'s independent byte-based buffering/decoding path.
+        use crate::unicode_fixtures::ACCENTED_LETTER;
+        let mut accented_bytes = [0u8; 4];
+        let accented_len = ACCENTED_LETTER.encode_utf8(&mut accented_bytes).len();
+        assert_eq!(accented_len, 2, "fixture must be a 2-byte character");
+
+        let prefix_len = 8192;
+        let padding = "x".repeat(prefix_len);
+        let line = format!("{padding}{ACCENTED_LETTER}more text after the split");
+        assert_eq!(
+            &line.as_bytes()[8191..8193],
+            [b'x', accented_bytes[0]],
+            "the accented character's first byte must land exactly at offset 8192"
+        );
+        let stdin = format!("{line}\n");
+
+        let out = eval_with_stdin("(display (string-length (read-line)))", &stdin).unwrap();
+        assert_eq!(out, line.chars().count().to_string());
+    }
 
     #[test]
     fn read_line_reads_successive_lines_then_the_eof_marker() {
