@@ -1036,6 +1036,16 @@ fn compile_macro_call(
                 }
             }
         }
+        // A one-level safety margin, not the load-bearing part of this
+        // guard, mirroring `compile_quasiquote`'s own identical `depth + 1`
+        // (see its doc comment): whatever `expanded` actually contains
+        // gets compiled by the ordinary recursive `compile_expr` call this
+        // returns, which adds its own many further levels of depth as it
+        // descends into that structure -- this single increment only
+        // matters for a macro whose expansion is one bare, deeply-nested
+        // atom-adjacent form with no nesting of its own for `compile_expr`
+        // to descend into at all, an edge case `MAX_NESTING_DEPTH`'s own
+        // margin (512) comfortably absorbs regardless.
         return compile_expr(&expanded, ctx, chunk, comp, depth + 1, tail);
     }
     Err(too_many_macro_expansion_rounds())

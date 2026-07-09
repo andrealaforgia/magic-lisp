@@ -314,6 +314,22 @@ fn value_to_sexpr_at_depth(
                     Value::List(ref tail_items) if tail_items.is_empty() => {
                         return Ok(Sexpr::List(items));
                     }
+                    // A `cons`/`list` hybrid like `(cons 1 (list 2 3))` is
+                    // semantically the proper list `(1 2 3)`, not a dotted
+                    // pair whose tail happens to be a list -- matches
+                    // `fmt_pair_chain`'s own (value.rs) identical handling
+                    // of this shape. Getting this wrong matters beyond
+                    // cosmetics: `Sexpr::DottedList` is only ever valid in
+                    // parameter-list syntax (`compile_expr` rejects it
+                    // anywhere else), so treating a genuinely proper list
+                    // as dotted here would make an ordinary macro-returned
+                    // list fail to compile at all.
+                    Value::List(tail_items) => {
+                        for item in tail_items.iter() {
+                            items.push(value_to_sexpr_at_depth(item, depth + 1)?);
+                        }
+                        return Ok(Sexpr::List(items));
+                    }
                     other => {
                         let tail = value_to_sexpr_at_depth(&other, depth + 1)?;
                         return Ok(Sexpr::DottedList(items, Box::new(tail)));
@@ -2987,6 +3003,24 @@ mod tests {
         assert_eq!(
             value_to_sexpr(&list).unwrap(),
             Sexpr::List(vec![Sexpr::Int(1), Sexpr::Int(2)])
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_flattens_a_pair_chain_whose_cdr_terminates_in_a_non_empty_flat_list() {
+        // A hybrid shape a mixture of `cons` and `list` can legitimately
+        // build at runtime -- `(cons 1 (list 2 3))` is semantically the
+        // proper list `(1 2 3)`, not a dotted pair whose tail happens to
+        // be a list. Distinct from the empty-tail case above: only a
+        // non-empty `List` tail actually exercises the branch that decides
+        // whether to keep flattening it into `items` versus stopping.
+        let hybrid = Value::Pair(Rc::new(RefCell::new((
+            Value::Int(1),
+            Value::List(Rc::new(vec![Value::Int(2), Value::Int(3)])),
+        ))));
+        assert_eq!(
+            value_to_sexpr(&hybrid).unwrap(),
+            Sexpr::List(vec![Sexpr::Int(1), Sexpr::Int(2), Sexpr::Int(3)])
         );
     }
 
