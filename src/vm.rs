@@ -392,6 +392,16 @@ fn value_to_sexpr_at_depth(
                     // an unobservable mutation target.
                     Value::List(tail_items) => {
                         for item in tail_items.iter() {
+                            // Same one-level safety margin as the car
+                            // conversion above, and for the same reason:
+                            // `depth` is this walk's fixed incoming
+                            // parameter, not a per-item counter, so each
+                            // tail item's OWN nested content (if any) is
+                            // what actually recurses past this `+ 1` --
+                            // and that nested content is caught by its own
+                            // recursive `depth + 1` increments regardless
+                            // of whether this particular outer increment
+                            // happened at all.
                             items.push(value_to_sexpr_at_depth(item, depth + 1)?);
                             if items.len() > MAX_MACRO_RESULT_ELEMENTS {
                                 return Err(too_many_elements());
@@ -400,6 +410,13 @@ fn value_to_sexpr_at_depth(
                         return Ok(Sexpr::List(items));
                     }
                     other => {
+                        // Same one-level safety margin as the car
+                        // conversion and the list-tail items above, and
+                        // for the same reason: the dotted tail's OWN
+                        // nested content is what actually recurses past
+                        // this `+ 1`, and is caught by its own recursive
+                        // `depth + 1` increments regardless of whether
+                        // this particular outer increment happened at all.
                         let tail = value_to_sexpr_at_depth(&other, depth + 1)?;
                         return Ok(Sexpr::DottedList(items, Box::new(tail)));
                     }
