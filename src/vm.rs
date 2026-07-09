@@ -1530,21 +1530,46 @@ impl DatumBoundaryScan {
 /// reintroduces the same O(N^2) cost this function otherwise avoids, for
 /// any transport that delivers many small chunks over a large payload).
 /// True if `sexpr` is, or is a quote/quasiquote/unquote/unquote-splicing
-/// wrapper around, a bare number or symbol -- unlike a list/vector/string
-/// (each closed by an explicit, unambiguous delimiter of its own), a bare
-/// atom's true end can only be known by seeing what comes after it or by
-/// the stream genuinely ending. `read_one` returning one of these with
-/// nothing left over in the currently-buffered text isn't evidence the
-/// atom is complete -- it may simply be mid-arrival, with more digits or
-/// characters still on the way (warden security review msg #244:
-/// reproduced returning `123` as a complete value when only `456` had yet
-/// to arrive for a longer number, including through a quote wrapper).
-/// Quote-shorthand has no closing delimiter of its own either, so its
-/// completeness is entirely inherited from whatever it wraps -- hence the
-/// recursion.
+/// wrapper around, a bare number, symbol, boolean, or character literal --
+/// unlike a list/vector/string (each closed by an explicit, unambiguous
+/// delimiter of its own), a bare atom's true end can only be known by
+/// seeing what comes after it or by the stream genuinely ending. `read_one`
+/// returning one of these with nothing left over in the currently-buffered
+/// text isn't evidence the atom is complete -- it may simply be
+/// mid-arrival, with more characters still on the way (warden security
+/// review msg #244: reproduced returning `123` as a complete value when
+/// only `456` had yet to arrive for a longer number, including through a
+/// quote wrapper). Quote-shorthand has no closing delimiter of its own
+/// either, so its completeness is entirely inherited from whatever it
+/// wraps -- hence the recursion.
+///
+/// `Bool` goes through the exact same delimiter-bounded tokenizer as
+/// `Symbol`/`Int`/`Float` (`#t`/`#f`/`true`/`false` are just specific
+/// strings that tokenizer classifies), so it's exactly as ambiguous
+/// (warden security review msg #249: reproduced `#t` returning as a
+/// complete value when only `ally` -- the rest of the symbol `#tally` --
+/// had yet to arrive). `Char` is read by an entirely separate function
+/// (`read_character`) with its own internal ambiguity: a name starting
+/// with a letter (`space`, `newline`, `tab`, or a single letter meant
+/// literally) keeps consuming until a delimiter, so it has the identical
+/// "can't know it's done without a delimiter or true EOF" property
+/// (same review, msg #249: reproduced `#\s` returning as the single
+/// character `s` when only `pace` -- the rest of the named literal
+/// `#\space` -- had yet to arrive). A single non-alphabetic character
+/// right after `#\` (e.g. `#\(`) is grammatically unambiguous the instant
+/// it's read and never extends into a name -- but that distinction isn't
+/// visible any more by the time `read_character` has already resolved it
+/// down to a plain `char`, so treating every `Char` as possibly still
+/// growing is deliberately imprecise, matching the same
+/// correctness-over-precision choice already made for the other variants
+/// here: the cost is one possibly-unnecessary wait for a delimiter or EOF
+/// that a genuinely-complete single-character literal didn't strictly
+/// need, never a wrong value.
 fn ends_in_a_possibly_growing_atom(sexpr: &Sexpr) -> bool {
     match sexpr {
-        Sexpr::Int(_) | Sexpr::Float(_) | Sexpr::Symbol(_) => true,
+        Sexpr::Int(_) | Sexpr::Float(_) | Sexpr::Symbol(_) | Sexpr::Bool(_) | Sexpr::Char(_) => {
+            true
+        }
         Sexpr::List(items) => match items.as_slice() {
             [Sexpr::Symbol(tag), inner]
                 if matches!(

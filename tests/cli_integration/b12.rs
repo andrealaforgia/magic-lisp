@@ -333,6 +333,125 @@ fn read_does_not_return_a_quote_wrapped_number_split_by_a_gap_until_all_its_digi
 }
 
 #[test]
+fn read_does_not_return_a_boolean_split_by_a_gap_until_it_is_complete() {
+    // Regression test for warden security review msg #249: `#t`/`#f` go
+    // through the exact same delimiter-bounded tokenizer as a bare
+    // number/symbol, so they're exactly as ambiguous when the stream
+    // hasn't produced a real delimiter yet. Sends `#t`, holds the stream
+    // open with no delimiter, then sends `ally` -- together spelling the
+    // symbol `#tally`, not the boolean `#t`. Confirmed pre-fix: the
+    // process had already exited returning `#t` before `ally` ever
+    // arrived.
+    let file = write_source("b12-read-boolean-split-by-a-gap.ml", "(display (read))");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"#t").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child
+            .try_wait()
+            .expect("polling child status should not fail")
+            .is_none(),
+        "process exited on '#t' alone, before the rest of the symbol '#tally' \
+         ever arrived -- the boolean-truncation regression"
+    );
+
+    stdin.write_all(b"ally").unwrap();
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("process should exit once the symbol completes");
+    assert!(
+        output.status.success(),
+        "expected a clean exit, got: {:?}",
+        output.status
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "#tally");
+}
+
+#[test]
+fn read_does_not_return_a_named_character_literal_split_by_a_gap_until_it_is_complete() {
+    // Regression test for warden security review msg #249: a named
+    // character literal like `#\space` is read by its own function
+    // (`read_character`), separate from the ordinary tokenizer, but has
+    // the identical ambiguity once its name starts with a letter: it
+    // keeps consuming until a real delimiter or true EOF. Sends `#\s`,
+    // holds the stream open with no delimiter, then sends `pace` --
+    // together spelling the named literal `#\space`, not the single
+    // character `#\s`. Confirmed pre-fix: the process had already exited
+    // returning the character `s` before `pace` ever arrived.
+    let file = write_source(
+        "b12-read-named-char-literal-split-by-a-gap.ml",
+        "(display (read))",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"#\\s").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child
+            .try_wait()
+            .expect("polling child status should not fail")
+            .is_none(),
+        "process exited on '#\\s' alone, before the rest of the named literal \
+         '#\\space' ever arrived -- the character-literal-truncation regression"
+    );
+
+    stdin.write_all(b"pace").unwrap();
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("process should exit once the named literal completes");
+    assert!(
+        output.status.success(),
+        "expected a clean exit, got: {:?}",
+        output.status
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), " ");
+}
+
+#[test]
+fn a_second_read_after_a_first_bare_atom_completed_only_at_true_eof_sees_eof_not_the_first_value() {
+    // Regression test for qa test-design review msg #250: the fix for
+    // warden msg #244 also fixed a second, distinct bug in the same area
+    // -- `native_read`'s final true-EOF branch never drained the buffer
+    // on a successful atom parse (unreachable for atoms before that fix,
+    // since a successful parse always drained during the incremental
+    // loop). Left undrained, a second `read` call would see the same
+    // already-returned text still sitting in the buffer and return it
+    // again. `read_does_not_return_a_number_split_by_a_gap...` above
+    // covers the truncation half of that commit; this covers the drain
+    // half specifically, decoupled from `b12_e1c`'s incidental coverage
+    // of the same shape via a different assertion (`eof-object?`).
+    assert_eq!(
+        eval_ok_with_stdin(
+            "b12-second-read-after-eof-completed-atom.ml",
+            "(display (read)) (write (read))",
+            b"42"
+        ),
+        "42#<eof>"
+    );
+}
+
+#[test]
 fn read_completes_promptly_for_a_closed_two_element_list_that_is_not_a_quote_wrapper() {
     // Regression test for warden security review msg #244's fix: only a
     // quote/quasiquote/unquote/unquote-splicing wrapper around a bare atom
