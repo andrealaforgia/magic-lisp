@@ -62,7 +62,17 @@ fn b14_e3_a_macro_that_always_expands_into_another_macro_call_fails_cleanly_not_
     );
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(SOURCE_ERROR));
-    assert!(!stderr_of(&output).is_empty());
+    // Specifically the macro-expansion-round guard, not merely *some* clean
+    // error: an infinite macro chain also keeps incrementing the ordinary
+    // expression-nesting depth on its way through `compile_expr` each
+    // round, so a broken round-limit check could still fail cleanly by
+    // hitting THAT unrelated guard instead, without ever exercising the
+    // one this test targets.
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("macro") && stderr.contains("recursion"),
+        "expected the macro-expansion-round guard's own error, got: {stderr}"
+    );
 }
 
 #[test]
