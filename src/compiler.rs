@@ -656,10 +656,10 @@ fn expand_quasiquote(template: &Sexpr, level: u32, depth: usize) -> Result<Sexpr
                     "unquote-splicing is only valid as an element of a list or vector template",
                 ));
             }
-            expand_qq_sequence(items, level, depth + 1)
+            expand_qq_sequence(items, level, depth)
         }
         Sexpr::Vector(items) => {
-            let list_expr = expand_qq_sequence(items, level, depth + 1)?;
+            let list_expr = expand_qq_sequence(items, level, depth)?;
             Ok(Sexpr::List(vec![
                 Sexpr::Symbol("list->vector".to_string()),
                 list_expr,
@@ -674,7 +674,18 @@ fn expand_quasiquote(template: &Sexpr, level: u32, depth: usize) -> Result<Sexpr
             // two more already-existing natives (warden security review
             // msg #221: this previously crashed at runtime with an
             // "append expects a proper list" error for e.g. `` `(a . b) ``).
-            let head = expand_qq_sequence(items, level, depth + 1)?;
+            //
+            // `head`'s call doesn't increment `depth`, matching the plain
+            // `List`/`Vector` arms above (delegating to iterate THIS
+            // list's own elements isn't itself a deeper nesting level --
+            // `expand_qq_sequence`'s own per-element recursion charges
+            // the one `depth + 1` that a genuinely deeper element earns).
+            // `tail`'s call DOES, since a chain of dotted pairs is exactly
+            // as deep, form for form, as the reader's own recursive
+            // descent into each one (warden security review msg #240:
+            // double-charging both of these silently halved the usable
+            // nesting depth for ordinary templates).
+            let head = expand_qq_sequence(items, level, depth)?;
             let expanded_tail = expand_quasiquote(tail, level, depth + 1)?;
             Ok(Sexpr::List(vec![
                 Sexpr::Symbol("fold-right".to_string()),
@@ -3151,6 +3162,22 @@ mod tests {
     #[test]
     fn quasiquote_template_nesting_comfortably_under_the_configured_maximum_still_compiles() {
         let program = [nested_quasiquoted_list(100)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    fn quasiquote_template_nesting_close_to_the_readers_own_maximum_still_compiles() {
+        // Regression test for warden security review msg #240: the
+        // restored depth counter double-charged ordinary nested-list-
+        // under-one-backtick templates (once when `expand_quasiquote`
+        // delegated to `expand_qq_sequence`, again when `expand_qq_sequence`
+        // recursed back into `expand_quasiquote` for the one element) --
+        // silently halving the usable nesting depth to ~255 for this
+        // common shape, well under the reader's own advertised limit of
+        // 511 for real source text of the same shape. 500 is comfortably
+        // under 511 with correct (single) counting, but was already
+        // rejected under the double-counting bug (500 * 2 > 512).
+        let program = [nested_quasiquoted_list(500)];
         assert!(compile_program(&program).is_ok());
     }
 
