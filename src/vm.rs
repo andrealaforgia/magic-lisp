@@ -3272,6 +3272,38 @@ mod tests {
         v
     }
 
+    /// Builds a `depth`-deep nested value AND runs `value_to_sexpr` on it,
+    /// both entirely within one dedicated, generously-sized thread, rather
+    /// than whatever stack the test harness happens to give this test's
+    /// own thread -- 512 levels of recursion through
+    /// `value_to_sexpr_at_depth`'s real frames (several local closures,
+    /// `format!` calls on the error paths) genuinely overflowed the
+    /// ordinary test-thread stack in a DEBUG build (confirmed: this exact
+    /// test crashed `cargo test`'s whole process with a real SIGABRT
+    /// before this fix), even though the equivalent depth is comfortably
+    /// safe on `compile_program`'s own dedicated `COMPILE_STACK_SIZE`
+    /// thread every real call to this function actually runs on. Matches
+    /// this codebase's established pattern for testing stack-depth-
+    /// sensitive code in isolation from the caller's own stack size.
+    ///
+    /// Built INSIDE the spawned thread, not passed in from outside: `Value`
+    /// contains `Rc`, which isn't `Send`, so a value built on the test's
+    /// own thread could never be moved into a different one anyway.
+    fn value_to_sexpr_of_a_deeply_nested_value_on_a_generously_sized_thread(
+        depth: usize,
+    ) -> Result<Sexpr, crate::compiler::CompileError> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    value_to_sexpr(&nested_single_element_list_value(depth))
+                })
+                .expect("should spawn the dedicated thread")
+                .join()
+                .expect("value_to_sexpr itself must not crash the calling thread")
+        })
+    }
+
     #[test]
     fn value_to_sexpr_accepts_nesting_of_exactly_the_configured_maximum_depth() {
         // Distinguishes `>` from `>=` in the depth guard: depth only ever
@@ -3279,14 +3311,22 @@ mod tests {
         // it always passes through the exact threshold on its way to
         // anything deeper -- a `>=` mutant would reject this one level
         // too early.
-        let v = nested_single_element_list_value(crate::compiler::MAX_NESTING_DEPTH);
-        assert!(value_to_sexpr(&v).is_ok());
+        assert!(
+            value_to_sexpr_of_a_deeply_nested_value_on_a_generously_sized_thread(
+                crate::compiler::MAX_NESTING_DEPTH
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn value_to_sexpr_rejects_nesting_of_one_more_than_the_configured_maximum_depth() {
-        let v = nested_single_element_list_value(crate::compiler::MAX_NESTING_DEPTH + 1);
-        assert!(value_to_sexpr(&v).is_err());
+        assert!(
+            value_to_sexpr_of_a_deeply_nested_value_on_a_generously_sized_thread(
+                crate::compiler::MAX_NESTING_DEPTH + 1
+            )
+            .is_err()
+        );
     }
 
     #[test]
