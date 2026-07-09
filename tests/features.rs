@@ -21,6 +21,8 @@ mod steps_b10;
 mod steps_b11;
 #[path = "features/steps_b12.rs"]
 mod steps_b12;
+#[path = "features/steps_b13.rs"]
+mod steps_b13;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -124,4 +126,10 @@ fn b11_vectors_and_hash_tables() {
 fn b12_io_read_write_display() {
     let src = include_str!("../features/B12-io-read-write-display.feature");
     registry::run_feature("B12-io-read-write-display", src, &steps_b12::registry());
+}
+
+#[test]
+fn b13_quasiquotation() {
+    let src = include_str!("../features/B13-quasiquotation.feature");
+    registry::run_feature("B13-quasiquotation", src, &steps_b13::registry());
 }
