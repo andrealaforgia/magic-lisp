@@ -1529,6 +1529,37 @@ impl DatumBoundaryScan {
 /// security review msg #237: re-validating the full buffer every time
 /// reintroduces the same O(N^2) cost this function otherwise avoids, for
 /// any transport that delivers many small chunks over a large payload).
+/// True if `sexpr` is, or is a quote/quasiquote/unquote/unquote-splicing
+/// wrapper around, a bare number or symbol -- unlike a list/vector/string
+/// (each closed by an explicit, unambiguous delimiter of its own), a bare
+/// atom's true end can only be known by seeing what comes after it or by
+/// the stream genuinely ending. `read_one` returning one of these with
+/// nothing left over in the currently-buffered text isn't evidence the
+/// atom is complete -- it may simply be mid-arrival, with more digits or
+/// characters still on the way (warden security review msg #244:
+/// reproduced returning `123` as a complete value when only `456` had yet
+/// to arrive for a longer number, including through a quote wrapper).
+/// Quote-shorthand has no closing delimiter of its own either, so its
+/// completeness is entirely inherited from whatever it wraps -- hence the
+/// recursion.
+fn ends_in_a_possibly_growing_atom(sexpr: &Sexpr) -> bool {
+    match sexpr {
+        Sexpr::Int(_) | Sexpr::Float(_) | Sexpr::Symbol(_) => true,
+        Sexpr::List(items) => match items.as_slice() {
+            [Sexpr::Symbol(tag), inner]
+                if matches!(
+                    tag.as_str(),
+                    "quote" | "quasiquote" | "unquote" | "unquote-splicing"
+                ) =>
+            {
+                ends_in_a_possibly_growing_atom(inner)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn advance_and_maybe_read(
     vm: &mut Vm,
     boundary: &mut DatumBoundaryScan,
@@ -1569,6 +1600,18 @@ fn advance_and_maybe_read(
         // the same way a genuine parse error is.
         if let Ok(text) = std::str::from_utf8(&vm.stdin_buffer) {
             match reader::read_one(text) {
+                // A bare atom (or a quote-shorthand wrapper around one)
+                // with nothing left over is ambiguous the same way an
+                // unterminated list is: it looks exactly like a complete
+                // short number/symbol until proven otherwise by whatever
+                // comes next, or by the stream genuinely ending (warden
+                // security review msg #244) -- falls through to the same
+                // "keep waiting" handling below instead of returning.
+                Ok((Some(sexpr), remaining))
+                    if remaining.is_empty() && ends_in_a_possibly_growing_atom(&sexpr) =>
+                {
+                    boundary.seen_token = false;
+                }
                 Ok((Some(sexpr), remaining)) => {
                     let consumed = text.len() - remaining.len();
                     vm.stdin_buffer.drain(..consumed);
@@ -1652,7 +1695,35 @@ fn native_read(vm: &mut Vm) -> Result<Value, RuntimeError> {
                 let text = std::str::from_utf8(&vm.stdin_buffer)
                     .map_err(|_| error("read: invalid UTF-8 in standard input"))?;
                 return match reader::read_one(text) {
-                    Ok((Some(sexpr), _)) => {
+                    Ok((Some(sexpr), remaining)) => {
+                        // Drain exactly like the incremental path above --
+                        // this branch is now reachable for a bare atom
+                        // that reached the true end of the stream (never
+                        // reachable before this deferred to it, since a
+                        // successful parse always drained during the
+                        // incremental loop; left undrained here, a
+                        // subsequent `read`/`read-line` call would see the
+                        // same already-returned text still sitting in the
+                        // buffer and return it again).
+                        //
+                        // `remaining` is provably always empty on this
+                        // exact path, making `-` and `+` here equivalent
+                        // (hand-verified, not just untested): this arm is
+                        // reached only when `next_chunk()` reports the
+                        // stream truly closed, i.e. no bytes exist beyond
+                        // what `advance_and_maybe_read` already fed above.
+                        // That function tries `read_one` on every
+                        // successively longer prefix as bytes arrive and
+                        // returns immediately the instant any attempt
+                        // yields a non-empty `remaining` -- so if execution
+                        // reaches here at all, every one of those prior
+                        // attempts, including the one on this exact full
+                        // buffer, must have yielded an empty `remaining`
+                        // (or failed to parse). Re-running `read_one` on
+                        // that identical, unchanged text below is
+                        // deterministic and reproduces the same result.
+                        let consumed = text.len() - remaining.len();
+                        vm.stdin_buffer.drain(..consumed);
                         let c = sexpr_to_const(&sexpr).map_err(|e| error(format!("read: {e}")))?;
                         Ok(const_to_value(&c))
                     }

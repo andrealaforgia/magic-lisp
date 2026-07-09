@@ -235,6 +235,155 @@ fn read_completes_promptly_for_a_datum_that_lands_exactly_on_a_full_relay_read_b
 }
 
 #[test]
+fn read_does_not_return_a_number_split_by_a_gap_until_all_its_digits_have_arrived() {
+    // Regression test for warden security review msg #244: a bare number
+    // (or symbol) has no delimiter of its own -- its true end can only be
+    // known by seeing what comes after it, or by the stream genuinely
+    // ending. Sending only its first digits, with the stream still open
+    // and no delimiter yet, must NOT be treated as "done"; the process
+    // must still be running when the rest of the number arrives later.
+    // Confirmed pre-fix: `(display (read))` fed "123" then, after a delay,
+    // "456" returned "123" -- the process had already exited on the first
+    // piece alone, instead of waiting for a real delimiter or true EOF.
+    let file = write_source("b12-read-number-split-by-a-gap.ml", "(display (read))");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"123").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child
+            .try_wait()
+            .expect("polling child status should not fail")
+            .is_none(),
+        "process exited on the first piece of a number alone, before the \
+         rest of its digits ever arrived -- the number-truncation regression"
+    );
+
+    stdin.write_all(b"456").unwrap();
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("process should exit after the number completes");
+    assert!(
+        output.status.success(),
+        "expected a clean exit, got: {:?}",
+        output.status
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "123456");
+}
+
+#[test]
+fn read_does_not_return_a_quote_wrapped_number_split_by_a_gap_until_all_its_digits_have_arrived() {
+    // Regression test for warden security review msg #244: quote-shorthand
+    // (`'1`) has no closing delimiter of its own -- its completeness is
+    // entirely inherited from whatever it wraps. Sending only the wrapped
+    // number's first digit, with the stream still open and no delimiter
+    // yet, must NOT be treated as "done"; the process must still be
+    // running when the rest of the number arrives later. Confirmed
+    // pre-fix: sending "'1" then, after a delay, "23" returned `(quote 1)`
+    // instead of `(quote 123)` -- the process had already exited on the
+    // first digit alone.
+    let file = write_source(
+        "b12-read-quoted-number-split-by-a-gap.ml",
+        "(write (read))",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"'1").unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child
+            .try_wait()
+            .expect("polling child status should not fail")
+            .is_none(),
+        "process exited on the first digit of a quote-wrapped number alone, \
+         before the rest of its digits ever arrived -- the quote-wrapped \
+         number-truncation regression"
+    );
+
+    stdin.write_all(b"23").unwrap();
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("process should exit after the number completes");
+    assert!(
+        output.status.success(),
+        "expected a clean exit, got: {:?}",
+        output.status
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "(quote 123)");
+}
+
+#[test]
+fn read_completes_promptly_for_a_closed_two_element_list_that_is_not_a_quote_wrapper() {
+    // Regression test for warden security review msg #244's fix: only a
+    // quote/quasiquote/unquote/unquote-splicing wrapper around a bare atom
+    // inherits that atom's ambiguous, possibly-still-growing completeness.
+    // An ordinary two-element list like `(foo 1)` is closed by its own
+    // explicit, unambiguous `)` -- it must complete promptly the moment
+    // that paren arrives, not be mistaken for a quote wrapper and made to
+    // wait for more input that was never coming. Sends the complete,
+    // already-closed list in one write, then holds the stream open with
+    // no further data.
+    let file = write_source(
+        "b12-read-closed-list-not-a-quote-wrapper.ml",
+        "(display (read))",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"(foo 1)").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not complete within 5s while stdin stayed open \
+                 after a complete, already-closed two-element list -- it was \
+                 mistaken for a quote wrapper and left waiting for more input"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(status.success(), "expected a clean exit, got: {status:?}");
+}
+
+#[test]
 fn read_completes_promptly_when_a_complete_datum_is_immediately_followed_by_an_incomplete_second_construct()
  {
     // Regression test for warden security review msg #237: checking for a
