@@ -535,7 +535,7 @@ fn compile_quasiquote(
             items.len().saturating_sub(1)
         )));
     };
-    let expanded = expand_quasiquote(template, 1)?;
+    let expanded = expand_quasiquote(template, 1, 1)?;
     // The `+ 1` here is a one-level safety margin, not the load-bearing
     // part of the depth limit: the expansion (built from nested `list`/
     // `append` calls) is itself compiled through the ordinary call path
@@ -591,29 +591,56 @@ fn qq_reconstruct_tagged(tag: &str, expr: Sexpr) -> Sexpr {
 /// via `qq_reconstruct_tagged`, continuing to expand recursively inside it
 /// in case something deeper still reaches 0 (spec 3.4's doubly-nested case).
 ///
-/// No separate compile-time recursion-depth guard here (unlike most other
-/// `compile_xxx` helpers): `expand_quasiquote` never calls `compile_expr`
-/// itself, only building a plain `Sexpr` expansion tree that `compile_expr`
-/// compiles exactly once, at the end, in `compile_quasiquote` -- so an
-/// over-deep template is still caught by `compile_expr`'s own existing
-/// `MAX_NESTING_DEPTH` check on that expanded tree (hand-verified: forcing
-/// this function's own recursion to never terminate early still produces a
-/// clean "nesting exceeds maximum" error, not a crash, for a template at
-/// the reader's own depth limit). This function's native Rust recursion
-/// itself is bounded by that same reader-enforced template depth (spec
-/// 3.4), which is a few hundred levels at most -- utterly safe.
-fn expand_quasiquote(template: &Sexpr, level: u32) -> Result<Sexpr, CompileError> {
+/// `depth` is a native-recursion-depth safety counter, unrelated to
+/// `level`'s quasiquote-nesting bookkeeping above -- restored (qa
+/// test-design review msg #225) after being removed once as apparently
+/// redundant with `compile_expr`'s own `MAX_NESTING_DEPTH` check on the
+/// fully-expanded result tree. That removal relied on an unstated
+/// invariant: only the reader ever produces trees fed to `compile_program`,
+/// and the reader's own guard keeps real backquote-shorthand nesting far
+/// below any depth that could matter. A hand-built `Sexpr` tree (any
+/// direct caller of `compile_program`, bypassing the reader) has no such
+/// bound -- and unlike a flat list template's element count, THIS
+/// recursion happens entirely inside this function, before `compile_expr`
+/// ever sees anything to check, so its own downstream guard cannot help
+/// here at all: confirmed as a genuine native stack overflow via
+/// `compile_program`'s public API at a hand-built nesting depth as low as
+/// 2,000, independent of `compile_expr`'s guard entirely.
+///
+/// Mutation testing cannot observe this check's own correctness (the `>`
+/// here, or any individual recursive call's `depth + 1`) at any depth
+/// that's safe to use in a committed test: `compile_expr`'s separate,
+/// pre-existing downstream guard on the fully-expanded result ALSO
+/// independently fires at essentially the same depth for every template
+/// shape this file's tests construct, so "some nesting error occurred"
+/// stays true whether this specific counter is correct, inverted, or
+/// disabled -- only an unsafe-to-commit depth (~2,000+) distinguishes
+/// them, which is why the tests below stop at a depth low enough to
+/// never risk reproducing the crash. Hand-verified instead, the same way
+/// the actual crash fix above was: temporarily breaking the comparison
+/// (an unreachably-high threshold) and each `depth + 1` this function
+/// contains or passes to `expand_qq_sequence` (negating it) independently
+/// reproduces the exact stack overflow the `#[ignore]`d probe test below
+/// exists to catch, confirming each is genuinely load-bearing despite
+/// being untestable through output alone at any depth this test suite
+/// can safely reach.
+fn expand_quasiquote(template: &Sexpr, level: u32, depth: usize) -> Result<Sexpr, CompileError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(err(format!(
+            "quasiquote template nesting exceeds the maximum supported depth ({MAX_NESTING_DEPTH})"
+        )));
+    }
     match template {
         Sexpr::List(items) => {
             if let Some(inner) = is_tagged(items, "quasiquote") {
-                let expanded_inner = expand_quasiquote(inner, level + 1)?;
+                let expanded_inner = expand_quasiquote(inner, level + 1, depth + 1)?;
                 return Ok(qq_reconstruct_tagged("quasiquote", expanded_inner));
             }
             if let Some(inner) = is_tagged(items, "unquote") {
                 return if level == 1 {
                     Ok(inner.clone())
                 } else {
-                    let expanded_inner = expand_quasiquote(inner, level - 1)?;
+                    let expanded_inner = expand_quasiquote(inner, level - 1, depth + 1)?;
                     Ok(qq_reconstruct_tagged("unquote", expanded_inner))
                 };
             }
@@ -622,10 +649,10 @@ fn expand_quasiquote(template: &Sexpr, level: u32) -> Result<Sexpr, CompileError
                     "unquote-splicing is only valid as an element of a list or vector template",
                 ));
             }
-            expand_qq_sequence(items, level)
+            expand_qq_sequence(items, level, depth + 1)
         }
         Sexpr::Vector(items) => {
-            let list_expr = expand_qq_sequence(items, level)?;
+            let list_expr = expand_qq_sequence(items, level, depth + 1)?;
             Ok(Sexpr::List(vec![
                 Sexpr::Symbol("list->vector".to_string()),
                 list_expr,
@@ -640,8 +667,8 @@ fn expand_quasiquote(template: &Sexpr, level: u32) -> Result<Sexpr, CompileError
             // two more already-existing natives (warden security review
             // msg #221: this previously crashed at runtime with an
             // "append expects a proper list" error for e.g. `` `(a . b) ``).
-            let head = expand_qq_sequence(items, level)?;
-            let expanded_tail = expand_quasiquote(tail, level)?;
+            let head = expand_qq_sequence(items, level, depth + 1)?;
+            let expanded_tail = expand_quasiquote(tail, level, depth + 1)?;
             Ok(Sexpr::List(vec![
                 Sexpr::Symbol("fold-right".to_string()),
                 Sexpr::Symbol("cons".to_string()),
@@ -665,7 +692,19 @@ fn expand_quasiquote(template: &Sexpr, level: u32) -> Result<Sexpr, CompileError
 /// wrapped in another list) -- the one place list- and vector-template
 /// expansion actually differ (vector wraps the result in `list->vector`;
 /// see the caller).
-fn expand_qq_sequence(items: &[Sexpr], level: u32) -> Result<Sexpr, CompileError> {
+///
+/// Both `depth + 1`s below carry the exact same load-bearing
+/// recursion-depth safety this function's caller documents on itself --
+/// each recurses back into `expand_quasiquote`, so an element (or an
+/// unquote-splicing operand) that's itself deeply quasiquote-nested hits
+/// the identical native-stack-overflow risk. Same hand-verification
+/// result too: temporarily breaking either one reproduces the crash the
+/// `#[ignore]`d probe test exists to catch, but only at a depth too
+/// unsafe to commit -- at any depth safe to test, `compile_expr`'s own
+/// separate downstream guard already independently catches the same
+/// input regardless, making these specific counters unobservable through
+/// committed-test output alone.
+fn expand_qq_sequence(items: &[Sexpr], level: u32, depth: usize) -> Result<Sexpr, CompileError> {
     if items.len() > MAX_QUASIQUOTE_SEQUENCE_LEN {
         return Err(err(format!(
             "quasiquote template list/vector has {} elements, exceeding the maximum of {}",
@@ -682,14 +721,14 @@ fn expand_qq_sequence(items: &[Sexpr], level: u32) -> Result<Sexpr, CompileError
         match splice_target {
             Some(inner) if level == 1 => pieces.push(inner.clone()),
             Some(inner) => {
-                let expanded_inner = expand_quasiquote(inner, level - 1)?;
+                let expanded_inner = expand_quasiquote(inner, level - 1, depth + 1)?;
                 pieces.push(wrap_singleton_list(qq_reconstruct_tagged(
                     "unquote-splicing",
                     expanded_inner,
                 )));
             }
             None => {
-                let value_expr = expand_quasiquote(item, level)?;
+                let value_expr = expand_quasiquote(item, level, depth + 1)?;
                 pieces.push(wrap_singleton_list(value_expr));
             }
         }
@@ -3007,6 +3046,76 @@ mod tests {
     fn quasiquote_with_more_than_one_argument_is_a_clean_compile_error() {
         let program = [list(vec![sym("quasiquote"), sym("a"), sym("b")])];
         assert!(compile_program(&program).is_err());
+    }
+
+    fn deeply_nested_quasiquote_forms(depth: usize) -> Sexpr {
+        // N literal nested `quasiquote` FORMS (unlike `nested_quasiquoted_list`
+        // below, which nests plain lists once inside a single quasiquote):
+        // `expand_quasiquote`'s own `is_tagged(items, "quasiquote")` branch
+        // recurses into itself directly, entirely before `compile_expr` ever
+        // sees anything -- the one recursion path its removed depth counter
+        // used to bound that `compile_expr`'s own downstream guard cannot,
+        // since it only ever inspects the fully-expanded RESULT, never the
+        // recursion that builds it. Only reachable via a hand-built AST:
+        // the reader's own guard bounds real source text's backquote-
+        // shorthand nesting to far below any depth that could matter here.
+        let mut expr = sym("x");
+        for _ in 0..depth {
+            expr = Sexpr::List(vec![sym("quasiquote"), expr]);
+        }
+        expr
+    }
+
+    #[test]
+    fn deeply_nested_quasiquote_forms_comfortably_under_the_maximum_still_compile() {
+        let program = [deeply_nested_quasiquote_forms(100)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    #[ignore = "manual verification only: confirms the fix at the depth that previously crashed \
+                the process outright; not run by default since a regression here would abort \
+                the whole test binary rather than fail cleanly"]
+    fn probe_manual_verify_deeply_nested_quasiquote_forms_at_the_previously_crashing_depth_now_errors_cleanly()
+     {
+        let program = [deeply_nested_quasiquote_forms(2000)];
+        let error = compile_program(&program).unwrap_err();
+        assert!(error.message.contains("quasiquote"));
+    }
+
+    #[test]
+    fn deeply_nested_quasiquote_forms_of_one_more_than_the_maximum_is_rejected_by_expand_quasiquotes_own_guard()
+     {
+        // Regression test for qa test-design review msg #225: removing
+        // `expand_quasiquote`'s own depth counter (as redundant with
+        // `compile_expr`'s downstream check) relied on an unstated
+        // invariant -- that only the reader ever produces trees fed to
+        // `compile_program`, and the reader's own guard keeps real
+        // backquote-shorthand nesting far below any depth that could
+        // matter. A hand-built AST bypasses that guard entirely: nested
+        // `quasiquote` FORMS recurse directly inside `expand_quasiquote`
+        // itself, entirely before `compile_expr`'s check ever runs on
+        // anything -- confirmed to be a genuine, currently-reachable
+        // native stack overflow via `compile_program`'s public API (at a
+        // depth as low as 2,000 -- far too deep to safely reproduce in a
+        // committed test, so not attempted here; verified by hand instead).
+        //
+        // At THIS depth specifically, `compile_expr`'s own downstream
+        // guard would also happen to catch the fully-expanded result
+        // anyway (513 native recursion frames doesn't itself risk a
+        // crash) -- so asserting only "some nesting error occurred" would
+        // pass even with this restored guard entirely removed again,
+        // silently losing this regression's protection. Asserting the
+        // SPECIFIC message this guard alone produces (distinct from
+        // `too_deep()`'s generic wording) is what actually distinguishes
+        // "this guard fired" from "the other, insufficient one did".
+        let program = [deeply_nested_quasiquote_forms(MAX_NESTING_DEPTH + 1)];
+        let error = compile_program(&program).unwrap_err();
+        assert!(
+            error.message.contains("quasiquote") && error.message.contains("nesting"),
+            "expected expand_quasiquote's own nesting-depth error, got: {}",
+            error.message
+        );
     }
 
     fn nested_quasiquoted_list(depth: usize) -> Sexpr {
