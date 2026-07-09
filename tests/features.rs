@@ -25,6 +25,8 @@ mod steps_b12;
 mod steps_b13;
 #[path = "features/steps_b14.rs"]
 mod steps_b14;
+#[path = "features/steps_b15.rs"]
+mod steps_b15;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
 #[path = "features/steps_b3.rs"]
@@ -140,4 +142,10 @@ fn b13_quasiquotation() {
 fn b14_macros_and_gensym() {
     let src = include_str!("../features/B14-macros-and-gensym.feature");
     registry::run_feature("B14-macros-and-gensym", src, &steps_b14::registry());
+}
+
+#[test]
+fn b15_errors_and_exit() {
+    let src = include_str!("../features/B15-errors-and-exit.feature");
+    registry::run_feature("B15-errors-and-exit", src, &steps_b15::registry());
 }
