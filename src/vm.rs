@@ -1078,13 +1078,20 @@ pub(crate) fn eval_top_level_function(
 /// `y` bound afterward, matching an ordinary program's own left-to-right
 /// evaluation order.
 ///
-/// No dedicated big stack thread of its own, unlike `run`/`run_with_stdin`:
-/// an ordinary REPL entry is a small, human-typed expression, not a whole
-/// program: adding one here would also require `globals` (containing
-/// `Rc`-based `Value`s from prior entries, e.g. a defined pair or string)
-/// to cross a thread boundary, which isn't `Send`-safe without rebuilding
-/// it fresh inside the new thread every entry -- defeating the whole
-/// point of carrying it across entries at all.
+/// Does not spawn a dedicated big-stack thread of its own here: unlike
+/// `run`/`run_with_stdin`, which each run exactly once per whole program,
+/// an interactive session evaluates many entries against the SAME
+/// `globals` (containing `Rc`-based `Value`s, e.g. a defined pair or
+/// string, that aren't `Send`-safe to move across a thread boundary), so a
+/// dedicated thread has to be spawned once for the whole session instead
+/// of once per entry -- `repl::run` is what does that (using
+/// `VM_STACK_SIZE`, the same empirically-validated size this function's
+/// caller ultimately always runs on), not this function itself. Warden
+/// security review msg #327 (High): before this, `repl::run` called this
+/// function directly on whatever thread it happened to be running on
+/// (with no dedicated stack at all), so genuine non-tail recursion well
+/// within `MAX_CALL_DEPTH`'s own documented-safe range crashed the entire
+/// process via native stack overflow.
 pub fn eval_repl_entry(
     module: &Module,
     fn_index: u32,
@@ -1152,7 +1159,7 @@ fn bind_arguments(
 /// stack size (raised from B3-era's 64 MiB) is what makes a MAX_CALL_DEPTH
 /// that high survivable without ever reaching real hardware stack overflow;
 /// see MAX_CALL_DEPTH's own doc comment for the bisected numbers.
-const VM_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
+pub(crate) const VM_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
 
 /// Runs `module` to completion on a dedicated `VM_STACK_SIZE` thread.
 ///

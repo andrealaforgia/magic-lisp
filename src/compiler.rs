@@ -169,9 +169,79 @@ impl Compilation {
         }
     }
 
+    /// Like `new`, but resumes from a REPL session's carried-forward state
+    /// (its accumulated function table and its compiler-internal alias
+    /// counter) instead of starting both fresh -- see [`ReplState`]'s own
+    /// doc comment for why both must persist across entries.
+    fn from_repl_state(state: ReplState) -> Self {
+        Compilation {
+            module: state.module,
+            gensym_counter: state.gensym_counter,
+            macros: HashMap::new(),
+            macro_gensym_counter: 0,
+            macro_step_budget_remaining: crate::vm::MACRO_TRAMPOLINE_STEP_BUDGET,
+            macro_conversion_budget_remaining: crate::vm::MAX_MACRO_CONVERSION_BUDGET,
+        }
+    }
+
     fn gensym(&mut self, hint: &str) -> String {
         self.gensym_counter += 1;
         format!("%%{hint}%{}", self.gensym_counter)
+    }
+}
+
+/// The REPL (B17) state that must be carried forward across an interactive
+/// session's entries, threaded in and back out of [`compile_repl_entry`] on
+/// every call exactly like `globals` is threaded through
+/// `vm::eval_repl_entry` -- both halves of the SAME underlying problem:
+/// warden security review (msg #327, Critical) found that giving each entry
+/// an entirely fresh `Module` let a later entry's function table reuse the
+/// SAME numeric index an earlier entry's now-persisted closure
+/// (`Value::Closure(idx, ..)`) still refers to, silently resolving the
+/// wrong function's body (or, if the aliased index happened to have an
+/// incompatible arity, a wrong-but-plausible arity error) the moment a
+/// closure created in one entry was called from a later one -- since a
+/// closure only stores a bare function-table index with no reference to
+/// which module it was compiled into.
+///
+/// The fix carries the module forward instead, so it only ever grows: an
+/// index a closure captured in an earlier entry still refers to that exact
+/// same function in every later entry's module too, because that module is
+/// always a superset, never a fresh replacement.
+///
+/// `gensym_counter` must persist for the identical reason, one level down:
+/// it names the synthetic global `compile_named_let`/internal `define`s
+/// register via `DEF_GLOBAL` (see `Ctx::with_alias`'s call sites), and
+/// those synthetic globals land in the SAME persisted `globals` map a
+/// closure's own values live in. Resetting this counter to 0 every entry
+/// would let two unrelated entries' internal bindings (e.g. two separate
+/// named lets both hinted "loop") generate the identical alias name and
+/// silently collide in `globals` -- the same class of bug as the module
+/// one above, just one layer further down, so it gets the same fix: thread
+/// it forward instead of resetting it.
+///
+/// Deliberately NOT included: `macros`/`macro_gensym_counter`/
+/// `macro_step_budget_remaining`/`macro_conversion_budget_remaining`. A
+/// `define-macro` seen in one entry is out of scope for this behaviour
+/// (see `compile_repl_entry`'s own doc comment) -- only ordinary `define`d
+/// VALUES need to persist -- and the macro-expansion budgets are sized per
+/// `compile_program`-sized unit of work; an interactive entry is always
+/// small enough that resetting them fresh each entry costs nothing real.
+pub(crate) struct ReplState {
+    module: Module,
+    gensym_counter: u32,
+}
+
+impl ReplState {
+    pub(crate) fn new() -> Self {
+        ReplState {
+            module: Module::default(),
+            gensym_counter: 0,
+        }
+    }
+
+    pub(crate) fn module(&self) -> &Module {
+        &self.module
     }
 }
 
@@ -536,13 +606,31 @@ fn compile_program_on_this_thread(forms: &[Sexpr]) -> Result<Module, CompileErro
 /// (B17 spec 9.1's persistence requirement), not just later expressions
 /// within this same entry.
 ///
-/// Returns the module together with the index of the function to call.
-/// Each entry gets an entirely fresh [`Compilation`] (no macro registry or
-/// gensym counter persisted from a prior entry) -- out of scope for this
+/// Takes `state` by value and always returns it back (see [`ReplState`]'s
+/// own doc comment for why it must keep growing across entries rather than
+/// reset), paired with the `Result` for just this entry's own function
+/// index -- not `Result<(ReplState, u32), _>`, since a compile error must
+/// not lose whatever `state` already grew to on a previous, successfully
+/// compiled entry.
+///
+/// Each entry still gets a fresh macro registry and macro-related budgets
+/// (only `ReplState`'s two fields persist) -- out of scope for this
 /// behaviour, which only requires ordinary VALUE bindings (`define`) to
 /// persist across entries, not `define-macro`.
-pub(crate) fn compile_repl_entry(forms: &[Sexpr]) -> Result<(Module, u32), CompileError> {
-    let mut comp = Compilation::new();
+pub(crate) fn compile_repl_entry(
+    state: ReplState,
+    forms: &[Sexpr],
+) -> (ReplState, Result<u32, CompileError>) {
+    let mut comp = Compilation::from_repl_state(state);
+    let result = compile_repl_entry_body(&mut comp, forms);
+    let state = ReplState {
+        module: comp.module,
+        gensym_counter: comp.gensym_counter,
+    };
+    (state, result)
+}
+
+fn compile_repl_entry_body(comp: &mut Compilation, forms: &[Sexpr]) -> Result<u32, CompileError> {
     let mut fn_chunk = Chunk::new();
     let ctx = Ctx::top_level();
     let Some((last, rest)) = forms.split_last() else {
@@ -551,17 +639,17 @@ pub(crate) fn compile_repl_entry(forms: &[Sexpr]) -> Result<(Module, u32), Compi
         fn_chunk.emit_return();
         let index = comp.module.functions.len() as u32;
         comp.module.functions.push(fn_chunk);
-        return Ok((comp.module, index));
+        return Ok(index);
     };
     for form in rest {
-        compile_expr(form, &ctx, &mut fn_chunk, &mut comp, 0, false)?;
+        compile_expr(form, &ctx, &mut fn_chunk, comp, 0, false)?;
         fn_chunk.emit_pop();
     }
-    compile_expr(last, &ctx, &mut fn_chunk, &mut comp, 0, true)?;
+    compile_expr(last, &ctx, &mut fn_chunk, comp, 0, true)?;
     fn_chunk.emit_return();
     let index = comp.module.functions.len() as u32;
     comp.module.functions.push(fn_chunk);
-    Ok((comp.module, index))
+    Ok(index)
 }
 
 /// Compiles a body of expressions where all but the last are evaluated for
