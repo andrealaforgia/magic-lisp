@@ -517,6 +517,53 @@ fn compile_program_on_this_thread(forms: &[Sexpr]) -> Result<Module, CompileErro
     Ok(comp.module)
 }
 
+/// Compiles one REPL entry (B17) as a callable, zero-arg function whose
+/// body is the entry's own top-level forms -- all but the last discarded
+/// via `POP` exactly like [`compile_program_on_this_thread`]'s own entry
+/// chunk, but the LAST form's value is left on the stack and returned via
+/// `RETURN` instead of being popped and the whole thing ending in `HALT`.
+/// This is what lets a REPL session auto-print each entry's result: an
+/// ordinary top-level program's entry chunk has nowhere for that value to
+/// go once `HALT` runs, since every one of its own top-level forms is
+/// unconditionally followed by a `POP`.
+///
+/// Deliberately NOT `compile_body`: that function gives LEADING `define`
+/// forms special internal-alias-only handling (correct for a function/
+/// `let` body, where an internal `define` never creates a real global),
+/// but a REPL entry's `(define x ...)` must create a REAL global -- the
+/// same one `compile_define`'s ordinary top-level path already produces
+/// -- since it has to remain visible to every LATER entry in the session
+/// (B17 spec 9.1's persistence requirement), not just later expressions
+/// within this same entry.
+///
+/// Returns the module together with the index of the function to call.
+/// Each entry gets an entirely fresh [`Compilation`] (no macro registry or
+/// gensym counter persisted from a prior entry) -- out of scope for this
+/// behaviour, which only requires ordinary VALUE bindings (`define`) to
+/// persist across entries, not `define-macro`.
+pub(crate) fn compile_repl_entry(forms: &[Sexpr]) -> Result<(Module, u32), CompileError> {
+    let mut comp = Compilation::new();
+    let mut fn_chunk = Chunk::new();
+    let ctx = Ctx::top_level();
+    let Some((last, rest)) = forms.split_last() else {
+        let idx = fn_chunk.add_const(Const::Unspecified);
+        fn_chunk.emit_const(idx);
+        fn_chunk.emit_return();
+        let index = comp.module.functions.len() as u32;
+        comp.module.functions.push(fn_chunk);
+        return Ok((comp.module, index));
+    };
+    for form in rest {
+        compile_expr(form, &ctx, &mut fn_chunk, &mut comp, 0, false)?;
+        fn_chunk.emit_pop();
+    }
+    compile_expr(last, &ctx, &mut fn_chunk, &mut comp, 0, true)?;
+    fn_chunk.emit_return();
+    let index = comp.module.functions.len() as u32;
+    comp.module.functions.push(fn_chunk);
+    Ok((comp.module, index))
+}
+
 /// Compiles a body of expressions where all but the last are evaluated for
 /// effect and discarded, and the last one's value is left on the stack.
 /// Used for `begin` and, via [`compile_body`], for function/let bodies.

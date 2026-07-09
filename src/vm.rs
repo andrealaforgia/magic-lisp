@@ -1065,6 +1065,49 @@ pub(crate) fn eval_top_level_function(
     ))
 }
 
+/// Evaluates one REPL entry (B17), compiled via `compiler::compile_repl_
+/// entry` into a zero-arg callable function -- threads `globals` IN as
+/// this call's starting global environment and returns the UPDATED
+/// globals afterward regardless of whether evaluation succeeded, exactly
+/// mirroring `macro_gensym_counter`/`macro_step_budget_remaining`'s own
+/// in/out threading pattern for `eval_top_level_function` above, so a
+/// caller can carry the same map across a whole session's worth of
+/// entries. Globals are threaded through even on `Err`: an entry that
+/// defines something and THEN fails partway through a later expression in
+/// the same entry (e.g. `(begin (define y 5) (car 5))`) must still leave
+/// `y` bound afterward, matching an ordinary program's own left-to-right
+/// evaluation order.
+///
+/// No dedicated big stack thread of its own, unlike `run`/`run_with_stdin`:
+/// an ordinary REPL entry is a small, human-typed expression, not a whole
+/// program: adding one here would also require `globals` (containing
+/// `Rc`-based `Value`s from prior entries, e.g. a defined pair or string)
+/// to cross a thread boundary, which isn't `Send`-safe without rebuilding
+/// it fresh inside the new thread every entry -- defeating the whole
+/// point of carrying it across entries at all.
+pub fn eval_repl_entry(
+    module: &Module,
+    fn_index: u32,
+    globals: HashMap<String, Value>,
+    out: &mut impl Write,
+) -> (Result<Value, RuntimeError>, HashMap<String, Value>) {
+    let mut vm = Vm {
+        module,
+        globals,
+        call_depth: 0,
+        stdin_buffer: Vec::new(),
+        stdin_channel: StdinChannel::none(),
+        gensym_counter: 0,
+        macro_step_budget: None,
+    };
+    let env = Rc::new(Env {
+        locals: Vec::new(),
+        parent: None,
+    });
+    let result = vm.call_value(&Value::Closure(fn_index, env), Vec::new(), out);
+    (result, vm.globals)
+}
+
 fn bind_arguments(
     chunk: &Chunk,
     mut args: Vec<Value>,

@@ -115,12 +115,16 @@ pub(crate) fn registry() -> Registry {
             assert!(!stdout_of(&disasm_out).trim_start().starts_with('1'));
             assert_eq!(disasm_out.status.code(), Some(SUCCESS));
 
+            // B17 gives the REPL its own real prompt ("> ") before each
+            // entry; `display`'s own side-effect output ("1") is
+            // interleaved with those prompts, since `display` itself
+            // returns the unspecified value (no auto-print of its own).
             let repl_out = run_with_stdin(&["repl"], b"(display 1)\n");
-            assert_eq!(stdout_of(&repl_out), "1");
+            assert_eq!(stdout_of(&repl_out), "> 1> ");
             assert_eq!(repl_out.status.code(), Some(SUCCESS));
 
             let default_out = run_with_stdin(&[], b"(display 1)\n");
-            assert_eq!(stdout_of(&default_out), "1");
+            assert_eq!(stdout_of(&default_out), "> 1> ");
             assert_eq!(default_out.status.code(), Some(SUCCESS));
 
             let unknown_out = run(&["frobnicate", src.to_str().unwrap()]);

@@ -415,7 +415,11 @@ mod execute_tests {
     }
 
     #[test]
-    fn repl_command_evaluates_lines_from_the_given_input() {
+    fn repl_command_evaluates_entries_from_the_given_input() {
+        // B17: the REPL prints a prompt before each entry (and once more
+        // before EOF); `display`'s own side-effect output ("3") is
+        // interleaved with those prompts, but nothing is auto-printed
+        // afterward since `display` itself returns the unspecified value.
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = execute(
@@ -424,7 +428,7 @@ mod execute_tests {
             &mut out,
             &mut err,
         );
-        assert_eq!(String::from_utf8(out).unwrap(), "3");
+        assert_eq!(String::from_utf8(out).unwrap(), "> 3> ");
         assert_eq!(code, exitcode::SUCCESS);
     }
 }

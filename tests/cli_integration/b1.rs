@@ -124,15 +124,19 @@ fn e4_compile_verb_writes_an_artifact_file_to_disk() {
 
 #[test]
 fn e4_repl_verb_evaluates_lines_from_stdin() {
+    // B17 gives the REPL its own real prompt ("> ") before each entry;
+    // `display`'s own side-effect output ("1") is interleaved with those
+    // prompts, since `display` itself returns the unspecified value (no
+    // auto-print of its own).
     let out = run_with_stdin(&["repl"], b"(display 1)\n");
-    assert_eq!(stdout_of(&out), "1");
+    assert_eq!(stdout_of(&out), "> 1> ");
     assert_eq!(out.status.code(), Some(SUCCESS));
 }
 
 #[test]
 fn e4_no_verb_given_defaults_to_repl() {
     let out = run_with_stdin(&[], b"(display 1)\n");
-    assert_eq!(stdout_of(&out), "1");
+    assert_eq!(stdout_of(&out), "> 1> ");
     assert_eq!(out.status.code(), Some(SUCCESS));
 }
 
