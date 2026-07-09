@@ -34,6 +34,23 @@ fn too_deep() -> CompileError {
     ))
 }
 
+/// Caps how many elements a single quasiquote template list/vector may
+/// have -- a separate, much larger bound than `MAX_NESTING_DEPTH`
+/// (deliberately not reusing it: `expand_qq_sequence` builds its expanded
+/// `append`-chain tree with a few levels of surrounding overhead already
+/// spent by the time it starts, so testing right at `MAX_NESTING_DEPTH`
+/// itself would sometimes reject templates `compile_expr`'s own guard
+/// would otherwise have accepted). Its job isn't to duplicate that guard
+/// -- moderately-oversized templates are already caught cleanly by it --
+/// but to prevent a much rarer, much larger failure: at a large enough
+/// element count, DROPPING the expanded tree overflows the native stack
+/// on its own (ordinary recursive `Drop` glue, since `Sexpr` has no
+/// custom iterative one), regardless of whether `compile_expr`'s guard
+/// would otherwise have fired cleanly on it (warden security review:
+/// confirmed crash at ~110,000+ elements). Comfortably below that
+/// threshold, comfortably above any legitimate template size.
+const MAX_QUASIQUOTE_SEQUENCE_LEN: usize = 2_000;
+
 /// Threads the module being built and a counter for generating unique
 /// internal names — see [`Ctx::aliases`].
 struct Compilation {
@@ -643,6 +660,13 @@ fn expand_quasiquote(template: &Sexpr, level: u32) -> Result<Sexpr, CompileError
 /// expansion actually differ (vector wraps the result in `list->vector`;
 /// see the caller).
 fn expand_qq_sequence(items: &[Sexpr], level: u32) -> Result<Sexpr, CompileError> {
+    if items.len() > MAX_QUASIQUOTE_SEQUENCE_LEN {
+        return Err(err(format!(
+            "quasiquote template list/vector has {} elements, exceeding the maximum of {}",
+            items.len(),
+            MAX_QUASIQUOTE_SEQUENCE_LEN
+        )));
+    }
     let mut pieces = Vec::with_capacity(items.len());
     for item in items {
         let splice_target = match item {
@@ -1356,6 +1380,22 @@ fn compile_expr(
                     "cond" => return compile_cond(items, ctx, chunk, comp, depth, tail),
                     "case" => return compile_case(items, ctx, chunk, comp, depth, tail),
                     "do" => return compile_do(items, ctx, chunk, comp, depth, tail),
+                    // Reachable ONLY as a bare, top-level `,x`/`,@x` outside
+                    // any quasiquote template: inside an actual template,
+                    // `expand_quasiquote`'s own tag matching consumes these
+                    // forms before compile_expr ever sees them (spec 3.4).
+                    // Previously fell through to an ordinary call against
+                    // an undefined global, failing only at runtime with a
+                    // generic unbound-name error instead of a clear
+                    // diagnostic (qa test-design review msg #225).
+                    "unquote" => {
+                        return Err(err("unquote is only valid inside a quasiquote template"));
+                    }
+                    "unquote-splicing" => {
+                        return Err(err(
+                            "unquote-splicing is only valid inside a quasiquote template",
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -2965,9 +3005,14 @@ mod tests {
 
     fn nested_quasiquoted_list(depth: usize) -> Sexpr {
         // A hand-built AST (bypassing the reader entirely, unlike the
-        // backtick-nesting reader tests) so this specifically exercises
-        // expand_quasiquote's own depth guard, not the reader's identical
-        // but separate one -- mirrors nested_call's same rationale above.
+        // backtick-nesting reader tests): `expand_quasiquote` no longer has
+        // its own depth counter (removed as redundant with the check
+        // below, since every reader-sourced template's nesting is bounded
+        // by the reader's own guard) -- this instead exercises
+        // `compile_expr`'s `MAX_NESTING_DEPTH` guard on the fully-expanded
+        // result tree, reachable this deep only via a hand-built AST, not
+        // through any real source text -- mirrors nested_call's same
+        // rationale above.
         let mut expr = Sexpr::Int(1);
         for _ in 0..depth {
             expr = Sexpr::List(vec![expr]);
@@ -2993,22 +3038,92 @@ mod tests {
         );
     }
 
+    fn flat_quasiquoted_list(count: usize) -> Sexpr {
+        // Unlike `nested_quasiquoted_list` above (N levels of nesting
+        // around a single element), this is N elements side by side at
+        // the SAME level -- the shape that made `expand_qq_sequence` build
+        // an N-deep `append` chain (warden security review's flat-list
+        // stack-overflow finding) rather than the shape that exercises
+        // `compile_expr`'s ordinary nesting guard.
+        let items: Vec<Sexpr> = (0..count).map(|i| Sexpr::Int(i as i64)).collect();
+        Sexpr::List(vec![sym("quasiquote"), Sexpr::List(items)])
+    }
+
     #[test]
-    fn bare_unquote_outside_quasiquote_is_not_a_compile_error_but_fails_cleanly_at_runtime() {
-        // qa test-design review (msg #220): a stray `,x` at the top level
-        // (outside any quasiquote template) isn't specially recognized by
-        // compile_expr's dispatch -- only expand_quasiquote's own internal
-        // matching knows about `unquote`/`unquote-splicing` -- so it falls
-        // through to ordinary function-call compilation against an
-        // undefined global `unquote`, failing at runtime rather than
-        // compile time. Pinned here as a deliberate, accepted design
-        // choice, so a future change to this behavior is a conscious
-        // decision, not an accidental regression.
+    fn quasiquote_template_element_count_comfortably_under_the_configured_maximum_still_compiles()
+    {
+        let program = [flat_quasiquoted_list(100)];
+        assert!(compile_program(&program).is_ok());
+    }
+
+    #[test]
+    fn quasiquote_template_element_count_of_exactly_the_configured_maximum_is_rejected_by_the_ordinary_nesting_guard_not_this_new_check()
+     {
+        // Pins the boundary itself (exactly `MAX_QUASIQUOTE_SEQUENCE_LEN`,
+        // not one more) so the check is a strict `>`, not `==` or `>=` --
+        // either of which would make THIS specific length trip the new
+        // element-count check. `MAX_QUASIQUOTE_SEQUENCE_LEN` is well above
+        // `MAX_NESTING_DEPTH`, so a template this long is already rejected
+        // by `compile_expr`'s ordinary nesting guard regardless -- the
+        // distinguishing signal is WHICH error comes back, not whether one
+        // does.
+        let program = [flat_quasiquoted_list(MAX_QUASIQUOTE_SEQUENCE_LEN)];
+        let error = compile_program(&program).unwrap_err();
+        assert!(
+            error.message.contains("nesting") && error.message.contains("depth"),
+            "expected the ordinary nesting-depth error (not the new element-count one), got: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn quasiquote_template_element_count_of_one_more_than_the_configured_maximum_is_a_clean_error_not_a_crash()
+     {
+        // Regression test for warden security review's flat-list finding:
+        // a flat template with enough elements used to build an
+        // `append`-chain tree deep enough to overflow the stack on drop
+        // (confirmed at ~110,000+ elements) instead of erroring cleanly.
+        // This pins the bound well below the crash threshold, so this
+        // test stays fast and never risks reproducing the actual crash.
+        let program = [flat_quasiquoted_list(MAX_QUASIQUOTE_SEQUENCE_LEN + 1)];
+        let error = compile_program(&program).unwrap_err();
+        assert!(
+            error.message.contains("elements") && error.message.contains("maximum"),
+            "expected a template-too-long error, got: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn bare_unquote_outside_quasiquote_is_a_clean_compile_error_not_a_runtime_one() {
+        // qa test-design review (msg #225): a stray `,x` at the top level
+        // (outside any quasiquote template) used to fall through to
+        // ordinary function-call compilation against an undefined global
+        // `unquote`, failing only at runtime with a generic unbound-global
+        // error -- a real user-facing rough edge, since `,x` outside a
+        // template is unambiguously meaningless, not merely an unbound
+        // name. Now caught directly in compile_expr's dispatch (reachable
+        // ONLY this way: inside an actual quasiquote template,
+        // expand_quasiquote's own tag matching consumes `unquote`/
+        // `unquote-splicing` forms before compile_expr ever sees them).
         let forms = crate::reader::read_program(",x").unwrap();
-        let module =
-            compile_program(&forms).expect("should compile (falls through to an ordinary call)");
-        let mut out = Vec::new();
-        assert!(crate::vm::run(&module, &mut out).is_err());
+        let error = compile_program(&forms).unwrap_err();
+        assert!(
+            error.message.contains("unquote") && error.message.contains("quasiquote"),
+            "expected a clear unquote-outside-quasiquote error, got: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn bare_unquote_splicing_outside_quasiquote_is_a_clean_compile_error_not_a_runtime_one() {
+        let forms = crate::reader::read_program(",@x").unwrap();
+        let error = compile_program(&forms).unwrap_err();
+        assert!(
+            error.message.contains("unquote-splicing") && error.message.contains("quasiquote"),
+            "expected a clear unquote-splicing-outside-quasiquote error, got: {}",
+            error.message
+        );
     }
 
     #[test]
