@@ -96,6 +96,27 @@ fn b14_e5_a_local_variable_shadowing_a_macro_name_wins_over_the_macro() {
 }
 
 #[test]
+fn b14_e5_a_letrec_bound_alias_shadowing_a_macro_name_also_wins_over_the_macro() {
+    // The same rule as the ordinary-parameter case above, but exercising a
+    // DIFFERENT one of the three kinds of binding that can shadow a macro
+    // name: `letrec` (like `let`/named-let self-reference) binds its names
+    // via an alias to a gensym'd global, not an ordinary local slot -- a
+    // distinct code path from a ordinary lambda/`let` parameter. If only
+    // the local-slot check were wired up, this specific shadowing kind
+    // would be missed and `(m 5)` would incorrectly expand as a macro
+    // call, displaying the macro's own inert result instead of ever
+    // calling the letrec-bound lambda.
+    assert_eq!(
+        eval_ok(
+            "b14-e5b.ml",
+            "(define-macro (m x) `(quote not-called)) \
+             (letrec ((m (lambda (x) (+ x 1)))) (display (m 5)))"
+        ),
+        "6"
+    );
+}
+
+#[test]
 fn b14_e6_the_swap_macro_uses_gensym_internally_to_avoid_colliding_with_its_own_operands() {
     assert_eq!(
         eval_ok(
