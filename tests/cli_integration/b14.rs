@@ -232,11 +232,23 @@ fn a_macro_returning_an_oversized_vector_directly_fails_cleanly_not_a_disproport
 #[test]
 fn a_macro_returning_an_oversized_flat_list_directly_fails_cleanly_not_a_disproportionate_cost() {
     // Same distinction as the vector case above, but for a `Value::List`
-    // built directly to its full size in one step (`vector->list` of an
-    // oversized vector) rather than incrementally via `cons`.
+    // built directly to its full size in one step, rather than
+    // incrementally via `cons` -- NOT via `vector->list` (warden security
+    // review msg #269: `vector->list` is implemented through
+    // `vec_to_list`, which builds a `Pair` CHAIN terminating in an empty
+    // list, the same shape the incremental cons-loop test already
+    // exercises, never reaching the up-front `Value::List`-arm check at
+    // all). A rest parameter is bound as a genuine flat `Value::List`
+    // directly (see `bind_arguments`), so spreading a large list of
+    // arguments onto a rest-only lambda via `apply` produces one in a
+    // single step instead.
     let file = write_source(
         "b14-oversized-list-macro-result.ml",
-        "(define-macro (huge) (vector->list (make-vector 200000))) (huge)",
+        "(define-macro (huge) \
+           (apply (lambda args args) \
+             (let loop ((n 200000) (acc (quote ()))) \
+               (if (= n 0) acc (loop (- n 1) (cons n acc)))))) \
+         (huge)",
     );
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(SOURCE_ERROR));
