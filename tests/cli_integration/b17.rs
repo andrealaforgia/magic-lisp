@@ -90,3 +90,99 @@ fn b17_e7_the_full_demo_sequence_produces_exactly_the_prescribed_transcript() {
     assert!(stderr.lines().next().unwrap().starts_with("Error: "), "{stderr:?}");
     assert_eq!(output.status.code(), Some(SUCCESS));
 }
+
+// --- qa test-design review msg #342: the critical cross-entry
+// closure/function-index aliasing fix (warden msgs #327/#332, examiner
+// verdict msg #331) had regression coverage only at the in-process
+// `src/repl.rs` unit-test level, not paired with this project's usual
+// subprocess-level CLI-integration coverage for a fix this consequential.
+// These mirror those same unit tests, but drive the real compiled binary.
+
+#[test]
+fn a_single_function_defined_in_one_entry_is_called_correctly_with_an_argument_from_a_later_entry()
+ {
+    let output = run_with_stdin(&["repl"], b"(define (inc n) (+ n 1))\n(inc 5)\n");
+    assert_eq!(stdout_of(&output), "> > 6\n> ");
+    assert!(stderr_of(&output).is_empty());
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
+
+#[test]
+fn two_functions_each_defined_in_their_own_entry_and_then_the_first_is_called_correctly() {
+    let output = run_with_stdin(
+        &["repl"],
+        b"(define g (lambda (n) (+ n 1)))\n(define h (lambda (x) (* x 100)))\n(g 3)\n",
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "> > > 4\n> ",
+        "must call g's own body (4), not h's (which would print 300)"
+    );
+    assert!(stderr_of(&output).is_empty());
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
+
+#[test]
+fn a_zero_argument_function_defined_in_one_entry_terminates_when_called_from_a_later_entry() {
+    // `run_with_stdin`'s own CHILD_TIMEOUT (30s) is this test's hang
+    // guard: a reintroduced regression here fails cleanly and quickly
+    // instead of hanging the whole suite.
+    let output = run_with_stdin(&["repl"], b"(define (f) 42)\n(f)\n");
+    assert_eq!(stdout_of(&output), "> > 42\n> ");
+    assert!(stderr_of(&output).is_empty());
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
+
+#[test]
+fn ordinary_non_tail_recursion_well_within_the_call_depth_limit_does_not_crash_the_session() {
+    let output = run_with_stdin(
+        &["repl"],
+        b"(begin (define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (display (f 100000)))\n",
+    );
+    assert_eq!(stdout_of(&output), "> 100000> ");
+    assert!(stderr_of(&output).is_empty());
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
+
+#[test]
+fn a_same_entry_definition_survives_a_later_failure_in_that_same_entry() {
+    let output = run_with_stdin(&["repl"], b"(begin (define y 5) (car 5))\ny\n");
+    assert_eq!(stdout_of(&output), "> > 5\n> ");
+    let stderr = stderr_of(&output);
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(stderr.lines().next().unwrap().starts_with("Error: "), "{stderr:?}");
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
+
+#[test]
+fn a_macro_defined_in_one_entry_does_not_persist_to_a_later_entry() {
+    let output = run_with_stdin(
+        &["repl"],
+        b"(define-macro (twice x) (list (quote begin) x x))\n(twice 1)\n",
+    );
+    assert_eq!(stdout_of(&output), "> > > ");
+    let stderr = stderr_of(&output);
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(stderr.lines().next().unwrap().starts_with("Error: "), "{stderr:?}");
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
+
+#[test]
+fn a_read_error_entry_reports_one_error_line_and_returns_to_the_prompt() {
+    let output = run_with_stdin(&["repl"], b"(display (+ 1\n");
+    assert_eq!(stdout_of(&output), "> > ");
+    let stderr = stderr_of(&output);
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(stderr.lines().next().unwrap().starts_with("Error: "), "{stderr:?}");
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
+
+#[test]
+fn a_compile_error_entry_reports_one_error_line_and_returns_to_the_prompt() {
+    let output = run_with_stdin(&["repl"], b"(lambda)\n");
+    assert_eq!(stdout_of(&output), "> > ");
+    let stderr = stderr_of(&output);
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(stderr.lines().next().unwrap().starts_with("Error: "), "{stderr:?}");
+    assert_eq!(output.status.code(), Some(SUCCESS));
+}
