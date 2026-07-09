@@ -1111,14 +1111,31 @@ fn compile_macro_call(
                     .map(|c| crate::vm::const_to_value(&c))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (result, updated_gensym_counter, updated_step_budget) = eval_top_level_function(
+        let (result, updated_gensym_counter, updated_step_budget) = match eval_top_level_function(
             &comp.module,
             fn_index,
             args,
             comp.macro_gensym_counter,
             comp.macro_step_budget_remaining,
-        )
-        .map_err(|e| err(format!("error while expanding macro '{op}': {e}")))?;
+        ) {
+            Ok(ok) => ok,
+            // qa test-design review msg #296: `exit`'s deliberate-
+            // termination signal reuses this same `RuntimeError` channel
+            // with an empty message (see `exit_signal`, vm.rs) -- passing
+            // it through the ordinary error-wrapping below would silently
+            // discard the requested exit code and produce a dangling
+            // "...: runtime error: " message with nothing after the
+            // colon. Calling `exit` while a macro body is being expanded
+            // at COMPILE time is a distinct scenario from a running
+            // program calling it (B15's own scope), rejected here with
+            // its own clear diagnostic instead.
+            Err(e) if e.exit_code.is_some() => {
+                return Err(err(format!(
+                    "macro '{op}' called exit during macro expansion, which is not supported -- exit terminates the running program, not the compiler"
+                )));
+            }
+            Err(e) => return Err(err(format!("error while expanding macro '{op}': {e}"))),
+        };
         comp.macro_gensym_counter = updated_gensym_counter;
         comp.macro_step_budget_remaining = updated_step_budget;
         let expanded = crate::vm::value_to_sexpr_with_budget(

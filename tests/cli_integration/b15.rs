@@ -154,3 +154,30 @@ fn b15_e6_all_four_demos_produce_exactly_the_prescribed_output() {
     assert_eq!(o4.status.code(), Some(SUCCESS));
     assert_eq!(stdout_of(&o4), "+inf.0");
 }
+
+#[test]
+fn calling_exit_during_macro_expansion_is_rejected_with_a_clear_error_not_a_dangling_message() {
+    // Regression test for qa test-design review msg #296: `exit`'s
+    // deliberate-termination signal reuses the RuntimeError channel with
+    // an empty message (by design, see `exit_signal`), but
+    // `compile_macro_call` unconditionally wrapped every error from a
+    // macro body's execution as an ordinary expansion failure, discarding
+    // the requested exit code entirely and producing a dangling,
+    // incomplete "...: runtime error: " message with nothing after the
+    // colon. Calling `exit` from within a macro body during compile-time
+    // expansion is a distinct scenario from a running program calling it
+    // (B15's own scope) -- rejected here with its own clear diagnostic
+    // rather than silently doing something surprising either way.
+    let file = write_source("b15-exit-in-macro.ml", "(define-macro (m) (exit 7)) (m)");
+    let output = run(&["eval", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(SOURCE_ERROR));
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("exit") && stderr.contains("macro"),
+        "expected a clear error naming both exit and macro expansion, got: {stderr}"
+    );
+    assert!(
+        !stderr.trim_end().ends_with(':'),
+        "expected a complete message, not a dangling one, got: {stderr}"
+    );
+}
