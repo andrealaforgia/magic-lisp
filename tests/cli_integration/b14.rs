@@ -252,7 +252,19 @@ fn a_macro_returning_an_oversized_flat_list_directly_fails_cleanly_not_a_disprop
     );
     let output = run(&["eval", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(SOURCE_ERROR));
-    assert!(!stderr_of(&output).is_empty());
+    // Specifically the size-cap's own error, not just any clean
+    // SOURCE_ERROR (warden security review msg #272): once the expansion
+    // isn't rejected for size, it becomes an ordinary 199,999-argument
+    // call, which an entirely unrelated, coincidental limit
+    // (compile_expr's own argument-count check, 255) also rejects with
+    // the same exit code -- a bare exit-code assertion can't tell "the
+    // intended check fired" apart from "some other limit happened to
+    // produce the same class of failure."
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("more than 100000 elements"),
+        "expected the size-cap's own error, got: {stderr}"
+    );
 }
 
 #[test]
