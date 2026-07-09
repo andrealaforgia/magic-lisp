@@ -604,8 +604,15 @@ fn qq_reconstruct_tagged(tag: &str, expr: Sexpr) -> Sexpr {
 /// recursion happens entirely inside this function, before `compile_expr`
 /// ever sees anything to check, so its own downstream guard cannot help
 /// here at all: confirmed as a genuine native stack overflow via
-/// `compile_program`'s public API at a hand-built nesting depth as low as
-/// 2,000, independent of `compile_expr`'s guard entirely.
+/// `compile_program`'s public API in a DEBUG build at a hand-built
+/// nesting depth as low as 2,000, independent of `compile_expr`'s guard
+/// entirely. Build-profile-dependent, not a fixed number: qa test-design
+/// review msg #238 independently confirmed a release build's smaller
+/// stack frames push the actual crash threshold out to roughly 30,000+ on
+/// typical hardware (expect this to vary by platform/stack size -- the
+/// mechanism, a hand-built AST defeating the downstream guard via pure
+/// native recursion, is the fact that matters, not either specific
+/// number).
 ///
 /// Mutation testing cannot observe this check's own correctness (the `>`
 /// here, or any individual recursive call's `depth + 1`) at any depth
@@ -614,11 +621,11 @@ fn qq_reconstruct_tagged(tag: &str, expr: Sexpr) -> Sexpr {
 /// independently fires at essentially the same depth for every template
 /// shape this file's tests construct, so "some nesting error occurred"
 /// stays true whether this specific counter is correct, inverted, or
-/// disabled -- only an unsafe-to-commit depth (~2,000+) distinguishes
-/// them, which is why the tests below stop at a depth low enough to
-/// never risk reproducing the crash. Hand-verified instead, the same way
-/// the actual crash fix above was: temporarily breaking the comparison
-/// (an unreachably-high threshold) and each `depth + 1` this function
+/// disabled -- only an unsafe-to-commit depth distinguishes them, which
+/// is why the tests below stop at a depth low enough to never risk
+/// reproducing the crash. Hand-verified instead, the same way the actual
+/// crash fix above was: temporarily breaking the comparison (an
+/// unreachably-high threshold) and each `depth + 1` this function
 /// contains or passes to `expand_qq_sequence` (negating it) independently
 /// reproduces the exact stack overflow the `#[ignore]`d probe test below
 /// exists to catch, confirming each is genuinely load-bearing despite
@@ -3073,8 +3080,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual verification only: confirms the fix at the depth that previously crashed \
-                the process outright; not run by default since a regression here would abort \
+    #[ignore = "manual verification only: confirms the fix at a depth that previously crashed \
+                the process outright in a DEBUG build (qa test-design review msg #238: this \
+                specific depth doesn't reproduce the pre-fix crash under --release, where the \
+                stack overflow this guard prevents needs a much deeper hand-built input, ~30,000+ \
+                on typical hardware -- the guard restored above fires at the same, much shallower \
+                threshold regardless of build profile, so this probe is still valid evidence the \
+                fix works, just not evidence the crash it prevents is reachable at exactly this \
+                depth in every profile); not run by default since a regression here would abort \
                 the whole test binary rather than fail cleanly"]
     fn probe_manual_verify_deeply_nested_quasiquote_forms_at_the_previously_crashing_depth_now_errors_cleanly()
      {
