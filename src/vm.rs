@@ -3356,6 +3356,110 @@ mod tests {
     }
 
     #[test]
+    fn value_to_sexpr_accepts_a_vector_of_exactly_the_configured_maximum_element_count() {
+        // Same `>` vs `>=` distinction as the List case above, for the
+        // Vector arm's own separate up-front check.
+        let items = vec![Value::Int(0); MAX_MACRO_RESULT_ELEMENTS];
+        let v = Value::Vector(Rc::new(RefCell::new(items)));
+        assert!(value_to_sexpr(&v).is_ok());
+    }
+
+    #[test]
+    fn value_to_sexpr_rejects_a_vector_of_one_more_than_the_configured_maximum_element_count() {
+        let items = vec![Value::Int(0); MAX_MACRO_RESULT_ELEMENTS + 1];
+        let v = Value::Vector(Rc::new(RefCell::new(items)));
+        assert!(value_to_sexpr(&v).is_err());
+    }
+
+    fn pair_chain_of(count: usize) -> Value {
+        let mut result = Value::List(Rc::new(Vec::new()));
+        for _ in 0..count {
+            result = Value::Pair(Rc::new(RefCell::new((Value::Int(0), result))));
+        }
+        result
+    }
+
+    /// Builds a `count`-element `Pair` chain, converts it, AND drops it,
+    /// all entirely within one dedicated, generously-sized thread --
+    /// `Value::Pair` has no custom `Drop` of its own (unlike `Const::Pair`,
+    /// see that type's own doc comment on the identical, deliberately-
+    /// deferred limitation), so dropping a long chain via Rust's ordinary
+    /// recursive field-drop glue relies entirely on running on a
+    /// generously-sized stack -- confirmed: building a
+    /// `MAX_MACRO_RESULT_ELEMENTS`-long chain and letting it drop on the
+    /// ordinary test-thread stack genuinely overflowed it in a debug
+    /// build. Every real caller of `value_to_sexpr` already runs on
+    /// `compile_program`'s own dedicated `COMPILE_STACK_SIZE` thread.
+    fn value_to_sexpr_of_a_pair_chain_on_a_generously_sized_thread(
+        build: impl FnOnce() -> Value + Send,
+    ) -> Result<Sexpr, crate::compiler::CompileError> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(DEPTH_BOUNDARY_TEST_STACK_SIZE)
+                .spawn_scoped(scope, move || value_to_sexpr(&build()))
+                .expect("should spawn the dedicated thread")
+                .join()
+                .expect("value_to_sexpr itself must not crash the calling thread")
+        })
+    }
+
+    #[test]
+    fn value_to_sexpr_accepts_a_cons_chain_of_exactly_the_configured_maximum_element_count() {
+        // Same `>` vs `>=` distinction as the up-front List/Vector checks
+        // above, for the incremental check the `Pair`-chain walk performs
+        // as it grows, one element at a time.
+        assert!(
+            value_to_sexpr_of_a_pair_chain_on_a_generously_sized_thread(|| pair_chain_of(
+                MAX_MACRO_RESULT_ELEMENTS
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_rejects_a_cons_chain_of_one_more_than_the_configured_maximum_element_count() {
+        assert!(
+            value_to_sexpr_of_a_pair_chain_on_a_generously_sized_thread(|| pair_chain_of(
+                MAX_MACRO_RESULT_ELEMENTS + 1
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_accepts_a_cons_chain_terminating_in_a_list_totaling_exactly_the_maximum() {
+        // Same distinction again, for the OTHER incremental check: a
+        // `Pair`-chain prefix that terminates in a non-empty `List`
+        // (flattened into the same running count, see the cons/list
+        // hybrid fix above) rather than the empty-list sentinel.
+        assert!(
+            value_to_sexpr_of_a_pair_chain_on_a_generously_sized_thread(|| {
+                let mut result = Value::List(Rc::new(vec![Value::Int(0); 10]));
+                for _ in 0..(MAX_MACRO_RESULT_ELEMENTS - 10) {
+                    result = Value::Pair(Rc::new(RefCell::new((Value::Int(0), result))));
+                }
+                result
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn value_to_sexpr_rejects_a_cons_chain_terminating_in_a_list_totaling_one_more_than_the_maximum()
+     {
+        assert!(
+            value_to_sexpr_of_a_pair_chain_on_a_generously_sized_thread(|| {
+                let mut result = Value::List(Rc::new(vec![Value::Int(0); 10]));
+                for _ in 0..(MAX_MACRO_RESULT_ELEMENTS - 10 + 1) {
+                    result = Value::Pair(Rc::new(RefCell::new((Value::Int(0), result))));
+                }
+                result
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn value_to_sexpr_rejects_a_procedure_value_with_a_clear_error() {
         assert!(value_to_sexpr(&Value::Native("car".to_string())).is_err());
         assert!(value_to_sexpr(&Value::Eof).is_err());
