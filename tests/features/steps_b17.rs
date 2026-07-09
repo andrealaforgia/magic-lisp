@@ -53,22 +53,37 @@ pub(crate) fn registry() -> Registry {
         )
         // --- E3 ---
         .step(
-            "x defined, then referenced, then redefined, then referenced again",
+            "x defined, then referenced, then redefined, then referenced again; a single function defined and called with an argument from a later entry; two functions each defined in their own entry with the first called from a third entry; and a zero-argument function defined and called from a later entry",
             |w, _text, _| {
-                w.notes
-                    .push("(define x 10)\nx\n(define x 20)\nx\n".to_string());
+                w.pending = vec![
+                    "(define x 10)\nx\n(define x 20)\nx\n".to_string(),
+                    "(define (inc n) (+ n 1))\n(inc 5)\n".to_string(),
+                    "(define g (lambda (n) (+ n 1)))\n(define h (lambda (x) (* x 100)))\n(g 3)\n"
+                        .to_string(),
+                    "(define (f) 42)\n(f)\n".to_string(),
+                ];
             },
         )
         .step("each entry is evaluated in sequence", |w, _text, _| {
-            let stdin = w.notes.last().unwrap().clone();
-            w.outputs.push(run_with_stdin(&["repl"], stdin.as_bytes()));
+            let pending = std::mem::take(&mut w.pending);
+            for src in pending {
+                w.outputs.push(run_with_stdin(&["repl"], src.as_bytes()));
+            }
         })
         .step(
-            "the first reference sees the original value and the second reference sees the redefined value",
+            "the first reference sees the original value and the second sees the redefined value, and every function case calls the CORRECT function's body with the correct result — no wrong-function execution, no spurious arity error, and no hang",
             |w, _text, _| {
-                let output = w.last_output();
-                assert_eq!(stdout_of(output), "> > 10\n> > 20\n> ");
-                assert_eq!(output.status.code(), Some(SUCCESS));
+                assert_eq!(stdout_of(&w.outputs[0]), "> > 10\n> > 20\n> ");
+                assert_eq!(w.outputs[0].status.code(), Some(SUCCESS));
+
+                assert_eq!(stdout_of(&w.outputs[1]), "> > 6\n> ");
+                assert_eq!(w.outputs[1].status.code(), Some(SUCCESS));
+
+                assert_eq!(stdout_of(&w.outputs[2]), "> > > 4\n> ");
+                assert_eq!(w.outputs[2].status.code(), Some(SUCCESS));
+
+                assert_eq!(stdout_of(&w.outputs[3]), "> > 42\n> ");
+                assert_eq!(w.outputs[3].status.code(), Some(SUCCESS));
             },
         )
         // --- E4 ---
