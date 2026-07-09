@@ -82,6 +82,26 @@ fn compile_source(src: &str) -> Result<bytecode::Module, String> {
     compiler::compile_program(&forms).map_err(|e| e.to_string())
 }
 
+/// Reports the outcome of a `vm::run`/`run_with_stdin` call: the `exit`
+/// native (B15) signals a deliberate early termination through this same
+/// `RuntimeError` channel, distinguished by `exit_code` -- that case exits
+/// silently with exactly the chosen code, never printed as a failure. Any
+/// other `RuntimeError` is an uncaught error (B15 spec 9.1): exactly one
+/// "Error: <message>" line to `err`, exit code `RUNTIME_ERROR` in every
+/// case, regardless of what specifically went wrong.
+fn report_vm_result(result: Result<(), vm::RuntimeError>, err: &mut impl Write) -> i32 {
+    match result {
+        Ok(()) => exitcode::SUCCESS,
+        Err(e) => match e.exit_code {
+            Some(code) => code,
+            None => {
+                let _ = writeln!(err, "Error: {}", e.message);
+                exitcode::RUNTIME_ERROR
+            }
+        },
+    }
+}
+
 fn run_eval(
     path: &Path,
     input: &mut impl BufRead,
@@ -102,13 +122,7 @@ fn run_eval(
             return exitcode::SOURCE_ERROR;
         }
     };
-    match vm::run_with_stdin(&module, out, input) {
-        Ok(()) => exitcode::SUCCESS,
-        Err(e) => {
-            let _ = writeln!(err, "error: {e}");
-            exitcode::RUNTIME_ERROR
-        }
-    }
+    report_vm_result(vm::run_with_stdin(&module, out, input), err)
 }
 
 fn run_compile(input: &Path, output: &Path, err: &mut impl Write) -> i32 {
@@ -156,13 +170,7 @@ fn run_run(
         Ok(m) => m,
         Err(code) => return code,
     };
-    match vm::run_with_stdin(&module, out, input) {
-        Ok(()) => exitcode::SUCCESS,
-        Err(e) => {
-            let _ = writeln!(err, "error: {e}");
-            exitcode::RUNTIME_ERROR
-        }
-    }
+    report_vm_result(vm::run_with_stdin(&module, out, input), err)
 }
 
 fn run_disasm(artifact: &Path, out: &mut impl Write, err: &mut impl Write) -> i32 {

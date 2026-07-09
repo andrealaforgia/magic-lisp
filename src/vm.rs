@@ -14,6 +14,13 @@ use crate::value::{Env, Value, is_truthy, value_equal, value_eqv, write_repr};
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
     pub message: String,
+    /// `Some(code)` for the `exit` native's deliberate early termination
+    /// (B15) -- reuses this same `Result::Err`/`?` propagation an ordinary
+    /// runtime error already gets (so "nothing after this point runs"
+    /// holds for free, all the way up through the trampoline), but the CLI
+    /// layer must recognize this case and terminate with exactly `code`
+    /// silently instead of reporting it as a failure.
+    pub exit_code: Option<i32>,
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -25,10 +32,18 @@ impl std::fmt::Display for RuntimeError {
 fn error(message: impl Into<String>) -> RuntimeError {
     RuntimeError {
         message: message.into(),
+        exit_code: None,
     }
 }
 
-const NATIVE_NAMES: [&str; 125] = [
+fn exit_signal(code: i32) -> RuntimeError {
+    RuntimeError {
+        message: String::new(),
+        exit_code: Some(code),
+    }
+}
+
+const NATIVE_NAMES: [&str; 127] = [
     "display",
     "newline",
     "+",
@@ -162,6 +177,9 @@ const NATIVE_NAMES: [&str; 125] = [
     "write",
     // B14: procedural macros and gensym.
     "gensym",
+    // B15: error signalling and the exit procedure.
+    "error",
+    "exit",
 ];
 
 pub fn default_globals() -> HashMap<String, Value> {
@@ -1566,6 +1584,26 @@ fn call_native(
             vm.gensym_counter += 1;
             Ok(Value::Symbol(format!("gensym {}", vm.gensym_counter)))
         }
+        "error" => {
+            let (message, irritants) = args
+                .split_first()
+                .ok_or_else(|| error("error expects at least 1 argument"))?;
+            let mut formatted = message.to_string();
+            for irritant in irritants {
+                formatted.push(' ');
+                formatted.push_str(&write_repr(irritant));
+            }
+            Err(error(formatted))
+        }
+        "exit" => match args {
+            [] => Err(exit_signal(0)),
+            [Value::Int(n)] => Err(exit_signal(*n as i32)),
+            [_] => Err(error("exit expects an integer argument")),
+            _ => Err(error(format!(
+                "exit expects 0 or 1 arguments, got {}",
+                args.len()
+            ))),
+        },
         other => Err(error(format!("unknown native procedure: {other}"))),
     }
 }
@@ -3878,6 +3916,7 @@ mod tests {
     fn runtime_error_display_includes_the_underlying_message() {
         let e = RuntimeError {
             message: "something specific went wrong".to_string(),
+            exit_code: None,
         };
         assert_eq!(
             e.to_string(),
