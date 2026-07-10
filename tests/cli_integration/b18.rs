@@ -339,6 +339,22 @@ fn e5_a_genuine_breadth_of_malformed_source_never_crashes_and_always_lands_on_an
     );
 }
 
+/// Byte offsets 0..=7 are the MLBC magic (0..=3), major/minor version
+/// (4, 5), and reserved flags (6, 7) fields -- per `bytecode::encode`'s
+/// own fixed header layout, corrupting ANY single byte in this range to
+/// `0xFF` is deterministically rejected by `decode()` itself, before
+/// either verb touches the function table. Unlike the rest of the sweep
+/// (which only proves crash-freedom, since `ESTABLISHED_CODES` includes
+/// `SUCCESS` and so can't tell "correctly rejected" apart from "silently
+/// accepted and processed as if nothing were wrong" -- qa test-design
+/// warning msg #371, confirmed concretely: reverting the B18 flags-check
+/// fix left this exact region silently exiting 0 while the sweep's own
+/// established-code check kept reporting 100% passed), this narrower
+/// assertion demonstrates the sweep CAN distinguish the two for the one
+/// region where the expected outcome is unconditional and format-fixed
+/// regardless of what the rest of the file happens to contain.
+const HEADER_REJECT_RANGE: std::ops::Range<usize> = 0..8;
+
 #[test]
 fn e5_a_genuine_breadth_of_corrupted_artifacts_never_crashes_and_always_lands_on_an_established_code()
  {
@@ -359,13 +375,24 @@ fn e5_a_genuine_breadth_of_corrupted_artifacts_never_crashes_and_always_lands_on
                 "corrupting byte offset {i} ({verb}) exited with an unrecognized code {:?}",
                 out.status.code()
             );
+            if HEADER_REJECT_RANGE.contains(&i) {
+                assert_eq!(
+                    out.status.code(),
+                    Some(BAD_ARTIFACT),
+                    "corrupting header byte offset {i} ({verb}) must be REJECTED, not \
+                     silently accepted -- got {:?}",
+                    out.status.code()
+                );
+            }
         }
         passed += 1;
     }
     assert_eq!(passed, variants.len());
     eprintln!(
         "B18 E5 artifact-corruption sweep: {passed}/{} byte offsets (x2 verbs each), \
-         100% exited cleanly on an established exit code",
+         100% exited cleanly on an established exit code, and every header-region \
+         offset (magic/version/flags) was specifically confirmed REJECTED, not just \
+         crash-free",
         variants.len()
     );
 }

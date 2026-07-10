@@ -247,6 +247,7 @@ pub(crate) fn registry() -> Registry {
                 "\"",
                 "(\"",
                 "(display #t",
+                "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((",
             ];
             for (i, src) in snippets.iter().enumerate() {
                 let file = write_source(&format!("b18-e5-src-{i}.ml"), src);
@@ -260,6 +261,16 @@ pub(crate) fn registry() -> Registry {
             }
 
             let good = compile_good_artifact("b18-e5-sweep-base");
+            // Offsets 0..=7 (magic/version/flags, per bytecode::encode's
+            // fixed header layout) are deterministically rejected by
+            // decode() regardless of the rest of the file -- asserted
+            // specifically as BAD_ARTIFACT (not just "some established
+            // code") so this sweep can actually distinguish correct
+            // rejection from silent wrong-acceptance for this region,
+            // rather than only proving crash-freedom (qa test-design
+            // warning msg #371: ESTABLISHED_CODES includes SUCCESS, so
+            // without this the sweep can't tell the two apart at all).
+            let header_reject_range = 0..8;
             for i in 0..good.len() {
                 let mut bytes = good.clone();
                 bytes[i] = 0xFF;
@@ -273,10 +284,19 @@ pub(crate) fn registry() -> Registry {
                         "offset {i} ({verb}) exit {:?}",
                         out.status.code()
                     );
+                    if header_reject_range.contains(&i) {
+                        assert_eq!(
+                            out.status.code(),
+                            Some(BAD_ARTIFACT),
+                            "header byte offset {i} ({verb}) must be REJECTED, not \
+                             silently accepted -- got {:?}",
+                            out.status.code()
+                        );
+                    }
                 }
             }
             w.notes.push(format!(
-                "{} source snippets + {} artifact offsets (x2 verbs) all exited cleanly on an established code",
+                "{} source snippets + {} artifact offsets (x2 verbs) all exited cleanly on an established code, header-region offsets specifically confirmed rejected",
                 snippets.len(),
                 good.len()
             ));
