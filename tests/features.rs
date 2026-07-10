@@ -37,6 +37,8 @@ mod steps_b18;
 mod steps_b19;
 #[path = "features/steps_b2.rs"]
 mod steps_b2;
+#[path = "features/steps_b20.rs"]
+mod steps_b20;
 #[path = "features/steps_b3.rs"]
 mod steps_b3;
 #[path = "features/steps_b4.rs"]
@@ -183,5 +185,15 @@ fn b19_reader_edge_cases_and_conformance() {
         "B19-reader-edge-cases-and-conformance",
         src,
         &steps_b19::registry(),
+    );
+}
+
+#[test]
+fn b20_self_test_and_quality_gates() {
+    let src = include_str!("../features/B20-self-test-and-quality-gates.feature");
+    registry::run_feature(
+        "B20-self-test-and-quality-gates",
+        src,
+        &steps_b20::registry(),
     );
 }
