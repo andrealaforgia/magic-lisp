@@ -93,16 +93,22 @@ impl<'a> Scanner<'a> {
     }
 
     /// The `#`-prefixed half of [`Self::skip_atmosphere`], split into its
-    /// own `#[inline(never)]` function so its extra local state (the
-    /// lookahead clone, the nested match) never inflates the stack frame
-    /// of the ordinary whitespace/`;`-comment path -- that path runs once
-    /// per level of `read_form`'s own list-nesting recursion, so growing
-    /// its frame size at all risks tipping an already precisely-
-    /// calibrated `MAX_NESTING_DEPTH` over into a real stack overflow
-    /// (confirmed: inlining this directly into `skip_atmosphere`
-    /// regressed `accepts_nesting_of_exactly_the_configured_maximum_depth`
-    /// from passing to a genuine native stack overflow, with no other
-    /// change to the recursion's own call count).
+    /// own function so its extra local state (the lookahead clone, the
+    /// nested match) never inflates the stack frame of the ordinary
+    /// whitespace/`;`-comment path -- that path runs once per level of
+    /// `read_form`'s own list-nesting recursion, so growing its frame size
+    /// at all risks tipping an already precisely-calibrated
+    /// `MAX_NESTING_DEPTH` closer to a real stack overflow.
+    ///
+    /// The `#[inline(never)]` below is a defensive hint, not a proven fix
+    /// on its own -- the actual margin that makes the `MAX_NESTING_DEPTH`
+    /// boundary tests reliable comes from running them on a dedicated,
+    /// fixed-size 8 MiB thread (see `read_program_on_a_fixed_stack` in the
+    /// tests below), which decouples them from the test harness's own
+    /// uncontrolled default per-test-thread stack size. Splitting this
+    /// function out keeps the hot path's frame small regardless of
+    /// whether the compiler honors the hint, but the dedicated-thread
+    /// pattern is what actually makes the boundary tests pass.
     ///
     /// Returns `true` if a comment was consumed (caller should keep
     /// looping) and `false` if the `#` starts a real datum instead (`#t`,

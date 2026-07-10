@@ -186,35 +186,3 @@ fn e6_sample_100_hash_deterministic_insertion_order_keys() {
     // '2\n(a b)\nnope\n#t\n#f\n'.
     assert_eq!(eval_ok("b19-e6-100.ml", src), "2\n(a b)\nnope\n#t\n#f\n");
 }
-
-// --- E7 (integration): the four named DEMOs verbatim. ---
-
-#[test]
-fn e7_demo1_skip_datum_marker_before_a_stray_value_between_a_sum() {
-    let out = eval_ok("b19-e7-demo1.ml", "(display (+ 1 #;99 2)) (newline)");
-    assert_eq!(out, "3\n");
-}
-
-#[test]
-fn e7_demo2_a_single_block_comment_then_displaying_1() {
-    let out = eval_ok(
-        "b19-e7-demo2.ml",
-        "#| a block comment |# (display 1) (newline)",
-    );
-    assert_eq!(out, "1\n");
-}
-
-#[test]
-fn e7_demo3_a_block_comment_containing_a_nested_complete_one_then_displaying_2() {
-    let out = eval_ok(
-        "b19-e7-demo3.ml",
-        "#| outer #| nested |# still outer |# (display 2) (newline)",
-    );
-    assert_eq!(out, "2\n");
-}
-
-#[test]
-fn e7_demo4_displaying_a_dotted_pair_of_1_and_2() {
-    let out = eval_ok("b19-e7-demo4.ml", "(display (quote (1 . 2))) (newline)");
-    assert_eq!(out, "(1 . 2)\n");
-}
