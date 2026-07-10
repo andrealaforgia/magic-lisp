@@ -1930,6 +1930,20 @@ struct DatumBoundaryScan {
     after_hash: bool,
     char_literal_pending: bool,
     seen_token: bool,
+    /// Nesting depth of `#| ... |#` block comments (B19; warden security
+    /// review msg #366): 0 means not in one. Mirrors `reader.rs`'s own
+    /// `skip_block_comment` counter exactly, since that function itself
+    /// works from a real lookahead (`peek`) this per-character tracker
+    /// doesn't have -- `block_hash_pending`/`block_pipe_pending` below
+    /// carry the equivalent "just saw this, waiting to see if the next
+    /// char completes a marker" state across individual `feed_char` calls
+    /// instead. While this is nonzero, every character is ignored other
+    /// than tracking further `#|`/`|#` markers -- in particular, brackets
+    /// and quotes inside a block comment must NOT affect `depth`/
+    /// `in_string`, exactly like the real reader's own block-comment skip.
+    in_block_comment: usize,
+    block_hash_pending: bool,
+    block_pipe_pending: bool,
 }
 
 impl DatumBoundaryScan {
@@ -1956,6 +1970,28 @@ impl DatumBoundaryScan {
             self.seen_token = true;
             return;
         }
+        if self.in_block_comment > 0 {
+            // Everything is ignored here except tracking further `#|`/`|#`
+            // markers -- deliberately NOT returning early on a lone '#' or
+            // '|' that turns out not to complete one; it's re-examined as
+            // a fresh potential marker-start on the very next character
+            // (matching e.g. a bare `#` followed later by `|#`, which must
+            // still close the comment rather than be swallowed).
+            if std::mem::take(&mut self.block_hash_pending) && c == '|' {
+                self.in_block_comment += 1;
+                return;
+            }
+            if std::mem::take(&mut self.block_pipe_pending) && c == '#' {
+                self.in_block_comment -= 1;
+                return;
+            }
+            match c {
+                '#' => self.block_hash_pending = true,
+                '|' => self.block_pipe_pending = true,
+                _ => {}
+            }
+            return;
+        }
         if self.in_comment {
             if c == '\n' {
                 self.in_comment = false;
@@ -1975,6 +2011,21 @@ impl DatumBoundaryScan {
         let after_hash = std::mem::take(&mut self.after_hash);
         if after_hash && c == '\\' {
             self.char_literal_pending = true;
+            self.seen_token = true;
+            return;
+        }
+        if after_hash && c == '|' {
+            self.in_block_comment = 1;
+            self.seen_token = true;
+            return;
+        }
+        if after_hash && c == ';' {
+            // `#;` (skip-next-datum, B19): NOT a line comment -- unlike a
+            // bare `;`, this must NOT swallow everything to the next
+            // newline. The datum it prefixes is tracked with completely
+            // ordinary bracket/string rules below (its own parens/quotes
+            // are real and must still count), so nothing further is
+            // needed here beyond not misrouting into the `;` arm.
             self.seen_token = true;
             return;
         }
@@ -2008,7 +2059,11 @@ impl DatumBoundaryScan {
     /// a *valid* datum is there; only that attempting a real parse is now
     /// worth its cost.
     fn possible_boundary(&self) -> bool {
-        self.seen_token && !self.in_string && !self.in_comment && self.depth <= 0
+        self.seen_token
+            && !self.in_string
+            && !self.in_comment
+            && self.in_block_comment == 0
+            && self.depth <= 0
     }
 
     #[cfg(test)]
@@ -6977,6 +7032,86 @@ mod tests {
         let mut b = DatumBoundaryScan::default();
         b.feed("(display #");
         b.feed(r"\( )");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    // --- B19 comment forms (warden security review msg #366): this
+    // tracker mirrors the reader's grammar, and had gone stale the moment
+    // B19 added `#| |#` and `#;` -- unmatched parens/quotes inside a block
+    // comment must not miscount, a nested block comment must not close the
+    // outer one early, and `#;` must NOT be misrouted into the unconditional
+    // `;` line-comment arm (which would swallow the rest of the stream). ---
+
+    #[test]
+    fn datum_boundary_scan_ignores_unmatched_parens_inside_a_block_comment() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display #| ( |# 1)");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_a_nested_block_comment_does_not_close_the_outer_one_early() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display #| outer #| nested |# still outer |# 1)");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_a_nested_block_comments_own_depth_is_tracked_not_just_its_shape() {
+        // The test above alone doesn't distinguish correctly-tracked
+        // nesting depth from a miscounted one that still happens to close
+        // fully by the time the real, final `|#` arrives -- both produce
+        // the SAME final depth/possible_boundary outcome whenever the
+        // text after the comment has exactly as many real close-parens as
+        // opens, which that test's own string does. This one adds a
+        // genuinely UNMATCHED `(` inside the portion that's only safely
+        // ignorable if the tracker is STILL correctly inside the outer
+        // comment at that point (i.e. the inner "|#" only dropped the
+        // nesting from 2 to 1, not fully to 0) -- if nesting is instead
+        // miscounted and the comment closes fully one marker too early,
+        // that stray `(` gets exposed as real, permanently-unbalanced
+        // code, and the final depth comes out as 1, not 0.
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display #| outer #| nested |# still ( outer |# 1)");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_stays_not_a_boundary_while_a_block_comment_is_still_open() {
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display #| still open");
+        assert!(!b.possible_boundary());
+        b.feed(" |# 1)");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_a_skip_next_datum_marker_is_not_mistaken_for_a_line_comment() {
+        // Warden's own exact repro (msg #366): before the fix, `#;`
+        // triggered the bare `;` arm's unconditional line-comment mode,
+        // which then swallowed the rest of the stream (including the
+        // real, load-bearing closing paren) since no more newlines ever
+        // arrive on a held-open connection -- `depth` got stuck above
+        // zero forever.
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display #;(x) 1)");
+        assert!(b.possible_boundary());
+        assert_eq!(b.depth, 0);
+    }
+
+    #[test]
+    fn datum_boundary_scan_a_skip_next_datum_marker_moved_one_token_later_still_tracks_correctly() {
+        // The exact ordering warden's own follow-up investigation
+        // identified as necessary to deterministically reproduce the bug
+        // (rather than a lucky single-chunk-delivery coincidence masking
+        // it): real bracket structure precedes the construct.
+        let mut b = DatumBoundaryScan::default();
+        b.feed("(display 1 #;(x) 2)");
         assert!(b.possible_boundary());
         assert_eq!(b.depth, 0);
     }

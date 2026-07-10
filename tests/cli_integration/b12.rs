@@ -239,6 +239,96 @@ fn read_completes_promptly_for_a_datum_that_lands_exactly_on_a_full_relay_read_b
 }
 
 #[test]
+fn read_completes_promptly_for_a_complete_datum_containing_a_block_comment() {
+    // Regression test for warden security review msg #366: B19 added
+    // `#| ... |#` block comments to the reader, but `native_read`'s own
+    // `DatumBoundaryScan` (a deliberately simplified mirror of that same
+    // grammar, used to decide when a real parse attempt is worth trying)
+    // went stale -- it had no notion of block comments at all, so an
+    // unmatched paren inside one desynced its bracket-depth count and the
+    // datum never registered as complete on a stream that stayed open.
+    let file = write_source("b12-read-block-comment.ml", "(display (read))");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"(display #| ( |# 1)").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not complete within 2s while stdin stayed open \
+                 after a complete datum containing a block comment -- the \
+                 stale-boundary-tracker stall regression"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(status.success(), "expected a clean exit, got: {status:?}");
+}
+
+#[test]
+fn read_completes_promptly_for_a_complete_datum_containing_a_skip_next_datum_marker() {
+    // Sibling regression test for the same root cause (warden security
+    // review msg #366): `#;` (skip the next datum) was misrouted into the
+    // tracker's unconditional `;`-line-comment handling, which then
+    // swallowed the rest of the stream -- including the real, load-bearing
+    // closing paren -- since no newline ever arrives on a held-open stream.
+    let file = write_source("b12-read-skip-datum.ml", "(display (read))");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .arg("eval")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"(display 1 #;(x) 2)").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("polling child status should not fail")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not complete within 2s while stdin stayed open \
+                 after a complete datum containing a #; skip-next-datum \
+                 marker -- the stale-boundary-tracker stall regression"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    assert!(status.success(), "expected a clean exit, got: {status:?}");
+}
+
+#[test]
 fn read_does_not_return_a_number_split_by_a_gap_until_all_its_digits_have_arrived() {
     // Regression test for warden security review msg #244: a bare number
     // (or symbol) has no delimiter of its own -- its true end can only be
