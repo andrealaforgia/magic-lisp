@@ -184,6 +184,12 @@ fn assert_plateaus(samples: &[u64]) {
 }
 
 #[test]
+#[ignore = "unconditionally costs ~60s+ on the release build (qa test-design warning: the \
+            same unconditional-slow-test lesson B20 just taught, one commit later), and is \
+            redundant with the BDD acceptance suite's own always-on B21 scenario (steps_b21.rs), \
+            which the Examiner explicitly asked NOT to shorten there. Invoke explicitly \
+            (`cargo test --release --test cli_integration -- --ignored b21::e5`) for a \
+            standalone CLI-integration-level re-check."]
 fn e5_repeatedly_creating_closures_over_a_captured_variable_over_a_sustained_minute_stays_bounded()
 {
     if cfg!(debug_assertions) {
@@ -194,6 +200,10 @@ fn e5_repeatedly_creating_closures_over_a_captured_variable_over_a_sustained_min
 }
 
 #[test]
+#[ignore = "unconditionally costs ~60s+ on the release build for the same reason as e5 above \
+            (qa test-design warning), and is redundant with the BDD acceptance suite's own \
+            always-on B21 integration scenario. Invoke explicitly (`cargo test --release \
+            --test cli_integration -- --ignored b21::e6`) for a standalone re-check."]
 fn e6_all_four_performance_and_memory_demos_hold_together_on_the_release_build() {
     if cfg!(debug_assertions) {
         return;
