@@ -189,6 +189,13 @@ fn b19_reader_edge_cases_and_conformance() {
 }
 
 #[test]
+#[ignore = "self-verifying: its own 'test' check spawns a full nested `cargo test --all`, \
+            so this one test alone costs several minutes wall-clock and a rebuilt isolated \
+            target directory -- three to four orders of magnitude slower than the rest of \
+            this binary combined (qa test-design warning on e3d5e43). Not run by default; \
+            invoke explicitly (`cargo test --test features -- --ignored b20_self_test`) \
+            before a release or in a dedicated CI job to re-confirm the documented quality \
+            gates still hold end to end."]
 fn b20_self_test_and_quality_gates() {
     let src = include_str!("../features/B20-self-test-and-quality-gates.feature");
     registry::run_feature(
