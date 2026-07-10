@@ -30,22 +30,6 @@ const NAMED_TESTS: &[&str] = &[
     "b1::e8_runtime_error_exit_code_for_an_undefined_global",
 ];
 
-/// This test binary is itself one of the things the documented test
-/// command (`cargo test --all`) runs, so spawning it unconditionally from
-/// inside this scenario would recurse forever. The child is launched with
-/// this variable set; if that child reaches this same step while running
-/// its own copy of this scenario, it recognizes the guard and skips
-/// spawning a second child instead of recursing again. The guard only
-/// elides the innermost self-referential spawn -- every other test in the
-/// child's real, complete `cargo test --all` run (including the eleven
-/// named tests above) still executes for real, so the assertions made
-/// against the guarded child's output are against a genuine, unmocked run.
-const RECURSION_GUARD_VAR: &str = "MAGICLISP_B20_RECURSION_GUARD";
-
-fn recursion_guard_active() -> bool {
-    std::env::var(RECURSION_GUARD_VAR).is_ok()
-}
-
 /// A target directory dedicated to the `cargo build`/`test`/`clippy`
 /// child processes this file spawns, distinct from the target directory
 /// the outer `cargo test` run (and every sibling test binary running
@@ -69,21 +53,42 @@ fn run_bin(bin: &str, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|e| panic!("{bin} {args:?} should run: {e}"))
 }
 
+/// Removes the isolated target directory after a nested cargo invocation
+/// is done with it (qa test-design warning: left uncleaned, every run
+/// leaked a fresh multi-hundred-MB directory that was never reclaimed).
+/// Cargo recreates it from scratch on the next call if one is needed --
+/// a negligible rebuild cost for this dependency-free crate compared to
+/// the test execution time these invocations are dominated by.
+fn cleanup_isolated_target_dir() {
+    let _ = std::fs::remove_dir_all(isolated_target_dir());
+}
+
 fn run_cargo(args: &[&str]) -> std::process::Output {
-    std::process::Command::new("cargo")
+    let output = std::process::Command::new("cargo")
         .args(args)
         .env("CARGO_TARGET_DIR", isolated_target_dir())
         .output()
-        .unwrap_or_else(|e| panic!("cargo {args:?} should run: {e}"))
+        .unwrap_or_else(|e| panic!("cargo {args:?} should run: {e}"));
+    cleanup_isolated_target_dir();
+    output
 }
 
+/// This test binary is itself one of the things the documented test
+/// command (`cargo test --all`) runs, but this scenario itself is
+/// `#[ignore]`d (see `tests/features.rs`) and the child invocation below
+/// is always a plain `cargo test --all` with no `--ignored`/
+/// `--include-ignored` flag, so the child selects only non-ignored
+/// tests -- it never reaches this same scenario again, regardless of how
+/// the outer invocation that reached this point was itself launched. No
+/// separate recursion guard is needed on top of that.
 fn run_documented_test_command() -> std::process::Output {
-    std::process::Command::new("cargo")
+    let output = std::process::Command::new("cargo")
         .args(["test", "--all"])
-        .env(RECURSION_GUARD_VAR, "1")
         .env("CARGO_TARGET_DIR", isolated_target_dir())
         .output()
-        .expect("cargo test --all should run")
+        .expect("cargo test --all should run");
+    cleanup_isolated_target_dir();
+    output
 }
 
 fn assert_test_command_ok(out: &std::process::Output) {
@@ -208,9 +213,7 @@ pub(crate) fn registry() -> Registry {
         .step(
             "it completes successfully, and specific named tests exist covering the reader (comment handling, dotted-pair reading), a real bytecode round trip through a file written to and read back from disk, closures sharing a captured variable, tail-call recursion reaching real depth without growing memory, and one example of each of the five established exit-code outcomes",
             |w, _text, _| {
-                if !recursion_guard_active() {
-                    assert_test_command_ok(w.labeled("test"));
-                }
+                assert_test_command_ok(w.labeled("test"));
             },
         )
         .step("it passes with no differences", |w, _text, _| {
@@ -222,9 +225,7 @@ pub(crate) fn registry() -> Registry {
         .step(
             "the test command completes successfully with all five required categories present, the formatting check passes with no differences, the linter reports no warnings, and a sample program compiled twice yields byte-identical output",
             |w, _text, _| {
-                if !recursion_guard_active() {
-                    assert_test_command_ok(w.labeled("test"));
-                }
+                assert_test_command_ok(w.labeled("test"));
                 assert_fmt_ok(w.labeled("fmt"));
                 assert_clippy_ok(w.labeled("clippy"));
                 assert_determinism_ok(&w.notes);
@@ -301,10 +302,8 @@ pub(crate) fn registry() -> Registry {
 fn run_queued_check(w: &mut super::world::World, kind: &str) {
     match kind {
         "test" => {
-            if !recursion_guard_active() {
-                let out = run_documented_test_command();
-                w.labeled.push(("test".to_string(), out));
-            }
+            let out = run_documented_test_command();
+            w.labeled.push(("test".to_string(), out));
         }
         "fmt" => {
             let out = run_cargo(&["fmt", "--check"]);
