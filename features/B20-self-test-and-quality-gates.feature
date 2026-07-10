@@ -26,6 +26,12 @@ Feature: B20 — Self-test suite and quality gates
     #   b1::e8_bad_artifact_exit_code_for_a_corrupt_artifact
     #   b1::e8_runtime_error_exit_code_for_an_undefined_global
     #   Independently confirmed all 11 named tests actually exist in the source tree (not fabricated).
+    #   Note: this scenario's own BDD verification test is marked #[ignore] by default — it
+    #   recursively spawns a full nested `cargo test --all` (several minutes, a rebuilt isolated
+    #   target directory), three to four orders of magnitude slower than the rest of the BDD
+    #   suite combined (qa test-design warning). Run it explicitly before a release or in a
+    #   dedicated CI job: `cargo test --test features -- --ignored b20_self_test`.
+    #   Independently re-verified: still passes when invoked explicitly (335.55s).
 
   Scenario: E2 — the formatting check produces no differences
     Given the project's formatting check
