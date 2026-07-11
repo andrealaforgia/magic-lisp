@@ -1,6 +1,15 @@
 //! B23: dotted-list literals past the const-nesting cap round-trip
 //! correctly, without weakening the cap's protection against genuine
 //! (car-side) pathological nesting.
+//!
+//! qa test-design review msg #380 (Maintainable): the fixture helpers
+//! below (`dotted_list_source`/`expected_display`/`nested_list_const`/
+//! `module_with_const`/the two cap constants) are intentionally
+//! duplicated in `tests/features/steps_b23.rs` -- the two files are
+//! separate Cargo test binaries with no shared dependency of their own
+//! (mirroring `helpers.rs`/`world.rs`'s own pre-existing split), so
+//! there's no `#[path]`-free way to share them. Flagged as a cross-
+//! reference rather than resolved, per the review's own stated minimum.
 
 use magiclisp::bytecode::{Chunk, Const, Module, encode};
 use magiclisp::exitcode::SUCCESS;
