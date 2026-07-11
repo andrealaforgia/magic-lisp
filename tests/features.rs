@@ -43,6 +43,8 @@ mod steps_b20;
 mod steps_b21;
 #[path = "features/steps_b22.rs"]
 mod steps_b22;
+#[path = "features/steps_b23.rs"]
+mod steps_b23;
 #[path = "features/steps_b3.rs"]
 mod steps_b3;
 #[path = "features/steps_b4.rs"]
@@ -219,4 +221,10 @@ fn b21_performance_and_memory() {
 fn b22_cycle_safe_memory() {
     let src = include_str!("../features/B22-cycle-safe-memory.feature");
     registry::run_feature("B22-cycle-safe-memory", src, &steps_b22::registry());
+}
+
+#[test]
+fn b23_dotted_list_round_trip() {
+    let src = include_str!("../features/B23-dotted-list-round-trip.feature");
+    registry::run_feature("B23-dotted-list-round-trip", src, &steps_b23::registry());
 }

@@ -313,24 +313,11 @@ fn encode_const(out: &mut Vec<u8>, c: &Const) {
             // of parens (nesting depth 1, never touching the reader's
             // MAX_NESTING_DEPTH), but produces a `Const::Pair` chain N
             // deep. Only each car (bounded by ordinary nesting depth, like
-            // `List`/`Vector` items) still recurses.
-            //
-            // Known asymmetry (qa test-design review, msg #160): this
-            // encode side doesn't cap cdr-chain length at all, but
-            // `decode_const` still enforces `MAX_CONST_NESTING_DEPTH`
-            // uniformly across car and cdr -- so a dotted-list literal
-            // longer than that limit encodes fine but fails to decode its
-            // own freshly-written bytes with a "truncated" error. A fix
-            // (making `decode_const`'s cdr walk cap-exempt and iterative
-            // too, matching this side) was attempted and reverted: it
-            // requires every recursive call in `decode_const_body` to call
-            // itself directly rather than through the `decode_const`
-            // wrapper, and even after correcting that, the existing
-            // *car*-nesting boundary tests (unrelated to this change)
-            // started overflowing the stack in an unoptimized build for a
-            // reason not fully root-caused in the time available. Left as
-            // a known, documented inconsistency rather than risk shipping
-            // an unverified change to this file's recursion structure.
+            // `List`/`Vector` items) still recurses -- `decode_const_body`
+            // mirrors this exact shape on the way back in, so a dotted
+            // list of any length round-trips regardless of
+            // `MAX_CONST_NESTING_DEPTH` (B23; the two sides used to be
+            // asymmetric here -- see git history for the prior gap).
             out.push(9);
             encode_const(out, car);
             let mut tail: &Const = cdr;
@@ -427,10 +414,21 @@ impl<'a> Reader<'a> {
 }
 
 fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
+    let tag = r.u8()?;
+    decode_const_body(r, depth, tag)
+}
+
+/// The body of [`decode_const`], taking an already-read tag byte directly
+/// rather than reading one of its own -- needed so the cdr-spine walk
+/// below can dispatch on a tag it peeked ahead of time without decoding it
+/// twice. Checks `MAX_CONST_NESTING_DEPTH` itself (rather than leaving
+/// that to the [`decode_const`] wrapper) so every value gets the same
+/// cap enforced exactly once, regardless of which of the two ways it was
+/// reached.
+fn decode_const_body(r: &mut Reader, depth: usize, tag: u8) -> Result<Const, BytecodeError> {
     if depth > MAX_CONST_NESTING_DEPTH {
         return Err(BytecodeError::Truncated);
     }
-    let tag = r.u8()?;
     Ok(match tag {
         0 => Const::Int(r.i64()?),
         1 => Const::Bool(r.u8()? != 0),
@@ -469,9 +467,29 @@ fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
             Const::Vector(items)
         }
         9 => {
-            let car = decode_const(r, depth + 1)?;
-            let cdr = decode_const(r, depth + 1)?;
-            Const::Pair(Box::new(car), Box::new(cdr))
+            // Mirrors encode_const's own iterative cdr-spine walk (see its
+            // doc comment): a dotted-list literal's cdr chain is one flat
+            // list, however many elements long, not real nesting -- only
+            // each car and the final tail count against
+            // MAX_CONST_NESTING_DEPTH, all at exactly `depth + 1` (the
+            // same single hop a plain, non-chained pair's car/cdr would
+            // cost), regardless of how many links the chain has. Every
+            // recursive call here goes through `decode_const_body`
+            // directly rather than back through `decode_const`, since the
+            // tag for each subsequent link is already peeked by the loop
+            // below and re-reading it would desync the byte stream.
+            let mut cars = vec![decode_const(r, depth + 1)?];
+            let tail = loop {
+                let next_tag = r.u8()?;
+                if next_tag == 9 {
+                    cars.push(decode_const(r, depth + 1)?);
+                } else {
+                    break decode_const_body(r, depth + 1, next_tag)?;
+                }
+            };
+            cars.into_iter()
+                .rev()
+                .fold(tail, |acc, car| Const::Pair(Box::new(car), Box::new(acc)))
         }
         _ => return Err(BytecodeError::Truncated),
     })
@@ -1006,7 +1024,14 @@ mod tests {
     /// `(1 2 3 ... . tail)` actually produces, unlike `nested_pair_const`
     /// above (which only exercises the car side's own depth counting).
     fn cdr_nested_pair_const(depth: usize) -> Const {
-        let mut c = Const::Int(0);
+        cdr_nested_pair_const_with_tail(depth, Const::Int(0))
+    }
+
+    /// As above, but with a caller-chosen final tail instead of always
+    /// `Const::Int(0)` -- lets a test pair a long-but-otherwise-shallow
+    /// cdr spine with a separately, deliberately deep tail.
+    fn cdr_nested_pair_const_with_tail(depth: usize, tail: Const) -> Const {
+        let mut c = tail;
         for _ in 0..depth {
             c = Const::Pair(Box::new(Const::Int(0)), Box::new(c));
         }
@@ -1021,8 +1046,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_cdr_chained_constant_pair_nested_one_deeper_than_the_configured_maximum() {
+    fn round_trips_a_cdr_chained_constant_pair_nested_one_deeper_than_the_configured_maximum() {
+        // B23: a dotted-list literal's cdr spine is one flat list, however
+        // long, not real nesting -- unlike car-side/List/Vector nesting
+        // (still capped, see the tests below), it must never be rejected
+        // for length alone. This is exactly one link past the old
+        // (now-removed) cdr cap, the boundary that used to fail.
         let module = module_with_const(cdr_nested_pair_const(MAX_CONST_NESTING_DEPTH + 1));
+        let bytes = encode(&module);
+        assert_eq!(decode_on_a_fixed_stack(&bytes), Ok(module));
+    }
+
+    #[test]
+    fn round_trips_a_cdr_chained_constant_pair_well_past_the_configured_maximum() {
+        // B23/E1/E2: several thousand elements, not just one past the old
+        // cap -- a genuinely long dotted-list literal, the case the spec's
+        // round-trip guarantee (SPEC §8) must hold for.
+        let module = module_with_const(cdr_nested_pair_const(MAX_CONST_NESTING_DEPTH * 10));
+        let bytes = encode(&module);
+        assert_eq!(decode_on_a_fixed_stack(&bytes), Ok(module));
+    }
+
+    #[test]
+    fn rejects_a_cdr_chained_pairs_final_tail_when_the_tail_itself_is_nested_past_the_maximum() {
+        // B23/E4: an unbounded cdr spine must not become a loophole for
+        // bypassing the depth cap on genuine nesting reached as the
+        // chain's own final tail -- the tail still costs exactly one depth
+        // unit past the chain, same as an ordinary car would, so pairing
+        // it with already-deep nesting still crosses the cap.
+        let deeply_nested_tail = nested_vector_const(MAX_CONST_NESTING_DEPTH);
+        let module = module_with_const(cdr_nested_pair_const_with_tail(1000, deeply_nested_tail));
+        let bytes = encode(&module);
+        assert_eq!(
+            decode_on_a_fixed_stack(&bytes),
+            Err(BytecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn rejects_a_cdr_chains_second_car_when_it_is_independently_nested_to_the_standalone_maximum() {
+        // Pins the depth+1 charge for the SECOND (and later) car in a cdr
+        // chain specifically, not just the first (mutation-testing
+        // finding): reaching a car via the chain's continuation still
+        // costs exactly one depth unit, same as any other position, so a
+        // car nested to the depth that succeeds standalone (starting at
+        // depth 0) must still be rejected here -- it's one level deeper
+        // by virtue of the chain link ahead of it.
+        let second_car = nested_list_const(MAX_CONST_NESTING_DEPTH);
+        let chain = Const::Pair(
+            Box::new(Const::Int(0)),
+            Box::new(Const::Pair(Box::new(second_car), Box::new(Const::Int(0)))),
+        );
+        let module = module_with_const(chain);
         let bytes = encode(&module);
         assert_eq!(
             decode_on_a_fixed_stack(&bytes),
