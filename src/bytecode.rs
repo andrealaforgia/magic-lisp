@@ -540,6 +540,28 @@ pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
 mod tests {
     use super::*;
 
+    /// Runs `decode` on a dedicated, fixed-size thread rather than whatever
+    /// stack the test harness happens to hand a given test -- mirrors
+    /// `read_program_on_a_fixed_stack` in `reader.rs` (added for a prior
+    /// security-review finding on B1). `decode_const`'s own boundary tests
+    /// previously asserted against `decode` directly, which only proves
+    /// `MAX_CONST_NESTING_DEPTH` is safe under whatever stack size the
+    /// harness happens to provide, not under a real, controlled budget the
+    /// way `cli.rs`'s `load_artifact` actually runs it (an ordinary thread,
+    /// no dedicated big-stack thread of its own). Pinning to a fixed 8 MiB
+    /// stack closes that verification gap (Warden security review, initial
+    /// baseline: finding 1).
+    fn decode_on_a_fixed_stack(bytes: &[u8]) -> Result<Module, BytecodeError> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, || decode(bytes))
+                .expect("should spawn the fixed-size thread")
+                .join()
+                .expect("decode itself must not crash the calling thread")
+        })
+    }
+
     fn sample_module() -> Module {
         let mut chunk = Chunk::new();
         let plus = chunk.add_const(Const::Symbol("+".to_string()));
@@ -825,14 +847,17 @@ mod tests {
     fn round_trips_a_constant_list_nested_to_exactly_the_configured_maximum_depth() {
         let module = module_with_const(nested_list_const(MAX_CONST_NESTING_DEPTH));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Ok(module));
+        assert_eq!(decode_on_a_fixed_stack(&bytes), Ok(module));
     }
 
     #[test]
     fn rejects_a_constant_list_nested_one_deeper_than_the_configured_maximum() {
         let module = module_with_const(nested_list_const(MAX_CONST_NESTING_DEPTH + 1));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+        assert_eq!(
+            decode_on_a_fixed_stack(&bytes),
+            Err(BytecodeError::Truncated)
+        );
     }
 
     fn nested_vector_const(depth: usize) -> Const {
@@ -847,7 +872,7 @@ mod tests {
     fn round_trips_a_constant_vector_nested_to_exactly_the_configured_maximum_depth() {
         let module = module_with_const(nested_vector_const(MAX_CONST_NESTING_DEPTH));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Ok(module));
+        assert_eq!(decode_on_a_fixed_stack(&bytes), Ok(module));
     }
 
     #[test]
@@ -859,7 +884,10 @@ mod tests {
         // blow the native stack instead of failing cleanly.
         let module = module_with_const(nested_vector_const(MAX_CONST_NESTING_DEPTH + 1));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+        assert_eq!(
+            decode_on_a_fixed_stack(&bytes),
+            Err(BytecodeError::Truncated)
+        );
     }
 
     #[test]
@@ -892,14 +920,17 @@ mod tests {
     fn round_trips_a_constant_pair_nested_to_exactly_the_configured_maximum_depth() {
         let module = module_with_const(nested_pair_const(MAX_CONST_NESTING_DEPTH));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Ok(module));
+        assert_eq!(decode_on_a_fixed_stack(&bytes), Ok(module));
     }
 
     #[test]
     fn rejects_a_constant_pair_nested_one_deeper_than_the_configured_maximum() {
         let module = module_with_const(nested_pair_const(MAX_CONST_NESTING_DEPTH + 1));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+        assert_eq!(
+            decode_on_a_fixed_stack(&bytes),
+            Err(BytecodeError::Truncated)
+        );
     }
 
     /// Chains via cdr, not car -- the shape a real dotted-list literal like
@@ -917,14 +948,17 @@ mod tests {
     fn round_trips_a_cdr_chained_constant_pair_nested_to_exactly_the_configured_maximum_depth() {
         let module = module_with_const(cdr_nested_pair_const(MAX_CONST_NESTING_DEPTH));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Ok(module));
+        assert_eq!(decode_on_a_fixed_stack(&bytes), Ok(module));
     }
 
     #[test]
     fn rejects_a_cdr_chained_constant_pair_nested_one_deeper_than_the_configured_maximum() {
         let module = module_with_const(cdr_nested_pair_const(MAX_CONST_NESTING_DEPTH + 1));
         let bytes = encode(&module);
-        assert_eq!(decode(&bytes), Err(BytecodeError::Truncated));
+        assert_eq!(
+            decode_on_a_fixed_stack(&bytes),
+            Err(BytecodeError::Truncated)
+        );
     }
 
     #[test]
