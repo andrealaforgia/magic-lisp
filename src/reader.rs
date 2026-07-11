@@ -486,6 +486,27 @@ pub fn read_program(src: &str) -> Result<Vec<Sexpr>, ReadError> {
 /// it's not independently tuned.
 const READ_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
 
+/// Runs `f` on a dedicated thread of `stack_size` bytes and joins it,
+/// converting a spawn failure or an internal panic into a [`ReadError`] --
+/// factored out from [`read_program_on_a_dedicated_stack`] so its two
+/// failure arms (spawn failure, panic-during-join) are directly testable
+/// against a deliberately failing `f`, without needing `read_program`
+/// itself to somehow panic (it never does, by design -- see SPEC.md
+/// §10.3's crash-free-robustness guarantee).
+fn on_a_dedicated_stack<T: Send>(
+    stack_size: usize,
+    f: impl FnOnce() -> T + Send,
+) -> Result<T, ReadError> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(stack_size)
+            .spawn_scoped(scope, f)
+            .map_err(|e| err(format!("failed to spawn dedicated-stack thread: {e}")))?
+            .join()
+            .map_err(|_| err("dedicated-stack thread panicked"))
+    })
+}
+
 /// Runs [`read_program`] on a dedicated `READ_STACK_SIZE` thread, so
 /// `MAX_NESTING_DEPTH`'s safety margin is a fixed, known quantity rather
 /// than whatever stack the calling thread happens to have -- mirrors
@@ -497,14 +518,7 @@ const READ_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
 /// call already runs inside `repl::run_session`'s session-wide dedicated
 /// thread, so neither of those needed a change).
 pub fn read_program_on_a_dedicated_stack(src: &str) -> Result<Vec<Sexpr>, ReadError> {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(READ_STACK_SIZE)
-            .spawn_scoped(scope, || read_program(src))
-            .map_err(|e| err(format!("failed to spawn reader thread: {e}")))?
-            .join()
-            .unwrap_or_else(|_| Err(err("internal error: reader thread panicked")))
-    })
+    on_a_dedicated_stack(READ_STACK_SIZE, || read_program(src))?
 }
 
 /// Reads exactly one datum from `src`, returning it together with
@@ -549,12 +563,28 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_stack_wrapper_produces_the_same_result_as_read_program_directly() {
+    fn dedicated_stack_wrapper_matches_read_program_on_success() {
         assert_eq!(
             read_program_on_a_dedicated_stack("(+ 1 2)"),
             read_program("(+ 1 2)")
         );
+    }
+
+    #[test]
+    fn dedicated_stack_wrapper_matches_read_program_on_error() {
         assert!(read_program_on_a_dedicated_stack("(display 1").is_err());
+    }
+
+    #[test]
+    fn dedicated_stack_wrapper_surfaces_a_panic_inside_f_as_a_read_error() {
+        // Exercises on_a_dedicated_stack's join-panic arm directly, via a
+        // deliberately panicking closure -- read_program itself never
+        // panics (SPEC.md §10.3), so this path can't be reached by feeding
+        // it any input, however malformed (qa test-design review msg
+        // #340).
+        let err = on_a_dedicated_stack(8 * 1024 * 1024, || -> () { panic!("boom") })
+            .expect_err("a panicking closure must surface as an error, not unwind further");
+        assert_eq!(err.message, "dedicated-stack thread panicked");
     }
 
     #[test]

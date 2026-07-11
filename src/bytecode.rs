@@ -482,6 +482,29 @@ fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
 /// comments for why this value and why it's not independently tuned.
 const DECODE_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
 
+/// Runs `f` on a dedicated thread of `stack_size` bytes and joins it,
+/// converting a spawn failure or an internal panic into a
+/// [`BytecodeError::Internal`] -- factored out from
+/// [`decode_on_a_dedicated_stack`] so its two failure arms (spawn failure,
+/// panic-during-join) are directly testable against a deliberately failing
+/// `f`, without needing `decode` itself to somehow panic (it never does, by
+/// design -- see SPEC.md §10.3's crash-free-robustness guarantee).
+fn on_a_dedicated_stack<T: Send>(
+    stack_size: usize,
+    f: impl FnOnce() -> T + Send,
+) -> Result<T, BytecodeError> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(stack_size)
+            .spawn_scoped(scope, f)
+            .map_err(|e| {
+                BytecodeError::Internal(format!("failed to spawn dedicated-stack thread: {e}"))
+            })?
+            .join()
+            .map_err(|_| BytecodeError::Internal("dedicated-stack thread panicked".to_string()))
+    })
+}
+
 /// Runs [`decode`] on a dedicated `DECODE_STACK_SIZE` thread, so
 /// `MAX_CONST_NESTING_DEPTH`'s safety margin is a fixed, known quantity
 /// rather than whatever stack the calling thread happens to have --
@@ -492,18 +515,7 @@ const DECODE_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
 /// boundary-depth cases in a dedicated thread, leaving this real
 /// production entry point still unprotected).
 pub fn decode_on_a_dedicated_stack(bytes: &[u8]) -> Result<Module, BytecodeError> {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(DECODE_STACK_SIZE)
-            .spawn_scoped(scope, || decode(bytes))
-            .map_err(|e| BytecodeError::Internal(format!("failed to spawn decoder thread: {e}")))?
-            .join()
-            .unwrap_or_else(|_| {
-                Err(BytecodeError::Internal(
-                    "decoder thread panicked".to_string(),
-                ))
-            })
-    })
+    on_a_dedicated_stack(DECODE_STACK_SIZE, || decode(bytes))?
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
@@ -856,10 +868,28 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_stack_wrapper_produces_the_same_result_as_decode_directly() {
+    fn dedicated_stack_wrapper_matches_decode_on_success() {
         let bytes = encode(&sample_module());
         assert_eq!(decode_on_a_dedicated_stack(&bytes), decode(&bytes));
+    }
+
+    #[test]
+    fn dedicated_stack_wrapper_matches_decode_on_error() {
         assert!(decode_on_a_dedicated_stack(b"nope").is_err());
+    }
+
+    #[test]
+    fn dedicated_stack_wrapper_surfaces_a_panic_inside_f_as_an_internal_error() {
+        // Exercises on_a_dedicated_stack's join-panic arm directly, via a
+        // deliberately panicking closure -- decode itself never panics
+        // (SPEC.md §10.3), so this path can't be reached by feeding it any
+        // input, however malformed (qa test-design review msg #340).
+        let err = on_a_dedicated_stack(8 * 1024 * 1024, || -> () { panic!("boom") })
+            .expect_err("a panicking closure must surface as an error, not unwind further");
+        assert_eq!(
+            err,
+            BytecodeError::Internal("dedicated-stack thread panicked".to_string())
+        );
     }
 
     fn nested_list_const(depth: usize) -> Const {
