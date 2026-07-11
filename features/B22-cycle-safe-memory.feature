@@ -32,8 +32,8 @@ Feature: B22 — Cycle-safe memory: closure/upvalue reference cycles stay bounde
     Then a reader can understand the strategy well enough to know why E1 and E2 stay memory-bounded despite no host garbage collector existing
     # Evidence: filled in once the README section has been written.
 
-  Scenario: E4 — integration: the self-reference soak, the mutual-reference soak, and B21's acyclic soak all hold together
-    Given the self-referential soak (E1), the mutual-reference soak (E2), and the B21/E5 acyclic counter-factory soak, each run for its own full ~60-second sampled window in one review pass
-    When each sampled resident-memory trend is examined together, alongside the README's mechanism description
-    Then all three stay memory-bounded across their full runs, and what the README describes matches what is actually observed running -- demonstrating sustained memory-boundedness under genuine cyclic reference patterns on top of B21's acyclic guarantee, not just isolated pieces passing alone
-    # Evidence: filled in once all three soaks have been re-confirmed together against the release binary.
+  Scenario: E4 — integration: the self-reference, mutual-reference, and B21 acyclic patterns interleaved in one run all hold together
+    Given a single ~60-second run that interleaves the self-referential pattern (E1), the mutual-reference pattern (E2), and the B21/E5 acyclic counter-factory pattern every iteration, with memory sampled at multiple points across the run, alongside the README's mechanism description
+    When the sampled resident-memory trend is examined together with that description
+    Then it stays memory-bounded across the full run, and what the README describes matches what is actually observed running -- demonstrating sustained memory-boundedness when genuine cyclic reference patterns and the acyclic pattern are exercised together, not just isolated pieces passing alone
+    # Evidence: filled in once the interleaved soak has been run against the release binary.

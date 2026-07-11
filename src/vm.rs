@@ -734,62 +734,227 @@ fn upvalue_cell(
 /// cycle SPEC.md §2.1/§10.2 identifies as this design's one known
 /// memory-leak hazard: a captured [`Env`]'s `locals` cell can hold a
 /// [`Value::Closure`] whose own captured `Env` (directly, or via another
-/// `Env` in a longer ring) is the very `Env` that cell belongs to. Plain
-/// `Rc` reference counting never reclaims such a ring on its own, since
-/// every member's count stays above zero for as long as the ring itself
-/// exists.
+/// `Env` in a longer ring) is the very `Env` that cell belongs to — whether
+/// that reference sits directly in the cell or is mediated through a
+/// `Pair`/`Vector`/`Hash`/`List` the cell holds instead (warden security
+/// review, B22 High finding: routing the same cycle through one layer of
+/// `cons`/vector/hash indirection previously bypassed collection entirely).
+/// Plain `Rc` reference counting never reclaims such a ring on its own,
+/// since every member's count stays above zero for as long as the ring
+/// itself exists.
 ///
 /// This is a **trial-deletion cycle collector** (the strategy SPEC.md
-/// §10.2 permits alongside a tracing collector), restricted to exactly the
-/// two node kinds that can participate in this specific hazard: captured
-/// `Env`s, and the local-variable cells (`Rc<RefCell<Value>>`) they close
-/// over. It works entirely from real `Rc`/`Weak` strong-count arithmetic —
-/// deliberately **not** by walking the VM's operand stack, call frames, or
-/// globals as an explicit root set. For every tracked node, `real strong
-/// count − occurrences within the tracked graph` tells us how much of that
-/// count is explained by references OUTSIDE the tracked graph (an active
-/// call frame's own locals, the operand stack, a global, a vector element —
+/// §10.2 permits alongside a tracing collector), restricted to the node
+/// kinds that can participate in this hazard: captured `Env`s, and every
+/// mutable value **carrier** ([`Carrier`]) reachable from an `Env`'s
+/// `locals` — a local cell itself, or any `Pair`/`Vector`/`Hash` nested
+/// inside one, however deep, transparently through any `Value::List` along
+/// the way (immutable, so it can never itself close a cycle or need
+/// clearing, but its elements still need to be visible). It works entirely
+/// from real `Rc`/`Weak` strong-count arithmetic — deliberately **not** by
+/// walking the VM's operand stack, call frames, or globals as an explicit
+/// root set. For every tracked node, `real strong count − occurrences
+/// within the tracked graph` tells us how much of that count is explained
+/// by references OUTSIDE the tracked graph (an active call frame's own
+/// locals, the operand stack, a global, a list element held elsewhere —
 /// anything at all). Any node with a positive remainder is alive by
 /// definition, and so is anything reachable from it by following further
-/// `Env`/cell edges. What's left unreached after that propagation is, by
+/// edges. What's left unreached after that propagation is, by
 /// construction, unreachable from every real owner in the program — a
 /// genuine garbage cycle — and is safe to break.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EnvGc {
     registry: Vec<Weak<Env>>,
-    envs_since_sweep: usize,
+    /// The `registry` length (post-sweep, i.e. post-compaction) that
+    /// triggers the next sweep. Starts at `MIN_ENVS_PER_SWEEP` and, after
+    /// every sweep, is reset to double the surviving registry size (never
+    /// below the minimum) — amortized-doubling, not a fixed count, so a
+    /// program that accumulates many genuinely long-lived closures (no
+    /// cycles, nothing to reclaim) pays O(N) total sweep work across N
+    /// registrations rather than O(N²) (warden security review, B22
+    /// Medium/High finding: a fixed per-registration threshold rescans the
+    /// *entire* ever-growing registry every `MIN_ENVS_PER_SWEEP` new
+    /// entries, regardless of how large it's already grown).
+    next_sweep_at: usize,
 }
 
-/// How many newly captured environments accumulate between sweeps. Small
-/// enough that a sustained soak of cycle-forming closures stays memory-
-/// bounded (SPEC.md §10.2) rather than piling up a large backlog before the
-/// first sweep; large enough that an ordinary program's occasional closure
-/// creation essentially never pays for a sweep pass at all.
-const ENVS_PER_SWEEP: usize = 512;
+impl Default for EnvGc {
+    fn default() -> Self {
+        EnvGc {
+            registry: Vec::new(),
+            next_sweep_at: MIN_ENVS_PER_SWEEP,
+        }
+    }
+}
 
-/// One node in the tracked `Env`/cell graph, used only to give the mark
+/// See [`EnvGc::next_sweep_at`]'s doc comment. Small enough that a
+/// sustained soak of cycle-forming closures stays memory-bounded (SPEC.md
+/// §10.2) rather than piling up a large backlog before the first sweep;
+/// large enough that an ordinary program's occasional closure creation
+/// essentially never pays for a sweep pass at all.
+const MIN_ENVS_PER_SWEEP: usize = 512;
+
+/// A tracked mutable value carrier: any `Rc<RefCell<...>>` allocation whose
+/// content might, directly or through further nesting, hold a reference
+/// back into the tracked `Env`/carrier graph. Mirrors the corresponding
+/// runtime `Value` variant one level down (`Cell` is an `Env`'s own
+/// captured local slot; the others are the compound value types a cell —
+/// or another carrier — can hold).
+#[derive(Clone)]
+enum Carrier {
+    Cell(Rc<RefCell<Value>>),
+    Pair(Rc<RefCell<(Value, Value)>>),
+    Vector(Rc<RefCell<Vec<Value>>>),
+    Hash(Rc<RefCell<Vec<(Value, Value)>>>),
+}
+
+impl Carrier {
+    fn ptr(&self) -> usize {
+        match self {
+            Carrier::Cell(c) => Rc::as_ptr(c) as usize,
+            Carrier::Pair(c) => Rc::as_ptr(c) as usize,
+            Carrier::Vector(c) => Rc::as_ptr(c) as usize,
+            Carrier::Hash(c) => Rc::as_ptr(c) as usize,
+        }
+    }
+
+    fn strong_count(&self) -> usize {
+        match self {
+            Carrier::Cell(c) => Rc::strong_count(c),
+            Carrier::Pair(c) => Rc::strong_count(c),
+            Carrier::Vector(c) => Rc::strong_count(c),
+            Carrier::Hash(c) => Rc::strong_count(c),
+        }
+    }
+
+    /// A snapshot of every `Value` directly stored inside this carrier —
+    /// one for `Cell`, two for `Pair` (car/cdr), one per element for
+    /// `Vector`, and one per key/value for `Hash`.
+    fn contents(&self) -> Vec<Value> {
+        match self {
+            Carrier::Cell(c) => vec![c.borrow().clone()],
+            Carrier::Pair(c) => {
+                let b = c.borrow();
+                vec![b.0.clone(), b.1.clone()]
+            }
+            Carrier::Vector(c) => c.borrow().clone(),
+            Carrier::Hash(c) => c
+                .borrow()
+                .iter()
+                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .collect(),
+        }
+    }
+
+    /// Replaces every slot whose value is, or (transparently through any
+    /// `Value::List` nesting) contains, a `Closure` pointing at an `Env` in
+    /// `dead` with `Value::Unspecified` — breaking exactly the edges this
+    /// sweep determined are unreachable. A slot holding a *tracked*
+    /// `Pair`/`Vector`/`Hash` is left alone even if something dead is
+    /// buried inside it: that nested carrier is tracked and cleared
+    /// separately, at its own level, so clearing here too would discard a
+    /// real allocation this pass doesn't own the decision for. `List` gets
+    /// no such separate pass (it's never tracked as its own carrier, and
+    /// can't be mutated to remove just one element), so reaching through it
+    /// here is the only place that edge ever gets broken; replacing the
+    /// *whole* slot is safe because whatever else the list holds is either
+    /// independently alive through some other real reference (unaffected
+    /// by losing this one), or was only ever reachable via a dead closure
+    /// too and would be reclaimed regardless.
+    ///
+    /// Safe to run unconditionally against every tracked carrier (not just
+    /// ones this sweep judged unreachable): a carrier that's genuinely
+    /// alive can never hold a closure into `dead`, because the mark phase
+    /// always propagates aliveness onto anything an alive carrier directly
+    /// (or transparently, through a list) references — so this can never
+    /// touch a still-relevant edge.
+    fn clear_closures_into(&self, dead: &HashSet<*const Env>) {
+        let targets_dead = |v: &Value| {
+            let mut flat = Vec::new();
+            flatten_transparent(v, &mut flat);
+            flat.iter().any(
+                |item| matches!(item, Value::Closure(_, env) if dead.contains(&Rc::as_ptr(env))),
+            )
+        };
+        match self {
+            Carrier::Cell(c) => {
+                let mut b = c.borrow_mut();
+                if targets_dead(&b) {
+                    *b = Value::Unspecified;
+                }
+            }
+            Carrier::Pair(c) => {
+                let mut b = c.borrow_mut();
+                if targets_dead(&b.0) {
+                    b.0 = Value::Unspecified;
+                }
+                if targets_dead(&b.1) {
+                    b.1 = Value::Unspecified;
+                }
+            }
+            Carrier::Vector(c) => {
+                let mut b = c.borrow_mut();
+                for slot in b.iter_mut() {
+                    if targets_dead(slot) {
+                        *slot = Value::Unspecified;
+                    }
+                }
+            }
+            Carrier::Hash(c) => {
+                let mut b = c.borrow_mut();
+                for (k, v) in b.iter_mut() {
+                    if targets_dead(k) {
+                        *k = Value::Unspecified;
+                    }
+                    if targets_dead(v) {
+                        *v = Value::Unspecified;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Flattens `v` transparently through any `Value::List` nesting into its
+/// direct, non-`List` contents (an ordinary `Closure`/`Pair`/`Vector`/
+/// `Hash`/anything else, pushed as-is). `List` is immutable (plain
+/// `Rc<Vec<Value>>`, no `RefCell`), so it can never be self-referential —
+/// this always terminates — and can never itself mediate a mutation-closed
+/// cycle or be usefully cleared, so it's never tracked as its own
+/// [`Carrier`]; its elements just need to stay visible to whatever carrier
+/// contains the list.
+fn flatten_transparent(v: &Value, out: &mut Vec<Value>) {
+    if let Value::List(items) = v {
+        for item in items.iter() {
+            flatten_transparent(item, out);
+        }
+    } else {
+        out.push(v.clone());
+    }
+}
+
+/// One node in the tracked `Env`/carrier graph, used only to give the mark
 /// worklist a single element type.
 enum GcNode {
     Env(usize),
-    Cell(usize),
+    Carrier(usize),
 }
 
 impl EnvGc {
     /// Registers a freshly captured `Env` (see `Op::MakeFunction` below) and
-    /// triggers a sweep once enough new environments have accumulated.
+    /// triggers a sweep once the registry has grown to `next_sweep_at`.
     fn register(&mut self, env: &Rc<Env>) {
         self.registry.push(Rc::downgrade(env));
-        self.envs_since_sweep += 1;
-        if self.envs_since_sweep >= ENVS_PER_SWEEP {
-            self.envs_since_sweep = 0;
+        if self.registry.len() >= self.next_sweep_at {
             self.sweep();
+            self.next_sweep_at = (self.registry.len() * 2).max(MIN_ENVS_PER_SWEEP);
         }
     }
 
-    /// Runs one trial-deletion pass: builds the tracked `Env`/cell graph,
-    /// marks everything reachable from a real (outside-the-graph) owner,
-    /// and clears the closure content of every cell left unreached —
-    /// breaking any garbage cycle so ordinary `Rc` drop glue reclaims it
+    /// Runs one trial-deletion pass: builds the tracked `Env`/carrier
+    /// graph, marks everything reachable from a real (outside-the-graph)
+    /// owner, and clears the closure content of every edge left unreached
+    /// — breaking any garbage cycle so ordinary `Rc` drop glue reclaims it
     /// once this pass's own temporary strong holds go out of scope.
     fn sweep(&mut self) {
         // Compact dead entries and upgrade the rest to a temporary strong
@@ -807,49 +972,136 @@ impl EnvGc {
             .map(|(i, e)| (Rc::as_ptr(e), i))
             .collect();
 
-        // Every distinct cell referenced from any tracked env's `locals`,
-        // deduplicated by identity (the same cell commonly appears in more
-        // than one captured env, e.g. two sibling closures from the same
-        // enclosing frame).
-        let mut cells: Vec<Rc<RefCell<Value>>> = Vec::new();
-        let mut cell_index: HashMap<*const RefCell<Value>, usize> = HashMap::new();
+        // Discover every tracked carrier reachable from any tracked env's
+        // `locals`, recursively through further Pair/Vector/Hash nesting
+        // (List is transparent -- see `flatten_transparent`). Dedup by
+        // allocation identity: this both merges shared carriers (the same
+        // cell commonly appears in more than one captured env) and guards
+        // against a self-referential Pair/Vector/Hash looping the walk.
+        let mut carriers: Vec<Carrier> = Vec::new();
+        let mut carrier_index: HashMap<usize, usize> = HashMap::new();
+        let mut to_expand: Vec<usize> = Vec::new();
+        let register_carrier = |c: Carrier,
+                                carriers: &mut Vec<Carrier>,
+                                carrier_index: &mut HashMap<usize, usize>,
+                                to_expand: &mut Vec<usize>| {
+            let ptr = c.ptr();
+            if let std::collections::hash_map::Entry::Vacant(slot) = carrier_index.entry(ptr) {
+                slot.insert(carriers.len());
+                to_expand.push(carriers.len());
+                carriers.push(c);
+            }
+        };
         for e in &envs {
             for cell in &e.locals {
-                cell_index.entry(Rc::as_ptr(cell)).or_insert_with(|| {
-                    cells.push(cell.clone());
-                    cells.len() - 1
-                });
+                register_carrier(
+                    Carrier::Cell(cell.clone()),
+                    &mut carriers,
+                    &mut carrier_index,
+                    &mut to_expand,
+                );
+            }
+        }
+        while let Some(i) = to_expand.pop() {
+            let contents = carriers[i].contents();
+            for content in &contents {
+                let mut flat = Vec::new();
+                flatten_transparent(content, &mut flat);
+                for item in flat {
+                    let nested = match item {
+                        Value::Pair(cell) => Some(Carrier::Pair(cell)),
+                        Value::Vector(cell) => Some(Carrier::Vector(cell)),
+                        Value::Hash(cell) => Some(Carrier::Hash(cell)),
+                        _ => None,
+                    };
+                    if let Some(c) = nested {
+                        register_carrier(c, &mut carriers, &mut carrier_index, &mut to_expand);
+                    }
+                }
             }
         }
 
+        // Each node's direct children, computed once and reused for both
+        // the internal-in-degree pass and the mark/propagation pass below.
+        let env_carrier_children: Vec<Vec<usize>> = envs
+            .iter()
+            .map(|e| {
+                e.locals
+                    .iter()
+                    .filter_map(|cell| carrier_index.get(&Carrier::Cell(cell.clone()).ptr()))
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        let carrier_children: Vec<(Vec<usize>, Vec<usize>)> = carriers
+            .iter()
+            .map(|c| {
+                let mut env_targets = Vec::new();
+                let mut carrier_targets = Vec::new();
+                for content in c.contents() {
+                    let mut flat = Vec::new();
+                    flatten_transparent(&content, &mut flat);
+                    for item in flat {
+                        match item {
+                            Value::Closure(_, target) => {
+                                if let Some(&ei) = env_index.get(&Rc::as_ptr(&target)) {
+                                    env_targets.push(ei);
+                                }
+                            }
+                            Value::Pair(cell) => {
+                                if let Some(&ci) = carrier_index.get(&Carrier::Pair(cell).ptr()) {
+                                    carrier_targets.push(ci);
+                                }
+                            }
+                            Value::Vector(cell) => {
+                                if let Some(&ci) = carrier_index.get(&Carrier::Vector(cell).ptr()) {
+                                    carrier_targets.push(ci);
+                                }
+                            }
+                            Value::Hash(cell) => {
+                                if let Some(&ci) = carrier_index.get(&Carrier::Hash(cell).ptr()) {
+                                    carrier_targets.push(ci);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                (env_targets, carrier_targets)
+            })
+            .collect();
+
         // Internal in-degree: how many tracked-graph edges land on each
-        // node (a parent link or a captured-locals slot for envs; a
-        // captured-locals slot for cells). Real strong count minus this,
-        // minus one for this pass's own temporary hold, is what's left
-        // over from outside the tracked graph entirely.
+        // node (a parent link or a locals slot for envs; a locals slot or
+        // a nesting reference from another carrier for carriers). Real
+        // strong count minus this, minus one for this pass's own
+        // temporary hold, is what's left over from outside the tracked
+        // graph entirely.
         let mut env_internal_in = vec![0usize; envs.len()];
-        let mut cell_internal_in = vec![0usize; cells.len()];
+        let mut carrier_internal_in = vec![0usize; carriers.len()];
         for e in &envs {
             if let Some(parent) = &e.parent
                 && let Some(&pi) = env_index.get(&Rc::as_ptr(parent))
             {
                 env_internal_in[pi] += 1;
             }
-            for cell in &e.locals {
-                let ci = cell_index[&Rc::as_ptr(cell)];
-                cell_internal_in[ci] += 1;
+        }
+        for kids in &env_carrier_children {
+            for &ci in kids {
+                carrier_internal_in[ci] += 1;
             }
         }
-        for cell in &cells {
-            if let Value::Closure(_, target) = &*cell.borrow()
-                && let Some(&ti) = env_index.get(&Rc::as_ptr(target))
-            {
-                env_internal_in[ti] += 1;
+        for (env_targets, carrier_targets) in &carrier_children {
+            for &ei in env_targets {
+                env_internal_in[ei] += 1;
+            }
+            for &ci in carrier_targets {
+                carrier_internal_in[ci] += 1;
             }
         }
 
         let mut env_alive = vec![false; envs.len()];
-        let mut cell_alive = vec![false; cells.len()];
+        let mut carrier_alive = vec![false; carriers.len()];
         let mut worklist: Vec<GcNode> = Vec::new();
         for (i, e) in envs.iter().enumerate() {
             let external = (Rc::strong_count(e) - 1).saturating_sub(env_internal_in[i]);
@@ -857,10 +1109,10 @@ impl EnvGc {
                 worklist.push(GcNode::Env(i));
             }
         }
-        for (j, c) in cells.iter().enumerate() {
-            let external = (Rc::strong_count(c) - 1).saturating_sub(cell_internal_in[j]);
+        for (i, c) in carriers.iter().enumerate() {
+            let external = (c.strong_count() - 1).saturating_sub(carrier_internal_in[i]);
             if external > 0 {
-                worklist.push(GcNode::Cell(j));
+                worklist.push(GcNode::Carrier(i));
             }
         }
 
@@ -876,38 +1128,43 @@ impl EnvGc {
                     {
                         worklist.push(GcNode::Env(pi));
                     }
-                    for cell in &envs[i].locals {
-                        let ci = cell_index[&Rc::as_ptr(cell)];
-                        worklist.push(GcNode::Cell(ci));
+                    for &ci in &env_carrier_children[i] {
+                        worklist.push(GcNode::Carrier(ci));
                     }
                 }
-                GcNode::Cell(j) => {
-                    if cell_alive[j] {
+                GcNode::Carrier(i) => {
+                    if carrier_alive[i] {
                         continue;
                     }
-                    cell_alive[j] = true;
-                    if let Value::Closure(_, target) = &*cells[j].borrow()
-                        && let Some(&ti) = env_index.get(&Rc::as_ptr(target))
-                    {
-                        worklist.push(GcNode::Env(ti));
+                    carrier_alive[i] = true;
+                    let (ref env_targets, ref carrier_targets) = carrier_children[i];
+                    for &ei in env_targets {
+                        worklist.push(GcNode::Env(ei));
+                    }
+                    for &ci in carrier_targets {
+                        worklist.push(GcNode::Carrier(ci));
                     }
                 }
             }
         }
 
-        // Sweep: every unreached cell is unreachable from any real owner in
-        // the program (nothing outside the tracked graph refers to it, and
-        // nothing inside the tracked graph that's itself alive refers to it
-        // either) — clearing its closure content breaks the cycle without
-        // ever touching a cell that's still legitimately in play.
-        for (j, alive) in cell_alive.iter().enumerate() {
-            if *alive {
-                continue;
-            }
-            let mut content = cells[j].borrow_mut();
-            if matches!(*content, Value::Closure(..)) {
-                *content = Value::Unspecified;
-            }
+        // Sweep: every env this pass never reached is unreachable from any
+        // real owner in the program (nothing outside the tracked graph
+        // refers to it, and nothing inside the tracked graph that's itself
+        // alive refers to it either) -- clearing every tracked carrier's
+        // direct closure references into one breaks the cycle without ever
+        // touching an edge that's still legitimately in play (see
+        // `Carrier::clear_closures_into`'s own doc comment for why this is
+        // safe to run unconditionally, not just against carriers this pass
+        // judged unreachable).
+        let dead_envs: HashSet<*const Env> = envs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !env_alive[*i])
+            .map(|(_, e)| Rc::as_ptr(e))
+            .collect();
+        for c in &carriers {
+            c.clear_closures_into(&dead_envs);
         }
     }
 }
@@ -4093,6 +4350,204 @@ mod tests {
         assert_eq!(*kept_alive.locals[0].borrow(), Value::Int(42));
     }
 
+    // --- Compound-value-mediated cycles (warden security review, B22 High
+    // finding): the exact same self-reference, but stored inside a Pair/
+    // Vector/Hash the local cell holds, instead of directly in the cell.
+
+    #[test]
+    fn sweep_reclaims_a_pair_mediated_self_referential_cycle() {
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        let pair = Rc::new(RefCell::new((
+            Value::Closure(0, env.clone()),
+            Value::Int(0),
+        )));
+        *cell.borrow_mut() = Value::Pair(pair.clone());
+
+        let weak_env = Rc::downgrade(&env);
+        let weak_pair = Rc::downgrade(&pair);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        drop(env);
+        drop(cell);
+        drop(pair);
+
+        gc.sweep();
+
+        assert_eq!(
+            weak_env.strong_count(),
+            0,
+            "the env should be reclaimed even though the closure sits inside a cons cell, \
+             not directly in the local"
+        );
+        assert_eq!(
+            weak_pair.strong_count(),
+            0,
+            "the mediating pair should be reclaimed too"
+        );
+    }
+
+    #[test]
+    fn sweep_reclaims_a_vector_mediated_self_referential_cycle() {
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        let vector = Rc::new(RefCell::new(vec![Value::Closure(0, env.clone())]));
+        *cell.borrow_mut() = Value::Vector(vector.clone());
+
+        let weak_env = Rc::downgrade(&env);
+        let weak_vector = Rc::downgrade(&vector);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        drop(env);
+        drop(cell);
+        drop(vector);
+
+        gc.sweep();
+
+        assert_eq!(weak_env.strong_count(), 0, "the env should be reclaimed");
+        assert_eq!(
+            weak_vector.strong_count(),
+            0,
+            "the mediating vector should be reclaimed too"
+        );
+    }
+
+    #[test]
+    fn sweep_reclaims_a_hash_mediated_self_referential_cycle() {
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        let hash = Rc::new(RefCell::new(vec![(
+            Value::Symbol("k".to_string()),
+            Value::Closure(0, env.clone()),
+        )]));
+        *cell.borrow_mut() = Value::Hash(hash.clone());
+
+        let weak_env = Rc::downgrade(&env);
+        let weak_hash = Rc::downgrade(&hash);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        drop(env);
+        drop(cell);
+        drop(hash);
+
+        gc.sweep();
+
+        assert_eq!(weak_env.strong_count(), 0, "the env should be reclaimed");
+        assert_eq!(
+            weak_hash.strong_count(),
+            0,
+            "the mediating hash should be reclaimed too"
+        );
+    }
+
+    #[test]
+    fn sweep_reclaims_a_self_referential_cycle_nested_two_pairs_deep() {
+        // Confirms carrier discovery itself recurses (not just one level
+        // of indirection): cell -> Pair -> Pair -> Closure -> env -> cell.
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        let inner_pair = Rc::new(RefCell::new((
+            Value::Closure(0, env.clone()),
+            Value::Int(0),
+        )));
+        let outer_pair = Rc::new(RefCell::new((
+            Value::Pair(inner_pair.clone()),
+            Value::Int(0),
+        )));
+        *cell.borrow_mut() = Value::Pair(outer_pair.clone());
+
+        let weak_env = Rc::downgrade(&env);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        drop(env);
+        drop(cell);
+        drop(inner_pair);
+        drop(outer_pair);
+
+        gc.sweep();
+
+        assert_eq!(
+            weak_env.strong_count(),
+            0,
+            "the env should be reclaimed through two layers of pair nesting"
+        );
+    }
+
+    #[test]
+    fn sweep_reclaims_a_self_referential_cycle_mediated_through_a_list() {
+        // `Value::List` is immutable and never tracked as its own carrier,
+        // but its elements must still be visible to the graph -- built via
+        // `list`, not `quote`, matching how ordinary Scheme code produces
+        // Value::List at runtime.
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        *cell.borrow_mut() = Value::List(Rc::new(vec![Value::Closure(0, env.clone())]));
+
+        let weak_env = Rc::downgrade(&env);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        drop(env);
+        drop(cell);
+
+        gc.sweep();
+
+        assert_eq!(
+            weak_env.strong_count(),
+            0,
+            "the env should be reclaimed even though the closure sits inside a list"
+        );
+    }
+
+    #[test]
+    fn sweep_does_not_clear_a_pair_mediated_closure_still_externally_reachable() {
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        let pair = Rc::new(RefCell::new((
+            Value::Closure(0, env.clone()),
+            Value::Int(0),
+        )));
+        *cell.borrow_mut() = Value::Pair(pair.clone());
+
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        // e.g. the pair was also stored in a global.
+        let external_hold = pair.clone();
+        drop(env);
+        drop(cell);
+        drop(pair);
+
+        gc.sweep();
+
+        assert!(
+            matches!(external_hold.borrow().0, Value::Closure(..)),
+            "a still-reachable pair-mediated closure must survive a sweep"
+        );
+    }
+
     #[test]
     fn sweep_compacts_dead_registry_entries() {
         let mut gc = EnvGc::default();
@@ -4131,7 +4586,7 @@ mod tests {
             "should not have been swept yet"
         );
 
-        for _ in 0..ENVS_PER_SWEEP {
+        for _ in 0..MIN_ENVS_PER_SWEEP {
             let filler = Rc::new(Env {
                 locals: vec![],
                 parent: None,
@@ -4149,7 +4604,7 @@ mod tests {
     #[test]
     fn register_does_not_sweep_before_the_threshold_is_actually_reached() {
         // Pins the `>=` boundary itself (mutation-testing finding): fewer
-        // than ENVS_PER_SWEEP additional registrations must leave the
+        // than MIN_ENVS_PER_SWEEP additional registrations must leave the
         // counter armed but not yet fired, not sweep on every call.
         let mut gc = EnvGc::default();
 
@@ -4164,10 +4619,10 @@ mod tests {
         drop(env);
         drop(cell);
 
-        // One registration already happened above; adding ENVS_PER_SWEEP -
-        // 2 more brings the running total to ENVS_PER_SWEEP - 1 --
+        // One registration already happened above; adding MIN_ENVS_PER_SWEEP -
+        // 2 more brings the running total to MIN_ENVS_PER_SWEEP - 1 --
         // deliberately one short of the threshold.
-        for _ in 0..ENVS_PER_SWEEP - 2 {
+        for _ in 0..MIN_ENVS_PER_SWEEP - 2 {
             let filler = Rc::new(Env {
                 locals: vec![],
                 parent: None,
@@ -4177,8 +4632,57 @@ mod tests {
 
         assert!(
             weak_env.strong_count() > 0,
-            "should not sweep until ENVS_PER_SWEEP new environments have accumulated, \
+            "should not sweep until MIN_ENVS_PER_SWEEP new environments have accumulated, \
              not fewer"
+        );
+    }
+
+    #[test]
+    fn next_sweep_threshold_doubles_the_post_sweep_registry_size() {
+        // Pins the amortized-doubling formula itself (mutation-testing
+        // finding): after a sweep, the next threshold must be exactly
+        // twice the surviving registry size, not the size plus a constant
+        // or the size halved -- either of those would defeat Finding B's
+        // fix (a fixed-count trigger rescanning an ever-growing registry
+        // is the O(N^2) shape warden security review flagged).
+        let mut gc = EnvGc::default();
+
+        // Reach a clean baseline: every filler here is created and
+        // dropped one at a time, so by the time a sweep actually runs
+        // none of them are still alive.
+        for _ in 0..MIN_ENVS_PER_SWEEP * 2 {
+            let filler = Rc::new(Env {
+                locals: vec![],
+                parent: None,
+            });
+            gc.register(&filler);
+        }
+        gc.sweep();
+        assert!(gc.registry.is_empty(), "no filler should have survived");
+        assert_eq!(gc.next_sweep_at, MIN_ENVS_PER_SWEEP);
+
+        // Register exactly MIN_ENVS_PER_SWEEP genuinely long-lived envs --
+        // this reaches the current threshold, triggering exactly one
+        // sweep in which every one of them survives (nothing garbage).
+        let mut kept_alive = Vec::new();
+        for _ in 0..MIN_ENVS_PER_SWEEP {
+            let env = Rc::new(Env {
+                locals: vec![],
+                parent: None,
+            });
+            gc.register(&env);
+            kept_alive.push(env);
+        }
+
+        assert_eq!(
+            gc.registry.len(),
+            MIN_ENVS_PER_SWEEP,
+            "all of them should have survived the sweep"
+        );
+        assert_eq!(
+            gc.next_sweep_at,
+            MIN_ENVS_PER_SWEEP * 2,
+            "the next sweep threshold should double the post-sweep registry size"
         );
     }
 
@@ -4251,34 +4755,55 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    /// `spin` registers `n` throwaway captured environments (via `lambda`
+    /// creation, immediately discarded) without ever calling any of
+    /// them -- pure MakeFunction volume, no cycles of its own. Interposed
+    /// between constructing a live cycle and using it, a large enough `n`
+    /// (above `MIN_ENVS_PER_SWEEP`, 512) forces at least one real automatic
+    /// sweep to run while that cycle's cell is still an active local of
+    /// the currently-executing frame -- qa test-design review msg #350:
+    /// without this, the two tests below never actually drove a sweep
+    /// during the live window their doc comments claimed to cover.
+    const SPIN_PAST_ONE_SWEEP: &str =
+        "(define (spin i) (if (= i 0) 0 (begin (lambda () i) (spin (- i 1)))))";
+
     #[test]
     fn a_self_referential_closure_stays_callable_through_its_own_cell_before_the_frame_returns() {
         // `cell` is set! to hold the very closure that captured it (E1's
-        // exact shape), then called immediately through that same cell,
-        // still within the defining frame -- the collector must never
-        // treat this as garbage while it's genuinely in play.
-        let src = "(define (make-self-ref) \
-                      (let ((cell #f)) \
-                        (set! cell (lambda () 42)) \
-                        (cell))) \
-                    (display (make-self-ref))";
-        assert_eq!(run_source_to_stdout(src), "42");
+        // exact shape); `spin` then forces a real sweep while `cell` is
+        // still this frame's own live local, before it's finally called
+        // through that same cell -- the collector must never treat it as
+        // garbage while it's genuinely in play.
+        let src = format!(
+            "{SPIN_PAST_ONE_SWEEP} \
+             (define (make-self-ref) \
+               (let ((cell #f)) \
+                 (set! cell (lambda () 42)) \
+                 (spin 600) \
+                 (cell))) \
+             (display (make-self-ref))"
+        );
+        assert_eq!(run_source_to_stdout(&src), "42");
     }
 
     #[test]
     fn a_mutual_two_closure_cycle_stays_callable_before_the_frame_returns() {
-        let src = "(define (make-mutual-pair) \
-                      (let ((a #f) (b #f)) \
-                        (set! a (lambda () 1)) \
-                        (set! b (lambda () 2)) \
-                        (+ (a) (b)))) \
-                    (display (make-mutual-pair))";
-        assert_eq!(run_source_to_stdout(src), "3");
+        let src = format!(
+            "{SPIN_PAST_ONE_SWEEP} \
+             (define (make-mutual-pair) \
+               (let ((a #f) (b #f)) \
+                 (set! a (lambda () 1)) \
+                 (set! b (lambda () 2)) \
+                 (spin 600) \
+                 (+ (a) (b)))) \
+             (display (make-mutual-pair))"
+        );
+        assert_eq!(run_source_to_stdout(&src), "3");
     }
 
     #[test]
     fn repeatedly_creating_and_discarding_self_referential_cycles_never_corrupts_a_later_one() {
-        // Crosses ENVS_PER_SWEEP many times over, forcing several automatic
+        // Crosses MIN_ENVS_PER_SWEEP many times over, forcing several automatic
         // sweeps mid-run while earlier generations' cycles are genuine
         // garbage -- the final call must still resolve correctly.
         let src = "(define (make-self-ref) \

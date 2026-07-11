@@ -9,9 +9,7 @@
 //! Examiner's explicit instruction not to shorten the sampling duration).
 
 use super::registry::Registry;
-use super::steps_b21::{
-    COUNTER_FACTORY_SOAK, assert_plateaus, note_u64, sample_any_soak_rss_over_a_minute,
-};
+use super::steps_b21::{assert_plateaus, sample_any_soak_rss_over_a_minute};
 
 /// E1: a captured cell `set!` to hold the very closure that captured it --
 /// every generation is a genuine closure -> upvalue -> closure self-cycle.
@@ -30,16 +28,79 @@ const MUTUAL_REFERENCE_SOAK: &str = "(define (make-mutual-pair) \
      (define (soak i) (make-mutual-pair) (if (= i 0) 0 (soak (- i 1)))) \
      (soak 999999999999)";
 
+/// E4: the self-reference (E1) and mutual-reference (E2) patterns AND
+/// B21/E5's acyclic counter-factory pattern, interleaved every iteration
+/// of one soak rather than run as three separate processes -- qa
+/// test-design review msg #350 flagged the prior sequential version as
+/// duplicating E1+E2+B21/E5 without exercising anything they didn't
+/// already cover independently. Interleaving the three actually is a
+/// materially different check: cyclic and acyclic garbage accumulating
+/// together, in the same run, at the same time.
+const INTERLEAVED_SOAK: &str = "(define (self-ref-once) \
+     (let ((cell #f)) (set! cell (lambda () cell)) 0)) \
+     (define (mutual-ref-once) \
+       (let ((a #f) (b #f)) \
+         (set! a (lambda () b)) \
+         (set! b (lambda () a)) \
+         0)) \
+     (define (counter) (let ((n 0)) (lambda () (set! n (+ n 1)) n))) \
+     (define (acyclic-once) ((counter)) 0) \
+     (define (soak i) \
+       (self-ref-once) \
+       (mutual-ref-once) \
+       (acyclic-once) \
+       (if (= i 0) 0 (soak (- i 1)))) \
+     (soak 999999999999)";
+
 fn readme_text() -> String {
     std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
         .expect("README.md should exist at the project root")
 }
 
-/// A README section explaining the mechanism only counts as understandable
-/// "without reading the source" (E3) if it actually uses these words, not
-/// just gestures vaguely at "memory management".
+/// Slices out the body of a `## <heading>` markdown section (up to the
+/// next `##` heading or end of file) -- E3/E4 check the actual cycle-
+/// safety section, not whatever else the README happens to say elsewhere.
+fn readme_section<'a>(text: &'a str, heading: &str) -> &'a str {
+    let start = text
+        .find(heading)
+        .unwrap_or_else(|| panic!("README should have a {heading:?} section"));
+    let after_heading = &text[start + heading.len()..];
+    let body_start = after_heading.find('\n').map_or(0, |i| i + 1);
+    let body = &after_heading[body_start..];
+    let end = body.find("\n## ").unwrap_or(body.len());
+    &body[..end]
+}
+
+/// A README section only counts as understandable "without reading the
+/// source" (E3) if it explains BOTH why plain reference counting fails on
+/// a cycle (not just that "cycle" appears somewhere) AND, at a conceptual
+/// level, how reclamation tells genuine garbage apart from something still
+/// in use -- qa test-design review msg #350: a prior version of this check
+/// only tested for four keywords anywhere in the whole file, which would
+/// pass identically for a coherent explanation or four scattered buzzwords.
 fn assert_readme_explains_cycle_safety(text: &str) {
-    let lower = text.to_lowercase();
+    let section = readme_section(text, "## Memory and cycle-safety");
+    let lower = section.to_lowercase();
+
+    let explains_why_counting_fails = ["never reach zero", "never free", "never reclaim", "leak"]
+        .iter()
+        .any(|phrase| lower.contains(phrase));
+    assert!(
+        explains_why_counting_fails,
+        "README's cycle-safety section should explain WHY plain reference counting fails \
+         on a cycle (e.g. that counts never reach zero), not just name the word \"cycle\" \
+         -- section text:\n{section}"
+    );
+
+    let explains_how_reclamation_decides = ["unreachable", "external", "outside"]
+        .iter()
+        .any(|phrase| lower.contains(phrase));
+    assert!(
+        explains_how_reclamation_decides,
+        "README's cycle-safety section should explain, conceptually, how reclamation tells \
+         genuine garbage apart from something still in use -- section text:\n{section}"
+    );
+
     for phrase in ["cycle", "closure", "reference count", "reclaim"] {
         assert!(
             lower.contains(phrase),
@@ -127,61 +188,40 @@ pub(crate) fn registry() -> Registry {
                 assert_readme_explains_cycle_safety(text);
             },
         )
-        // --- E4: integration ---
+        // --- E4: integration (interleaved, not sequential -- see
+        // INTERLEAVED_SOAK's own doc comment) ---
         .step(
-            "the self-referential soak (E1), the mutual-reference soak (E2), and the B21/E5 acyclic counter-factory soak, each run for its own full ~60-second sampled window in one review pass",
-            |_w, _text, _| { /* purely descriptive; the When step below does the real work */ },
-        )
-        .step(
-            "each sampled resident-memory trend is examined together, alongside the README's mechanism description",
+            "a single ~60-second run that interleaves the self-referential pattern (E1), the mutual-reference pattern (E2), and the B21/E5 acyclic counter-factory pattern every iteration, with memory sampled at multiple points across the run, alongside the README's mechanism description",
             |w, _text, _| {
                 w.notes.push(readme_text());
+            },
+        )
+        .step(
+            "the sampled resident-memory trend is examined together with that description",
+            |w, _text, _| {
                 if cfg!(debug_assertions) {
                     return;
                 }
-                for (i, s) in
-                    sample_any_soak_rss_over_a_minute("b22-e4-self-ref.ml", SELF_REFERENCE_SOAK)
-                        .iter()
-                        .enumerate()
-                {
-                    w.notes.push(format!("self_ref_{i}:{s}"));
-                }
-                for (i, s) in sample_any_soak_rss_over_a_minute(
-                    "b22-e4-mutual-ref.ml",
-                    MUTUAL_REFERENCE_SOAK,
-                )
-                .iter()
-                .enumerate()
-                {
-                    w.notes.push(format!("mutual_ref_{i}:{s}"));
-                }
-                for (i, s) in
-                    sample_any_soak_rss_over_a_minute("b22-e4-acyclic.ml", COUNTER_FACTORY_SOAK)
-                        .iter()
-                        .enumerate()
-                {
-                    w.notes.push(format!("acyclic_{i}:{s}"));
+                let samples = sample_any_soak_rss_over_a_minute("b22-e4-interleaved.ml", INTERLEAVED_SOAK);
+                for s in samples {
+                    w.notes.push(s.to_string());
                 }
             },
         )
         .step(
-            "all three stay memory-bounded across their full runs, and what the README describes matches what is actually observed running -- demonstrating sustained memory-boundedness under genuine cyclic reference patterns on top of B21's acyclic guarantee, not just isolated pieces passing alone",
+            "it stays memory-bounded across the full run, and what the README describes matches what is actually observed running -- demonstrating sustained memory-boundedness when genuine cyclic reference patterns and the acyclic pattern are exercised together, not just isolated pieces passing alone",
             |w, _text, _| {
                 let readme = w
                     .notes
                     .first()
-                    .expect("the README text should have been queued by the When step");
+                    .expect("the README text should have been queued by the Given step");
                 assert_readme_explains_cycle_safety(readme);
 
                 if cfg!(debug_assertions) {
                     return;
                 }
-                for prefix in ["self_ref", "mutual_ref", "acyclic"] {
-                    let samples: Vec<u64> = (0..5)
-                        .map(|i| note_u64(&w.notes, &format!("{prefix}_{i}")))
-                        .collect();
-                    assert_plateaus(&samples);
-                }
+                let samples: Vec<u64> = w.notes[1..].iter().map(|s| s.parse().unwrap()).collect();
+                assert_plateaus(&samples);
             },
         )
 }
