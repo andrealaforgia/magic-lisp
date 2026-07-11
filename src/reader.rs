@@ -481,6 +481,32 @@ pub fn read_program(src: &str) -> Result<Vec<Sexpr>, ReadError> {
     Ok(forms)
 }
 
+/// Matches `compiler::COMPILE_STACK_SIZE`/`vm::VM_STACK_SIZE` exactly,
+/// deliberately -- see their own doc comments for why this value and why
+/// it's not independently tuned.
+const READ_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
+
+/// Runs [`read_program`] on a dedicated `READ_STACK_SIZE` thread, so
+/// `MAX_NESTING_DEPTH`'s safety margin is a fixed, known quantity rather
+/// than whatever stack the calling thread happens to have -- mirrors
+/// `compiler::compile_program`'s own production wrapper (warden security
+/// review msg #310, Medium: `cli.rs`'s `compile_source` called
+/// `read_program` directly on the process's ordinary main thread, the one
+/// production entry point still missing this protection --
+/// `compiler::compile_program`/`vm::run` already had it, and the REPL's own
+/// call already runs inside `repl::run_session`'s session-wide dedicated
+/// thread, so neither of those needed a change).
+pub fn read_program_on_a_dedicated_stack(src: &str) -> Result<Vec<Sexpr>, ReadError> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(READ_STACK_SIZE)
+            .spawn_scoped(scope, || read_program(src))
+            .map_err(|e| err(format!("failed to spawn reader thread: {e}")))?
+            .join()
+            .unwrap_or_else(|_| Err(err("internal error: reader thread panicked")))
+    })
+}
+
 /// Reads exactly one datum from `src`, returning it together with
 /// everything left unconsumed afterward -- for callers (the `read` native,
 /// spec 4.8) that read one unit of data at a time from a stream, each call
@@ -499,37 +525,36 @@ pub fn read_one(src: &str) -> Result<(Option<Sexpr>, String), ReadError> {
 mod tests {
     use super::*;
 
-    /// Runs `read_program` on a dedicated, fixed-size thread rather than
-    /// whatever thread the test harness happens to spawn a given test on
-    /// -- that harness default is neither controlled nor guaranteed by
-    /// this project (unlike the stack sizes deliberately chosen elsewhere
-    /// in this codebase, e.g. `COMPILE_STACK_SIZE`/`VM_STACK_SIZE`), so a
-    /// boundary-depth test pinned only to it is fragile against ordinary
-    /// codegen drift (B19: adding `#|`/`#;` support grew `read_form`'s own
-    /// recursive call chain just enough that several of these exact tests
-    /// started genuinely overflowing the stack under the harness's
-    /// previously-adequate default, with no change to their own logical
-    /// nesting depth). 8 MiB comfortably exceeds a typical OS process
-    /// main-thread stack (this reader has no dedicated big-stack thread
-    /// of its own in production either -- `cli.rs`'s `compile_source`
-    /// calls `read_program` directly, before `compile_program`'s own
-    /// dedicated thread ever starts), so this pins every boundary-depth
-    /// test to the same real-world budget production code actually runs
-    /// under, rather than an incidental, uncontrolled harness default.
+    /// Runs `read_program` the same way production actually does --
+    /// [`read_program_on_a_dedicated_stack`]'s own `READ_STACK_SIZE`
+    /// thread, matching `COMPILE_STACK_SIZE`/`VM_STACK_SIZE` -- rather than
+    /// whatever stack the test harness happens to hand a given test, which
+    /// is neither controlled nor guaranteed by this project (B19: adding
+    /// `#|`/`#;` support once grew `read_form`'s own recursive call chain
+    /// just enough that several of these exact tests started genuinely
+    /// overflowing the stack under the harness's previously-adequate
+    /// default, with no change to their own logical nesting depth). Every
+    /// boundary-depth test below is pinned to this real-world budget
+    /// production code actually runs under (warden security review msg
+    /// #310: this used to be its own independently-chosen 8 MiB thread,
+    /// proving only that the depth cap was safe under SOME fixed budget,
+    /// not the one `cli.rs` genuinely runs on).
     fn read_program_on_a_fixed_stack(src: &str) -> Result<Vec<Sexpr>, ReadError> {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(8 * 1024 * 1024)
-                .spawn_scoped(scope, || read_program(src))
-                .expect("should spawn the fixed-size thread")
-                .join()
-                .expect("read_program itself must not crash the calling thread")
-        })
+        read_program_on_a_dedicated_stack(src)
     }
 
     #[test]
     fn reads_a_whole_number() {
         assert_eq!(read_program("42").unwrap(), vec![Sexpr::Int(42)]);
+    }
+
+    #[test]
+    fn dedicated_stack_wrapper_produces_the_same_result_as_read_program_directly() {
+        assert_eq!(
+            read_program_on_a_dedicated_stack("(+ 1 2)"),
+            read_program("(+ 1 2)")
+        );
+        assert!(read_program_on_a_dedicated_stack("(display 1").is_err());
     }
 
     #[test]

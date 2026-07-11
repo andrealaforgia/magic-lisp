@@ -78,7 +78,7 @@ pub fn execute(
 }
 
 fn compile_source(src: &str) -> Result<bytecode::Module, String> {
-    let forms = reader::read_program(src).map_err(|e| e.to_string())?;
+    let forms = reader::read_program_on_a_dedicated_stack(src).map_err(|e| e.to_string())?;
     compiler::compile_program(&forms).map_err(|e| e.to_string())
 }
 
@@ -154,7 +154,7 @@ fn load_artifact(artifact: &Path, err: &mut impl Write) -> Result<bytecode::Modu
         let _ = writeln!(err, "error: cannot read {}: {e}", artifact.display());
         exitcode::BAD_ARTIFACT
     })?;
-    bytecode::decode(&bytes).map_err(|e| {
+    bytecode::decode_on_a_dedicated_stack(&bytes).map_err(|e| {
         let _ = writeln!(err, "error: {e}");
         exitcode::BAD_ARTIFACT
     })

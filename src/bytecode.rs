@@ -239,6 +239,10 @@ pub enum BytecodeError {
     /// and proceed with, unlike a container format that reserves specific
     /// bits for genuinely optional, safely-ignorable extensions.
     UnsupportedFlags(u16),
+    /// Not a property of the file at all -- the dedicated decode thread
+    /// (see [`decode_on_a_dedicated_stack`]) failed to spawn, or panicked
+    /// internally, neither of which is ever expected in practice.
+    Internal(String),
 }
 
 impl std::fmt::Display for BytecodeError {
@@ -255,6 +259,7 @@ impl std::fmt::Display for BytecodeError {
             BytecodeError::UnsupportedFlags(flags) => {
                 write!(f, "MLBC file sets unsupported flags: {flags:#06x}")
             }
+            BytecodeError::Internal(what) => write!(f, "internal error: {what}"),
         }
     }
 }
@@ -472,6 +477,35 @@ fn decode_const(r: &mut Reader, depth: usize) -> Result<Const, BytecodeError> {
     })
 }
 
+/// Matches `compiler::COMPILE_STACK_SIZE`/`vm::VM_STACK_SIZE`/
+/// `reader::READ_STACK_SIZE` exactly, deliberately -- see their own doc
+/// comments for why this value and why it's not independently tuned.
+const DECODE_STACK_SIZE: usize = 3 * 1024 * 1024 * 1024;
+
+/// Runs [`decode`] on a dedicated `DECODE_STACK_SIZE` thread, so
+/// `MAX_CONST_NESTING_DEPTH`'s safety margin is a fixed, known quantity
+/// rather than whatever stack the calling thread happens to have --
+/// mirrors `compiler::compile_program`'s own production wrapper (warden
+/// security review msg #310, Medium: `cli.rs`'s `load_artifact` called
+/// `decode` directly on the process's ordinary main thread; the prior fix
+/// for the same underlying finding only wrapped `decode`'s own *test*
+/// boundary-depth cases in a dedicated thread, leaving this real
+/// production entry point still unprotected).
+pub fn decode_on_a_dedicated_stack(bytes: &[u8]) -> Result<Module, BytecodeError> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DECODE_STACK_SIZE)
+            .spawn_scoped(scope, || decode(bytes))
+            .map_err(|e| BytecodeError::Internal(format!("failed to spawn decoder thread: {e}")))?
+            .join()
+            .unwrap_or_else(|_| {
+                Err(BytecodeError::Internal(
+                    "decoder thread panicked".to_string(),
+                ))
+            })
+    })
+}
+
 pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
     let mut r = Reader::new(bytes);
 
@@ -540,26 +574,20 @@ pub fn decode(bytes: &[u8]) -> Result<Module, BytecodeError> {
 mod tests {
     use super::*;
 
-    /// Runs `decode` on a dedicated, fixed-size thread rather than whatever
-    /// stack the test harness happens to hand a given test -- mirrors
-    /// `read_program_on_a_fixed_stack` in `reader.rs` (added for a prior
-    /// security-review finding on B1). `decode_const`'s own boundary tests
-    /// previously asserted against `decode` directly, which only proves
-    /// `MAX_CONST_NESTING_DEPTH` is safe under whatever stack size the
-    /// harness happens to provide, not under a real, controlled budget the
-    /// way `cli.rs`'s `load_artifact` actually runs it (an ordinary thread,
-    /// no dedicated big-stack thread of its own). Pinning to a fixed 8 MiB
-    /// stack closes that verification gap (Warden security review, initial
-    /// baseline: finding 1).
+    /// Runs `decode` the same way production actually does --
+    /// [`decode_on_a_dedicated_stack`]'s own `DECODE_STACK_SIZE` thread --
+    /// rather than whatever stack the test harness happens to hand a given
+    /// test. `decode_const`'s own boundary tests previously asserted
+    /// against `decode` directly (proving `MAX_CONST_NESTING_DEPTH` safe
+    /// only under whatever the harness happened to provide), then against
+    /// an independently-chosen 8 MiB thread of the test's own (proving it
+    /// safe under SOME fixed budget, but not the one `cli.rs`'s
+    /// `load_artifact` actually ran on). Warden security review msg #310
+    /// closed that second gap too: `load_artifact` now genuinely runs
+    /// `decode` on this exact dedicated thread, so pinning the test to it
+    /// directly keeps the two back in sync by construction.
     fn decode_on_a_fixed_stack(bytes: &[u8]) -> Result<Module, BytecodeError> {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(8 * 1024 * 1024)
-                .spawn_scoped(scope, || decode(bytes))
-                .expect("should spawn the fixed-size thread")
-                .join()
-                .expect("decode itself must not crash the calling thread")
-        })
+        decode_on_a_dedicated_stack(bytes)
     }
 
     fn sample_module() -> Module {
@@ -804,6 +832,10 @@ mod tests {
             BytecodeError::UnsupportedFlags(1).to_string(),
             "MLBC file sets unsupported flags: 0x0001"
         );
+        assert_eq!(
+            BytecodeError::Internal("decoder thread panicked".to_string()).to_string(),
+            "internal error: decoder thread panicked"
+        );
     }
 
     #[test]
@@ -821,6 +853,13 @@ mod tests {
         // The ordinary, current-encoder-produced case must still decode.
         let bytes = encode(&sample_module());
         assert!(decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn dedicated_stack_wrapper_produces_the_same_result_as_decode_directly() {
+        let bytes = encode(&sample_module());
+        assert_eq!(decode_on_a_dedicated_stack(&bytes), decode(&bytes));
+        assert!(decode_on_a_dedicated_stack(b"nope").is_err());
     }
 
     fn nested_list_const(depth: usize) -> Const {
