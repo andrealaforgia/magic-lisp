@@ -4368,105 +4368,171 @@ mod tests {
 
     // --- Compound-value-mediated cycles (warden security review, B22 High
     // finding): the exact same self-reference, but stored inside a Pair/
-    // Vector/Hash the local cell holds, instead of directly in the cell.
+    // Vector/Hash/List the local cell holds, instead of directly in the
+    // cell. Parameterized over `CarrierKind` (qa test-design review msg
+    // #365: 8 near-identical reclaim/guard tests, one per carrier kind,
+    // collapsed to two macro-generated families keyed on kind, so each
+    // kind still gets its own independently-named, independently-failing
+    // `#[test]`).
 
-    #[test]
-    fn sweep_reclaims_a_pair_mediated_self_referential_cycle() {
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        let pair = Rc::new(RefCell::new((
-            Value::Closure(0, env.clone()),
-            Value::Int(0),
-        )));
-        *cell.borrow_mut() = Value::Pair(pair.clone());
-
-        let weak_env = Rc::downgrade(&env);
-        let weak_pair = Rc::downgrade(&pair);
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        drop(env);
-        drop(cell);
-        drop(pair);
-
-        gc.sweep();
-
-        assert_eq!(
-            weak_env.strong_count(),
-            0,
-            "the env should be reclaimed even though the closure sits inside a cons cell, \
-             not directly in the local"
-        );
-        assert_eq!(
-            weak_pair.strong_count(),
-            0,
-            "the mediating pair should be reclaimed too"
-        );
+    #[derive(Debug, Clone, Copy)]
+    enum CarrierKind {
+        Pair,
+        Vector,
+        Hash,
+        /// Never its own carrier (immutable -- see `flatten_transparent`'s
+        /// doc comment); its "holder" is the enclosing cell itself.
+        List,
     }
 
-    #[test]
-    fn sweep_reclaims_a_vector_mediated_self_referential_cycle() {
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        let vector = Rc::new(RefCell::new(vec![Value::Closure(0, env.clone())]));
-        *cell.borrow_mut() = Value::Vector(vector.clone());
-
-        let weak_env = Rc::downgrade(&env);
-        let weak_vector = Rc::downgrade(&vector);
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        drop(env);
-        drop(cell);
-        drop(vector);
-
-        gc.sweep();
-
-        assert_eq!(weak_env.strong_count(), 0, "the env should be reclaimed");
-        assert_eq!(
-            weak_vector.strong_count(),
-            0,
-            "the mediating vector should be reclaimed too"
-        );
+    /// A strong handle to whatever `CarrierKind::install` created, kept
+    /// alive so the caller can check whether it still contains a live
+    /// closure after a sweep.
+    enum Holder {
+        Pair(Rc<RefCell<(Value, Value)>>),
+        Vector(Rc<RefCell<Vec<Value>>>),
+        Hash(Rc<RefCell<Vec<(Value, Value)>>>),
+        Cell(Rc<RefCell<Value>>),
     }
 
-    #[test]
-    fn sweep_reclaims_a_hash_mediated_self_referential_cycle() {
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        let hash = Rc::new(RefCell::new(vec![(
-            Value::Symbol("k".to_string()),
-            Value::Closure(0, env.clone()),
-        )]));
-        *cell.borrow_mut() = Value::Hash(hash.clone());
-
-        let weak_env = Rc::downgrade(&env);
-        let weak_hash = Rc::downgrade(&hash);
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        drop(env);
-        drop(cell);
-        drop(hash);
-
-        gc.sweep();
-
-        assert_eq!(weak_env.strong_count(), 0, "the env should be reclaimed");
-        assert_eq!(
-            weak_hash.strong_count(),
-            0,
-            "the mediating hash should be reclaimed too"
-        );
+    impl CarrierKind {
+        /// Wraps `closure` in this kind of carrier, installs it as `cell`'s
+        /// content, and returns a strong handle to whatever mediates it.
+        fn install(self, cell: &Rc<RefCell<Value>>, closure: Value) -> Holder {
+            match self {
+                CarrierKind::Pair => {
+                    let pair = Rc::new(RefCell::new((closure, Value::Int(0))));
+                    *cell.borrow_mut() = Value::Pair(pair.clone());
+                    Holder::Pair(pair)
+                }
+                CarrierKind::Vector => {
+                    let vector = Rc::new(RefCell::new(vec![closure]));
+                    *cell.borrow_mut() = Value::Vector(vector.clone());
+                    Holder::Vector(vector)
+                }
+                CarrierKind::Hash => {
+                    let hash = Rc::new(RefCell::new(vec![(
+                        Value::Symbol("k".to_string()),
+                        closure,
+                    )]));
+                    *cell.borrow_mut() = Value::Hash(hash.clone());
+                    Holder::Hash(hash)
+                }
+                CarrierKind::List => {
+                    *cell.borrow_mut() = Value::List(Rc::new(vec![closure]));
+                    Holder::Cell(cell.clone())
+                }
+            }
+        }
     }
+
+    impl Holder {
+        fn has_closure(&self) -> bool {
+            match self {
+                Holder::Pair(p) => matches!(p.borrow().0, Value::Closure(..)),
+                Holder::Vector(v) => matches!(v.borrow()[0], Value::Closure(..)),
+                Holder::Hash(h) => matches!(h.borrow()[0].1, Value::Closure(..)),
+                Holder::Cell(c) => {
+                    matches!(&*c.borrow(), Value::List(items) if matches!(items[0], Value::Closure(..)))
+                }
+            }
+        }
+    }
+
+    macro_rules! carrier_reclaim_test {
+        ($test_name:ident, $kind:expr) => {
+            #[test]
+            fn $test_name() {
+                let cell = Rc::new(RefCell::new(Value::Unspecified));
+                let env = Rc::new(Env {
+                    locals: vec![cell.clone()],
+                    parent: None,
+                });
+                let holder = $kind.install(&cell, Value::Closure(0, env.clone()));
+                let weak_env = Rc::downgrade(&env);
+                let mut gc = EnvGc::default();
+                gc.registry.push(Rc::downgrade(&env));
+
+                drop(env);
+                drop(cell);
+                drop(holder);
+
+                gc.sweep();
+
+                assert_eq!(
+                    weak_env.strong_count(),
+                    0,
+                    "the env should be reclaimed even though the closure was mediated \
+                     through a {:?}, not stored directly in the local",
+                    $kind
+                );
+            }
+        };
+    }
+
+    carrier_reclaim_test!(
+        sweep_reclaims_a_pair_mediated_self_referential_cycle,
+        CarrierKind::Pair
+    );
+    carrier_reclaim_test!(
+        sweep_reclaims_a_vector_mediated_self_referential_cycle,
+        CarrierKind::Vector
+    );
+    carrier_reclaim_test!(
+        sweep_reclaims_a_hash_mediated_self_referential_cycle,
+        CarrierKind::Hash
+    );
+    carrier_reclaim_test!(
+        sweep_reclaims_a_self_referential_cycle_mediated_through_a_list,
+        CarrierKind::List
+    );
+
+    macro_rules! carrier_guard_test {
+        ($test_name:ident, $kind:expr) => {
+            #[test]
+            fn $test_name() {
+                let cell = Rc::new(RefCell::new(Value::Unspecified));
+                let env = Rc::new(Env {
+                    locals: vec![cell.clone()],
+                    parent: None,
+                });
+                let holder = $kind.install(&cell, Value::Closure(0, env.clone()));
+
+                let mut gc = EnvGc::default();
+                gc.registry.push(Rc::downgrade(&env));
+
+                // e.g. the holder was also stored in a global, or (for
+                // `List`) `cell` is still this frame's own live local.
+                drop(env);
+                drop(cell);
+
+                gc.sweep();
+
+                assert!(
+                    holder.has_closure(),
+                    "a still-reachable {:?}-mediated closure must survive a sweep",
+                    $kind
+                );
+            }
+        };
+    }
+
+    carrier_guard_test!(
+        sweep_does_not_clear_a_pair_mediated_closure_still_externally_reachable,
+        CarrierKind::Pair
+    );
+    carrier_guard_test!(
+        sweep_does_not_clear_a_vector_mediated_closure_still_externally_reachable,
+        CarrierKind::Vector
+    );
+    carrier_guard_test!(
+        sweep_does_not_clear_a_hash_mediated_closure_still_externally_reachable,
+        CarrierKind::Hash
+    );
+    carrier_guard_test!(
+        sweep_does_not_clear_a_list_mediated_closure_still_externally_reachable,
+        CarrierKind::List
+    );
 
     #[test]
     fn sweep_reclaims_a_self_referential_cycle_nested_two_pairs_deep() {
@@ -4502,157 +4568,6 @@ mod tests {
             weak_env.strong_count(),
             0,
             "the env should be reclaimed through two layers of pair nesting"
-        );
-    }
-
-    #[test]
-    fn sweep_reclaims_a_self_referential_cycle_mediated_through_a_list() {
-        // `Value::List` is immutable and never tracked as its own carrier,
-        // but its elements must still be visible to the graph -- built via
-        // `list`, not `quote`, matching how ordinary Scheme code produces
-        // Value::List at runtime.
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        *cell.borrow_mut() = Value::List(Rc::new(vec![Value::Closure(0, env.clone())]));
-
-        let weak_env = Rc::downgrade(&env);
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        drop(env);
-        drop(cell);
-
-        gc.sweep();
-
-        assert_eq!(
-            weak_env.strong_count(),
-            0,
-            "the env should be reclaimed even though the closure sits inside a list"
-        );
-    }
-
-    #[test]
-    fn sweep_does_not_clear_a_pair_mediated_closure_still_externally_reachable() {
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        let pair = Rc::new(RefCell::new((
-            Value::Closure(0, env.clone()),
-            Value::Int(0),
-        )));
-        *cell.borrow_mut() = Value::Pair(pair.clone());
-
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        // e.g. the pair was also stored in a global.
-        let external_hold = pair.clone();
-        drop(env);
-        drop(cell);
-        drop(pair);
-
-        gc.sweep();
-
-        assert!(
-            matches!(external_hold.borrow().0, Value::Closure(..)),
-            "a still-reachable pair-mediated closure must survive a sweep"
-        );
-    }
-
-    #[test]
-    fn sweep_does_not_clear_a_vector_mediated_closure_still_externally_reachable() {
-        // Mirrors the Pair case above (qa test-design review msg #360: the
-        // false-positive guard existed only for Pair, leaving Vector/Hash/
-        // List-mediated external-reachability an untested mutation gap).
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        let vector = Rc::new(RefCell::new(vec![Value::Closure(0, env.clone())]));
-        *cell.borrow_mut() = Value::Vector(vector.clone());
-
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        let external_hold = vector.clone();
-        drop(env);
-        drop(cell);
-        drop(vector);
-
-        gc.sweep();
-
-        assert!(
-            matches!(external_hold.borrow()[0], Value::Closure(..)),
-            "a still-reachable vector-mediated closure must survive a sweep"
-        );
-    }
-
-    #[test]
-    fn sweep_does_not_clear_a_hash_mediated_closure_still_externally_reachable() {
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        let hash = Rc::new(RefCell::new(vec![(
-            Value::Symbol("k".to_string()),
-            Value::Closure(0, env.clone()),
-        )]));
-        *cell.borrow_mut() = Value::Hash(hash.clone());
-
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        let external_hold = hash.clone();
-        drop(env);
-        drop(cell);
-        drop(hash);
-
-        gc.sweep();
-
-        assert!(
-            matches!(external_hold.borrow()[0].1, Value::Closure(..)),
-            "a still-reachable hash-mediated closure must survive a sweep"
-        );
-    }
-
-    #[test]
-    fn sweep_does_not_clear_a_list_mediated_closure_still_externally_reachable() {
-        // `List` is never its own carrier (immutable, see
-        // `flatten_transparent`'s doc comment), so this exercises the
-        // enclosing `cell`'s own external-reachability instead -- the
-        // closure survives because `cell` itself does, not because the
-        // list is separately tracked.
-        let cell = Rc::new(RefCell::new(Value::Unspecified));
-        let env = Rc::new(Env {
-            locals: vec![cell.clone()],
-            parent: None,
-        });
-        *cell.borrow_mut() = Value::List(Rc::new(vec![Value::Closure(0, env.clone())]));
-
-        let mut gc = EnvGc::default();
-        gc.registry.push(Rc::downgrade(&env));
-
-        // e.g. `cell` is still this frame's own live local.
-        let external_hold = cell.clone();
-        drop(env);
-        drop(cell);
-
-        gc.sweep();
-
-        let content = external_hold.borrow();
-        let Value::List(items) = &*content else {
-            panic!("expected the list to survive untouched, got {content:?}");
-        };
-        assert!(
-            matches!(items[0], Value::Closure(..)),
-            "a still-reachable list-mediated closure must survive a sweep"
         );
     }
 
@@ -4863,16 +4778,15 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
-    /// Like [`run_source_to_stdout`], but constructs the `Vm` directly
-    /// (bypassing the public `run` wrapper) so the caller can inspect
-    /// `EnvGc::sweep_count` afterward -- for tests that need to confirm a
-    /// sweep genuinely fired mid-execution, not just infer it from a
-    /// correct final answer (qa test-design review msg #360).
-    fn run_source_and_count_sweeps(src: &str) -> (String, usize) {
-        let forms = read_program(src).unwrap();
-        let module = compile_program(&forms).unwrap();
-        let mut vm = Vm {
-            module: &module,
+    /// Builds a `Vm` directly against `module`, bypassing the public `run`
+    /// wrapper's dedicated big-stack thread -- for white-box tests that
+    /// need to inspect internal state afterward (`env_gc`, `call_depth`)
+    /// and don't need that thread themselves (qa test-design review msg
+    /// #365: this exact field list was duplicated at three separate
+    /// in-test call sites).
+    fn vm_for_test(module: &Module) -> Vm<'_> {
+        Vm {
+            module,
             globals: default_globals(),
             call_depth: 0,
             stdin_buffer: Vec::new(),
@@ -4880,7 +4794,18 @@ mod tests {
             gensym_counter: 0,
             macro_step_budget: None,
             env_gc: EnvGc::default(),
-        };
+        }
+    }
+
+    /// Like [`run_source_to_stdout`], but returns the `Vm` (via
+    /// [`vm_for_test`]) so the caller can inspect `EnvGc::sweep_count`
+    /// afterward -- for tests that need to confirm a sweep genuinely fired
+    /// mid-execution, not just infer it from a correct final answer (qa
+    /// test-design review msg #360).
+    fn run_source_and_count_sweeps(src: &str) -> (String, usize) {
+        let forms = read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut vm = vm_for_test(&module);
         let mut out = Vec::new();
         let entry = &module.functions[module.entry_index as usize];
         vm.exec(entry, Vec::new(), None, &mut out).unwrap();
@@ -5233,16 +5158,7 @@ mod tests {
             std::thread::Builder::new()
                 .stack_size(VM_STACK_SIZE)
                 .spawn_scoped(scope, || {
-                    let mut vm = Vm {
-                        module: &module,
-                        globals: default_globals(),
-                        call_depth: 0,
-                        stdin_buffer: Vec::new(),
-                        stdin_channel: StdinChannel::none(),
-                        gensym_counter: 0,
-                        macro_step_budget: None,
-                        env_gc: EnvGc::default(),
-                    };
+                    let mut vm = vm_for_test(&module);
                     let mut out = Vec::new();
                     let entry = &module.functions[module.entry_index as usize];
                     vm.exec(entry, Vec::new(), None, &mut out).unwrap();
@@ -6717,16 +6633,7 @@ mod tests {
         let forms = read_program("(define (loop n limit) (if (= n limit) n (loop (+ n 1) limit)))")
             .unwrap();
         let module = compile_program(&forms).unwrap();
-        let mut vm = Vm {
-            module: &module,
-            globals: default_globals(),
-            call_depth: 0,
-            stdin_buffer: Vec::new(),
-            stdin_channel: StdinChannel::none(),
-            gensym_counter: 0,
-            macro_step_budget: None,
-            env_gc: EnvGc::default(),
-        };
+        let mut vm = vm_for_test(&module);
         let mut out = Vec::new();
         let entry = &module.functions[module.entry_index as usize];
         vm.exec(entry, Vec::new(), None, &mut out).unwrap();
