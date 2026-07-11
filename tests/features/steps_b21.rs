@@ -19,7 +19,7 @@ const SELF_TAIL_LOOP: &str =
     "(define (loop i limit) (if (= i limit) i (loop (+ i 1) limit))) (display (loop 0 10000000))";
 const NAIVE_FIB_27: &str =
     "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 27))";
-const COUNTER_FACTORY_SOAK: &str = "(define (counter) (let ((n 0)) (lambda () (set! n (+ n 1)) n))) \
+pub(crate) const COUNTER_FACTORY_SOAK: &str = "(define (counter) (let ((n 0)) (lambda () (set! n (+ n 1)) n))) \
      (define (soak i) ((counter)) (if (= i 0) 0 (soak (- i 1)))) \
      (soak 999999999999)";
 
@@ -63,7 +63,7 @@ fn note_f64(notes: &[String], key: &str) -> f64 {
         .unwrap()
 }
 
-fn note_u64(notes: &[String], key: &str) -> u64 {
+pub(crate) fn note_u64(notes: &[String], key: &str) -> u64 {
     notes
         .iter()
         .find_map(|n| n.strip_prefix(&format!("{key}:")))
@@ -77,7 +77,15 @@ fn note_u64(notes: &[String], key: &str) -> u64 {
 /// -- the program's own iteration count is astronomically large so it
 /// never finishes on its own; only the live sampling window matters.
 fn sample_soak_rss_over_a_minute() -> Vec<u64> {
-    let file = write_source("b21-soak.ml", COUNTER_FACTORY_SOAK);
+    sample_any_soak_rss_over_a_minute("b21-soak.ml", COUNTER_FACTORY_SOAK)
+}
+
+/// Generalisation of the above for any `eval`-able soak program (not just
+/// B21's own counter-factory pattern) -- reused by B22's self- and mutual-
+/// reference cycle soaks, which need the identical spawn/sample/kill
+/// harness against a different MagicLisp source.
+pub(crate) fn sample_any_soak_rss_over_a_minute(label: &str, src: &str) -> Vec<u64> {
+    let file = write_source(label, src);
     let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
         .args(["eval", file.to_str().unwrap()])
         .stdout(Stdio::null())
@@ -98,7 +106,7 @@ fn sample_soak_rss_over_a_minute() -> Vec<u64> {
     samples
 }
 
-fn sample_rss_kb(pid: u32) -> u64 {
+pub(crate) fn sample_rss_kb(pid: u32) -> u64 {
     let out = Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
@@ -114,7 +122,7 @@ fn sample_rss_kb(pid: u32) -> u64 {
 /// more than a generous slack, AND must itself stay under a generous
 /// absolute cap -- together these catch both an accelerating leak and a
 /// slow-but-steady one, while tolerating ordinary allocator/OS noise.
-fn assert_plateaus(samples: &[u64]) {
+pub(crate) fn assert_plateaus(samples: &[u64]) {
     assert_eq!(samples.len(), 5, "expected 5 RSS samples, got {samples:?}");
     let first_half_growth = samples[2].saturating_sub(samples[0]) as i64;
     let second_half_growth = samples[4].saturating_sub(samples[2]) as i64;

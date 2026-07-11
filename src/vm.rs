@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 
 use crate::bytecode::{Chunk, Const, Module, Op};
@@ -628,6 +628,9 @@ struct Vm<'m> {
     /// directly instead of relying on the product of several independent
     /// factors happening to stay small.
     macro_step_budget: Option<usize>,
+    /// Tracks every captured `Env` for periodic cycle-safe reclamation —
+    /// see [`EnvGc`]'s own doc comment (SPEC.md §10.2).
+    env_gc: EnvGc,
 }
 
 /// The total trampoline-hop budget for ALL `define-macro` body execution
@@ -725,6 +728,188 @@ fn upvalue_cell(
         .get(slot as usize)
         .cloned()
         .ok_or_else(|| error(format!("upvalue slot {slot} out of range")))
+}
+
+/// Cycle-safe reclamation for the `closure → upvalue → closure` reference
+/// cycle SPEC.md §2.1/§10.2 identifies as this design's one known
+/// memory-leak hazard: a captured [`Env`]'s `locals` cell can hold a
+/// [`Value::Closure`] whose own captured `Env` (directly, or via another
+/// `Env` in a longer ring) is the very `Env` that cell belongs to. Plain
+/// `Rc` reference counting never reclaims such a ring on its own, since
+/// every member's count stays above zero for as long as the ring itself
+/// exists.
+///
+/// This is a **trial-deletion cycle collector** (the strategy SPEC.md
+/// §10.2 permits alongside a tracing collector), restricted to exactly the
+/// two node kinds that can participate in this specific hazard: captured
+/// `Env`s, and the local-variable cells (`Rc<RefCell<Value>>`) they close
+/// over. It works entirely from real `Rc`/`Weak` strong-count arithmetic —
+/// deliberately **not** by walking the VM's operand stack, call frames, or
+/// globals as an explicit root set. For every tracked node, `real strong
+/// count − occurrences within the tracked graph` tells us how much of that
+/// count is explained by references OUTSIDE the tracked graph (an active
+/// call frame's own locals, the operand stack, a global, a vector element —
+/// anything at all). Any node with a positive remainder is alive by
+/// definition, and so is anything reachable from it by following further
+/// `Env`/cell edges. What's left unreached after that propagation is, by
+/// construction, unreachable from every real owner in the program — a
+/// genuine garbage cycle — and is safe to break.
+#[derive(Debug, Default)]
+struct EnvGc {
+    registry: Vec<Weak<Env>>,
+    envs_since_sweep: usize,
+}
+
+/// How many newly captured environments accumulate between sweeps. Small
+/// enough that a sustained soak of cycle-forming closures stays memory-
+/// bounded (SPEC.md §10.2) rather than piling up a large backlog before the
+/// first sweep; large enough that an ordinary program's occasional closure
+/// creation essentially never pays for a sweep pass at all.
+const ENVS_PER_SWEEP: usize = 512;
+
+/// One node in the tracked `Env`/cell graph, used only to give the mark
+/// worklist a single element type.
+enum GcNode {
+    Env(usize),
+    Cell(usize),
+}
+
+impl EnvGc {
+    /// Registers a freshly captured `Env` (see `Op::MakeFunction` below) and
+    /// triggers a sweep once enough new environments have accumulated.
+    fn register(&mut self, env: &Rc<Env>) {
+        self.registry.push(Rc::downgrade(env));
+        self.envs_since_sweep += 1;
+        if self.envs_since_sweep >= ENVS_PER_SWEEP {
+            self.envs_since_sweep = 0;
+            self.sweep();
+        }
+    }
+
+    /// Runs one trial-deletion pass: builds the tracked `Env`/cell graph,
+    /// marks everything reachable from a real (outside-the-graph) owner,
+    /// and clears the closure content of every cell left unreached —
+    /// breaking any garbage cycle so ordinary `Rc` drop glue reclaims it
+    /// once this pass's own temporary strong holds go out of scope.
+    fn sweep(&mut self) {
+        // Compact dead entries and upgrade the rest to a temporary strong
+        // hold for the duration of this pass — accounted for below by
+        // subtracting exactly one from every strong-count reading.
+        let envs: Vec<Rc<Env>> = self.registry.iter().filter_map(Weak::upgrade).collect();
+        self.registry = envs.iter().map(Rc::downgrade).collect();
+        if envs.is_empty() {
+            return;
+        }
+
+        let env_index: HashMap<*const Env, usize> = envs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (Rc::as_ptr(e), i))
+            .collect();
+
+        // Every distinct cell referenced from any tracked env's `locals`,
+        // deduplicated by identity (the same cell commonly appears in more
+        // than one captured env, e.g. two sibling closures from the same
+        // enclosing frame).
+        let mut cells: Vec<Rc<RefCell<Value>>> = Vec::new();
+        let mut cell_index: HashMap<*const RefCell<Value>, usize> = HashMap::new();
+        for e in &envs {
+            for cell in &e.locals {
+                cell_index.entry(Rc::as_ptr(cell)).or_insert_with(|| {
+                    cells.push(cell.clone());
+                    cells.len() - 1
+                });
+            }
+        }
+
+        // Internal in-degree: how many tracked-graph edges land on each
+        // node (a parent link or a captured-locals slot for envs; a
+        // captured-locals slot for cells). Real strong count minus this,
+        // minus one for this pass's own temporary hold, is what's left
+        // over from outside the tracked graph entirely.
+        let mut env_internal_in = vec![0usize; envs.len()];
+        let mut cell_internal_in = vec![0usize; cells.len()];
+        for e in &envs {
+            if let Some(parent) = &e.parent
+                && let Some(&pi) = env_index.get(&Rc::as_ptr(parent))
+            {
+                env_internal_in[pi] += 1;
+            }
+            for cell in &e.locals {
+                let ci = cell_index[&Rc::as_ptr(cell)];
+                cell_internal_in[ci] += 1;
+            }
+        }
+        for cell in &cells {
+            if let Value::Closure(_, target) = &*cell.borrow()
+                && let Some(&ti) = env_index.get(&Rc::as_ptr(target))
+            {
+                env_internal_in[ti] += 1;
+            }
+        }
+
+        let mut env_alive = vec![false; envs.len()];
+        let mut cell_alive = vec![false; cells.len()];
+        let mut worklist: Vec<GcNode> = Vec::new();
+        for (i, e) in envs.iter().enumerate() {
+            let external = (Rc::strong_count(e) - 1).saturating_sub(env_internal_in[i]);
+            if external > 0 {
+                worklist.push(GcNode::Env(i));
+            }
+        }
+        for (j, c) in cells.iter().enumerate() {
+            let external = (Rc::strong_count(c) - 1).saturating_sub(cell_internal_in[j]);
+            if external > 0 {
+                worklist.push(GcNode::Cell(j));
+            }
+        }
+
+        while let Some(node) = worklist.pop() {
+            match node {
+                GcNode::Env(i) => {
+                    if env_alive[i] {
+                        continue;
+                    }
+                    env_alive[i] = true;
+                    if let Some(parent) = &envs[i].parent
+                        && let Some(&pi) = env_index.get(&Rc::as_ptr(parent))
+                    {
+                        worklist.push(GcNode::Env(pi));
+                    }
+                    for cell in &envs[i].locals {
+                        let ci = cell_index[&Rc::as_ptr(cell)];
+                        worklist.push(GcNode::Cell(ci));
+                    }
+                }
+                GcNode::Cell(j) => {
+                    if cell_alive[j] {
+                        continue;
+                    }
+                    cell_alive[j] = true;
+                    if let Value::Closure(_, target) = &*cells[j].borrow()
+                        && let Some(&ti) = env_index.get(&Rc::as_ptr(target))
+                    {
+                        worklist.push(GcNode::Env(ti));
+                    }
+                }
+            }
+        }
+
+        // Sweep: every unreached cell is unreachable from any real owner in
+        // the program (nothing outside the tracked graph refers to it, and
+        // nothing inside the tracked graph that's itself alive refers to it
+        // either) — clearing its closure content breaks the cycle without
+        // ever touching a cell that's still legitimately in play.
+        for (j, alive) in cell_alive.iter().enumerate() {
+            if *alive {
+                continue;
+            }
+            let mut content = cells[j].borrow_mut();
+            if matches!(*content, Value::Closure(..)) {
+                *content = Value::Unspecified;
+            }
+        }
+    }
 }
 
 impl<'m> Vm<'m> {
@@ -901,6 +1086,7 @@ impl<'m> Vm<'m> {
                             locals: locals.clone(),
                             parent: env.clone(),
                         });
+                        self.env_gc.register(&captured);
                         stack.push(Value::Closure(idx, captured));
                     }
                     op if op == Op::Jump as u8 => {
@@ -1053,6 +1239,7 @@ pub(crate) fn eval_top_level_function(
         stdin_channel: StdinChannel::none(),
         gensym_counter,
         macro_step_budget: Some(step_budget_remaining),
+        env_gc: EnvGc::default(),
     };
     let env = Rc::new(Env {
         locals: Vec::new(),
@@ -1104,6 +1291,7 @@ pub fn eval_repl_entry(
         stdin_channel: StdinChannel::none(),
         gensym_counter: 0,
         macro_step_budget: None,
+        env_gc: EnvGc::default(),
     };
     let env = Rc::new(Env {
         locals: Vec::new(),
@@ -1280,6 +1468,7 @@ fn run_on_this_thread(
         stdin_channel,
         gensym_counter: 0,
         macro_step_budget: None,
+        env_gc: EnvGc::default(),
     };
     let entry = module
         .functions
@@ -3749,6 +3938,361 @@ mod tests {
         assert!(upvalue_cell(Some(&env), 1, 0).is_err());
     }
 
+    // --- EnvGc (SPEC.md §10.2 cycle-safety): white-box tests against the
+    // trial-deletion algorithm directly, with hand-built Env/cell graphs --
+    // no VM/compiler machinery needed to exercise the algorithm itself.
+    // End-to-end tests through the real compiler+VM follow further below.
+
+    #[test]
+    fn sweep_reclaims_a_pure_self_referential_cycle_once_nothing_external_holds_it() {
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        *cell.borrow_mut() = Value::Closure(0, env.clone());
+
+        let weak_env = Rc::downgrade(&env);
+        let weak_cell = Rc::downgrade(&cell);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        // Drop every reference this test itself was holding -- what's left
+        // is exactly the cycle: cell's content strongly owns env, and
+        // env.locals strongly owns cell, with nothing external anchoring
+        // either one.
+        drop(env);
+        drop(cell);
+
+        gc.sweep();
+
+        assert_eq!(
+            weak_env.strong_count(),
+            0,
+            "the self-referential env should have been reclaimed"
+        );
+        assert_eq!(
+            weak_cell.strong_count(),
+            0,
+            "the cell it captured should have been reclaimed too"
+        );
+    }
+
+    #[test]
+    fn sweep_reclaims_a_mutual_two_closure_cycle_once_nothing_external_holds_it() {
+        let cell_a = Rc::new(RefCell::new(Value::Unspecified));
+        let cell_b = Rc::new(RefCell::new(Value::Unspecified));
+        let env_a = Rc::new(Env {
+            locals: vec![cell_a.clone()],
+            parent: None,
+        });
+        let env_b = Rc::new(Env {
+            locals: vec![cell_b.clone()],
+            parent: None,
+        });
+        *cell_a.borrow_mut() = Value::Closure(0, env_b.clone());
+        *cell_b.borrow_mut() = Value::Closure(1, env_a.clone());
+
+        let weak_env_a = Rc::downgrade(&env_a);
+        let weak_env_b = Rc::downgrade(&env_b);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env_a));
+        gc.registry.push(Rc::downgrade(&env_b));
+
+        drop(env_a);
+        drop(env_b);
+        drop(cell_a);
+        drop(cell_b);
+
+        gc.sweep();
+
+        assert_eq!(
+            weak_env_a.strong_count(),
+            0,
+            "env_a should have been reclaimed"
+        );
+        assert_eq!(
+            weak_env_b.strong_count(),
+            0,
+            "env_b should have been reclaimed"
+        );
+    }
+
+    #[test]
+    fn sweep_does_not_clear_a_self_referential_closure_still_bound_elsewhere() {
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        *cell.borrow_mut() = Value::Closure(0, env.clone());
+
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        // e.g. the closure was returned and bound to a global, or is still
+        // sitting on some other live frame's stack -- a real, independent
+        // strong owner outside the tracked graph entirely.
+        let external_hold = env.clone();
+        drop(env);
+        drop(cell);
+
+        gc.sweep();
+
+        assert!(
+            matches!(*external_hold.locals[0].borrow(), Value::Closure(..)),
+            "a still-reachable self-referential closure must survive a sweep"
+        );
+    }
+
+    #[test]
+    fn sweep_does_not_clear_a_cell_still_owned_by_an_active_frame() {
+        // Mirrors calling a self-referential closure through its own cell
+        // immediately, before the defining frame returns: `cell` here plays
+        // the role of that frame's own `locals` entry, a real strong owner
+        // Rc::strong_count already reflects, with no VM root-tracking
+        // needed for the collector to see it.
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        *cell.borrow_mut() = Value::Closure(0, env.clone());
+
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        let active_frame_hold = cell.clone();
+        drop(env);
+        drop(cell);
+
+        gc.sweep();
+
+        assert!(
+            matches!(*active_frame_hold.borrow(), Value::Closure(..)),
+            "a cell still owned by an active frame must keep its closure content"
+        );
+    }
+
+    #[test]
+    fn sweep_leaves_an_ordinary_acyclic_captured_env_untouched() {
+        let cell = Rc::new(RefCell::new(Value::Int(42)));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+
+        let kept_alive = env.clone();
+        drop(env);
+
+        gc.sweep();
+
+        assert_eq!(*kept_alive.locals[0].borrow(), Value::Int(42));
+    }
+
+    #[test]
+    fn sweep_compacts_dead_registry_entries() {
+        let mut gc = EnvGc::default();
+        {
+            let env = Rc::new(Env {
+                locals: vec![],
+                parent: None,
+            });
+            gc.registry.push(Rc::downgrade(&env));
+        }
+        assert_eq!(gc.registry.len(), 1);
+        gc.sweep();
+        assert!(
+            gc.registry.is_empty(),
+            "a dead entry should be pruned by the next sweep"
+        );
+    }
+
+    #[test]
+    fn register_automatically_sweeps_once_envs_per_sweep_new_environments_have_accumulated() {
+        let mut gc = EnvGc::default();
+
+        let weak_env;
+        {
+            let cell = Rc::new(RefCell::new(Value::Unspecified));
+            let env = Rc::new(Env {
+                locals: vec![cell.clone()],
+                parent: None,
+            });
+            *cell.borrow_mut() = Value::Closure(0, env.clone());
+            weak_env = Rc::downgrade(&env);
+            gc.register(&env);
+        }
+        assert!(
+            weak_env.strong_count() > 0,
+            "should not have been swept yet"
+        );
+
+        for _ in 0..ENVS_PER_SWEEP {
+            let filler = Rc::new(Env {
+                locals: vec![],
+                parent: None,
+            });
+            gc.register(&filler);
+        }
+
+        assert_eq!(
+            weak_env.strong_count(),
+            0,
+            "should have been reclaimed by the automatic threshold-triggered sweep"
+        );
+    }
+
+    #[test]
+    fn register_does_not_sweep_before_the_threshold_is_actually_reached() {
+        // Pins the `>=` boundary itself (mutation-testing finding): fewer
+        // than ENVS_PER_SWEEP additional registrations must leave the
+        // counter armed but not yet fired, not sweep on every call.
+        let mut gc = EnvGc::default();
+
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: None,
+        });
+        *cell.borrow_mut() = Value::Closure(0, env.clone());
+        let weak_env = Rc::downgrade(&env);
+        gc.register(&env);
+        drop(env);
+        drop(cell);
+
+        // One registration already happened above; adding ENVS_PER_SWEEP -
+        // 2 more brings the running total to ENVS_PER_SWEEP - 1 --
+        // deliberately one short of the threshold.
+        for _ in 0..ENVS_PER_SWEEP - 2 {
+            let filler = Rc::new(Env {
+                locals: vec![],
+                parent: None,
+            });
+            gc.register(&filler);
+        }
+
+        assert!(
+            weak_env.strong_count() > 0,
+            "should not sweep until ENVS_PER_SWEEP new environments have accumulated, \
+             not fewer"
+        );
+    }
+
+    #[test]
+    fn sweep_correctly_attributes_a_parent_link_as_an_internal_reference_not_an_external_one() {
+        // Pins the parent-edge internal-in-degree count specifically
+        // (mutation-testing finding: a prior version of this test used a
+        // parentless `env`, which has no locals of its own to wrongly
+        // protect, so nothing observable actually depended on whether the
+        // parent edge was counted). Here `env` is self-referential in its
+        // OWN right via `grandcell`, AND is also `child`'s parent, with
+        // `child` itself self-referential via `cell`. If the parent edge
+        // isn't counted as internal, `env`'s external score looks positive
+        // purely from `child.parent`, which wrongly marks `env` (and,
+        // transitively, `grandcell`) alive and un-clearable -- even though
+        // nothing outside this whole four-node graph ever references any
+        // of it, and `child`/`cell` would still (correctly) get reclaimed
+        // either way, masking the bug unless `env`/`grandcell` are checked
+        // too.
+        let grandcell = Rc::new(RefCell::new(Value::Unspecified));
+        let env = Rc::new(Env {
+            locals: vec![grandcell.clone()],
+            parent: None,
+        });
+        *grandcell.borrow_mut() = Value::Closure(0, env.clone());
+
+        let cell = Rc::new(RefCell::new(Value::Unspecified));
+        let child = Rc::new(Env {
+            locals: vec![cell.clone()],
+            parent: Some(env.clone()),
+        });
+        *cell.borrow_mut() = Value::Closure(1, child.clone());
+
+        let weak_env = Rc::downgrade(&env);
+        let weak_child = Rc::downgrade(&child);
+        let mut gc = EnvGc::default();
+        gc.registry.push(Rc::downgrade(&env));
+        gc.registry.push(Rc::downgrade(&child));
+
+        drop(env);
+        drop(child);
+        drop(grandcell);
+        drop(cell);
+
+        gc.sweep();
+
+        assert_eq!(
+            weak_child.strong_count(),
+            0,
+            "the self-referential child should have been reclaimed"
+        );
+        assert_eq!(
+            weak_env.strong_count(),
+            0,
+            "the parent should have been reclaimed too -- treating child.parent as an \
+             external reference would wrongly keep env (and its own self-referential \
+             grandcell) alive forever"
+        );
+    }
+
+    // --- End-to-end through the real compiler + VM: proves the collector
+    // doesn't corrupt genuinely live cyclic closures under real bytecode,
+    // not just the hand-built graphs above.
+
+    fn run_source_to_stdout(src: &str) -> String {
+        let forms = read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        run(&module, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_self_referential_closure_stays_callable_through_its_own_cell_before_the_frame_returns() {
+        // `cell` is set! to hold the very closure that captured it (E1's
+        // exact shape), then called immediately through that same cell,
+        // still within the defining frame -- the collector must never
+        // treat this as garbage while it's genuinely in play.
+        let src = "(define (make-self-ref) \
+                      (let ((cell #f)) \
+                        (set! cell (lambda () 42)) \
+                        (cell))) \
+                    (display (make-self-ref))";
+        assert_eq!(run_source_to_stdout(src), "42");
+    }
+
+    #[test]
+    fn a_mutual_two_closure_cycle_stays_callable_before_the_frame_returns() {
+        let src = "(define (make-mutual-pair) \
+                      (let ((a #f) (b #f)) \
+                        (set! a (lambda () 1)) \
+                        (set! b (lambda () 2)) \
+                        (+ (a) (b)))) \
+                    (display (make-mutual-pair))";
+        assert_eq!(run_source_to_stdout(src), "3");
+    }
+
+    #[test]
+    fn repeatedly_creating_and_discarding_self_referential_cycles_never_corrupts_a_later_one() {
+        // Crosses ENVS_PER_SWEEP many times over, forcing several automatic
+        // sweeps mid-run while earlier generations' cycles are genuine
+        // garbage -- the final call must still resolve correctly.
+        let src = "(define (make-self-ref) \
+                      (let ((cell #f)) \
+                        (set! cell (lambda () 42)) \
+                        (cell))) \
+                    (define (loop i) \
+                      (if (= i 0) \
+                          (make-self-ref) \
+                          (begin (make-self-ref) (loop (- i 1))))) \
+                    (display (loop 2000))";
+        assert_eq!(run_source_to_stdout(src), "42");
+    }
+
     #[test]
     fn consume_step_decrements_the_remaining_budget_by_exactly_one() {
         assert_eq!(consume_step(5), 4);
@@ -4028,6 +4572,7 @@ mod tests {
                         stdin_channel: StdinChannel::none(),
                         gensym_counter: 0,
                         macro_step_budget: None,
+                        env_gc: EnvGc::default(),
                     };
                     let mut out = Vec::new();
                     let entry = &module.functions[module.entry_index as usize];
@@ -5511,6 +6056,7 @@ mod tests {
             stdin_channel: StdinChannel::none(),
             gensym_counter: 0,
             macro_step_budget: None,
+            env_gc: EnvGc::default(),
         };
         let mut out = Vec::new();
         let entry = &module.functions[module.entry_index as usize];

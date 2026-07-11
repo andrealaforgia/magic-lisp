@@ -41,6 +41,8 @@ mod steps_b2;
 mod steps_b20;
 #[path = "features/steps_b21.rs"]
 mod steps_b21;
+#[path = "features/steps_b22.rs"]
+mod steps_b22;
 #[path = "features/steps_b3.rs"]
 mod steps_b3;
 #[path = "features/steps_b4.rs"]
@@ -211,4 +213,10 @@ fn b20_self_test_and_quality_gates() {
 fn b21_performance_and_memory() {
     let src = include_str!("../features/B21-performance-and-memory.feature");
     registry::run_feature("B21-performance-and-memory", src, &steps_b21::registry());
+}
+
+#[test]
+fn b22_cycle_safe_memory() {
+    let src = include_str!("../features/B22-cycle-safe-memory.feature");
+    registry::run_feature("B22-cycle-safe-memory", src, &steps_b22::registry());
 }
