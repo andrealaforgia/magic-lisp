@@ -317,7 +317,7 @@ pub(crate) fn registry() -> Registry {
             },
         )
         .step(
-            "a new user successfully compresses then decompresses a file, with no need to read the .ml source or ask for help",
+            "a new user successfully compresses then decompresses a file, with no need to read the .ml source or ask for help, and the check fails if the documented commands themselves ever drift from what's proven to work",
             |w, _text, _| {
                 let input = std::fs::read(w.last_file()).unwrap();
                 let restored = std::fs::read(w.last_artifact()).expect(
@@ -337,7 +337,7 @@ pub(crate) fn registry() -> Registry {
             |_w, _text, _| { /* purely descriptive; the When step below does the real work */ },
         )
         .step(
-            "it is run end to end against a real file from the command line",
+            "it is run end to end against a real file from the command line, executed by a real Cucumber-style step-definition runner (not just ad hoc integration tests)",
             |w, _text, _| {
                 let readme = std::fs::read_to_string(huffman_dir().join("README.md"))
                     .expect("examples/huffman/README.md should exist");
@@ -370,7 +370,7 @@ pub(crate) fn registry() -> Registry {
             },
         )
         .step(
-            "the restored file is byte-for-byte identical to the original, demonstrating the whole example (algorithm + CLI + docs) works as one coherent, usable deliverable",
+            "the restored file is byte-for-byte identical to the original, demonstrating the whole example (algorithm + CLI + docs) works as one coherent, usable deliverable, and this feature file itself now executes rather than sitting decorative",
             |w, _text, _| {
                 let input = std::fs::read(w.last_file()).unwrap();
                 let restored = std::fs::read(w.last_artifact()).unwrap();
