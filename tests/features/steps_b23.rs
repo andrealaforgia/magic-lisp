@@ -22,7 +22,7 @@ use magiclisp::bytecode::{Chunk, Const, Module, encode};
 use magiclisp::exitcode::{BAD_ARTIFACT, SUCCESS};
 
 use super::registry::Registry;
-use super::world::{World, run, stdout_of, temp_path, write_source};
+use super::world::{World, run, stderr_of, stdout_of, temp_path, write_source};
 
 /// Mirrors `bytecode::MAX_CONST_NESTING_DEPTH` (private to that module, so
 /// restated here) -- several thousand is comfortably past it, matching the
@@ -90,7 +90,8 @@ fn compile_long_dotted_list(world: &mut World, label: &str) {
     assert_eq!(
         out.status.code(),
         Some(SUCCESS),
-        "setup compile should succeed"
+        "setup compile should succeed, stderr: {}",
+        stderr_of(&out)
     );
     world.artifacts.push(artifact);
 }
@@ -113,15 +114,19 @@ fn run_and_disasm_pathological_nesting(world: &mut World, label: &str) {
 }
 
 fn assert_pathological_nesting_was_rejected(world: &World) {
+    let run_out = world.labeled("run");
     assert_eq!(
-        world.labeled("run").status.code(),
+        run_out.status.code(),
         Some(BAD_ARTIFACT),
-        "run should reject pathological car-side nesting"
+        "run should reject pathological car-side nesting, stderr: {}",
+        stderr_of(run_out)
     );
+    let disasm_out = world.labeled("disasm");
     assert_eq!(
-        world.labeled("disasm").status.code(),
+        disasm_out.status.code(),
         Some(BAD_ARTIFACT),
-        "disasm should reject pathological car-side nesting"
+        "disasm should reject pathological car-side nesting, stderr: {}",
+        stderr_of(disasm_out)
     );
 }
 
@@ -150,7 +155,13 @@ pub(crate) fn registry() -> Registry {
         .step(
             "compilation succeeds and produces an MLBC artifact, with no spurious rejection for the literal's length",
             |w, _text, _| {
-                assert_eq!(w.last_output().status.code(), Some(SUCCESS));
+                let out = w.last_output();
+                assert_eq!(
+                    out.status.code(),
+                    Some(SUCCESS),
+                    "compile should succeed, stderr: {}",
+                    stderr_of(out)
+                );
                 assert!(
                     std::fs::metadata(w.last_artifact()).is_ok(),
                     "the compiled artifact should exist on disk"
@@ -177,7 +188,12 @@ pub(crate) fn registry() -> Registry {
             "decoding succeeds with no truncation error, and every element along the chain plus the final tail match what was written",
             |w, _text, _| {
                 let out = w.last_output();
-                assert_eq!(out.status.code(), Some(SUCCESS));
+                assert_eq!(
+                    out.status.code(),
+                    Some(SUCCESS),
+                    "run should decode and execute successfully, stderr: {}",
+                    stderr_of(out)
+                );
                 assert_eq!(stdout_of(out), expected_display(WELL_PAST_THE_OLD_CDR_CAP));
             },
         )
@@ -194,7 +210,12 @@ pub(crate) fn registry() -> Registry {
             "every element and the final tail are exactly as authored, proving the round-tripped value is actually usable at runtime",
             |w, _text, _| {
                 let out = w.last_output();
-                assert_eq!(out.status.code(), Some(SUCCESS));
+                assert_eq!(
+                    out.status.code(),
+                    Some(SUCCESS),
+                    "run should decode and execute successfully, stderr: {}",
+                    stderr_of(out)
+                );
                 assert_eq!(stdout_of(out), expected_display(WELL_PAST_THE_OLD_CDR_CAP));
             },
         )
@@ -235,7 +256,12 @@ pub(crate) fn registry() -> Registry {
             "the long dotted list runs correctly end to end and the pathologically-nested artifact is still rejected with exit code 66 -- the fix restores the round-trip guarantee without opening a hole in the malformed-input safety net",
             |w, _text, _| {
                 let dotted_list_run = w.last_output();
-                assert_eq!(dotted_list_run.status.code(), Some(SUCCESS));
+                assert_eq!(
+                    dotted_list_run.status.code(),
+                    Some(SUCCESS),
+                    "run should decode and execute successfully, stderr: {}",
+                    stderr_of(dotted_list_run)
+                );
                 assert_eq!(
                     stdout_of(dotted_list_run),
                     expected_display(WELL_PAST_THE_OLD_CDR_CAP)
