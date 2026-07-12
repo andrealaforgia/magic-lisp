@@ -337,6 +337,38 @@ impl Ctx {
         Ok(slot)
     }
 
+    /// The current slot high-water mark, to be paired with
+    /// [`Ctx::restore_slot_mark`] around a group of *mutually exclusive*
+    /// branches (an `if`'s two arms, or one `cond`/`case` clause among
+    /// several) — see that method's own doc comment for why this is
+    /// needed on top of `next_slot`'s ordinary sharing.
+    fn slot_mark(&self) -> u8 {
+        self.next_slot.get()
+    }
+
+    /// Resets the shared slot counter back to a previously-recorded
+    /// [`Ctx::slot_mark`]. `next_slot` is deliberately shared (not
+    /// per-clone) so two *sequential* `let`s in the same straight-line
+    /// body — which both genuinely execute, one after the other — never
+    /// collide on the same runtime slot (see `next_slot`'s own doc
+    /// comment). But an `if`'s two branches, or a `cond`/`case`'s several
+    /// clauses, are *mutually exclusive*: at runtime only one of them ever
+    /// runs, so a `let` in a branch that ISN'T taken must not permanently
+    /// consume slot numbers a sibling branch that IS taken then can't use
+    /// — without this reset, compiling the first branch's own `let`
+    /// advances the shared counter, so the next branch's own (independent)
+    /// `let` gets assigned a slot number one higher than what actually
+    /// gets pushed at runtime when only that branch executes, producing a
+    /// live "local slot N out of range" error the moment that branch runs.
+    /// Callers must still leave `next_slot` at the *highest* mark reached
+    /// by any branch once all of them are compiled (not just the first
+    /// branch's own mark), since code that follows a branching form in the
+    /// same body must allocate its own new slots above whatever any branch
+    /// could have consumed, regardless of which one actually ran.
+    fn restore_slot_mark(&self, mark: u8) {
+        self.next_slot.set(mark);
+    }
+
     fn resolve_local(&self, name: &str) -> Option<u8> {
         self.locals
             .iter()
@@ -1104,10 +1136,35 @@ fn compile_if(
 
     compile_expr(condition, ctx, chunk, comp, depth + 1, false)?;
     let else_jump = chunk.emit_jump(Op::JumpIfFalse);
+    // See `Ctx::restore_slot_mark`'s doc comment: the two branches are
+    // mutually exclusive, so each must start allocating locals from the
+    // same baseline. When this `if` isn't itself in tail position (so
+    // code follows it in the same body), each branch is also padded with
+    // placeholder locals up to whichever branch would introduce the
+    // most (see `measure_locals_introduced`/`pad_locals_to`), so the
+    // runtime locals vector ends up the same length regardless of which
+    // branch actually ran -- when it IS tail position, nothing follows in
+    // this body, so there's nothing to keep consistent for.
+    let mark = ctx.slot_mark();
+    let target = if tail {
+        0
+    } else {
+        let then_needs = measure_locals_introduced(then_branch, ctx, comp, depth + 1)?;
+        let else_needs = match else_branch {
+            Some(e) => measure_locals_introduced(e, ctx, comp, depth + 1)?,
+            None => 0,
+        };
+        mark + then_needs.max(else_needs)
+    };
+
     compile_expr(then_branch, ctx, chunk, comp, depth + 1, tail)?;
+    if !tail {
+        pad_locals_to(chunk, ctx, target);
+    }
     let end_jump = chunk.emit_jump(Op::Jump);
 
     chunk.patch_jump(else_jump);
+    ctx.restore_slot_mark(mark);
     match else_branch {
         Some(else_expr) => compile_expr(else_expr, ctx, chunk, comp, depth + 1, tail)?,
         None => {
@@ -1115,8 +1172,81 @@ fn compile_if(
             chunk.emit_const(idx);
         }
     }
+    if !tail {
+        pad_locals_to(chunk, ctx, target);
+    }
     chunk.patch_jump(end_jump);
     Ok(())
+}
+
+/// Compiles `expr` into a throwaway chunk purely to measure how many NEW
+/// local slots it would introduce if compiled for real from the current
+/// `ctx` state (see `Ctx::restore_slot_mark`'s doc comment for why an
+/// `if`/`cond`/`case` branch needs to know this about a *sibling* branch
+/// before either can safely fall through to code that follows). Restores
+/// `next_slot` to its pre-call value regardless of outcome; the throwaway
+/// chunk's bytecode itself is discarded. May leave a handful of otherwise-
+/// dead entries in `comp`'s function table if `expr` contains a `lambda`
+/// (compiled twice: once here to measure, once for real afterward) --
+/// harmless, since nothing ever references the throwaway copy, just not
+/// maximally compact.
+///
+/// Mutation-testing note: every call site below passes `depth + 1` (or an
+/// equivalent) to this and to [`measure_sequence_locals_introduced`], and
+/// every one of those call sites has a sibling -- either the corresponding
+/// *real* compile of the same sub-expression (for a measure call), or the
+/// measure call that ran just before it (for a real-compile call) -- that
+/// independently computes the *same* correct depth and so independently
+/// enforces `MAX_NESTING_DEPTH` against it. Corrupting a single such
+/// `depth` argument (e.g. `depth + 1` mutated to `depth * 1`) is therefore
+/// unobservable: whichever of the pair still has the correct depth catches
+/// any nesting-depth violation the other would have missed, before the
+/// corrupted one's own result is ever used for anything besides that same
+/// pass/fail check. `cargo mutants` reports these as surviving; they are
+/// accepted equivalent mutants, verified by hand (applying each one still
+/// leaves the full `cargo test --lib` suite green).
+fn measure_locals_introduced(
+    expr: &Sexpr,
+    ctx: &Ctx,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<u8, CompileError> {
+    let mark = ctx.slot_mark();
+    let mut scratch = Chunk::new();
+    compile_expr(expr, ctx, &mut scratch, comp, depth, false)?;
+    let introduced = ctx.slot_mark() - mark;
+    ctx.restore_slot_mark(mark);
+    Ok(introduced)
+}
+
+/// Same as [`measure_locals_introduced`], but for a `cond`/`case` clause
+/// body: a whole sequence of expressions compiled with [`compile_sequence`]
+/// rather than a single expression.
+fn measure_sequence_locals_introduced(
+    exprs: &[Sexpr],
+    ctx: &Ctx,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<u8, CompileError> {
+    let mark = ctx.slot_mark();
+    let mut scratch = Chunk::new();
+    compile_sequence(exprs, ctx, &mut scratch, comp, depth, false)?;
+    let introduced = ctx.slot_mark() - mark;
+    ctx.restore_slot_mark(mark);
+    Ok(introduced)
+}
+
+/// Pads the runtime locals vector up to `target` slots with placeholder
+/// `Unspecified` values, and advances `ctx`'s own slot mark to match --
+/// see `measure_locals_introduced`'s doc comment for why.
+fn pad_locals_to(chunk: &mut Chunk, ctx: &Ctx, target: u8) {
+    let current = ctx.slot_mark();
+    for _ in current..target {
+        let idx = chunk.add_const(Const::Unspecified);
+        chunk.emit_const(idx);
+        chunk.emit_push_local();
+    }
+    ctx.restore_slot_mark(target);
 }
 
 fn compile_define(
@@ -1741,8 +1871,29 @@ fn compile_cond(
 ) -> Result<(), CompileError> {
     let clauses = &items[1..];
     let mut end_jumps = Vec::new();
+    // Every clause is mutually exclusive with every other (at runtime, at
+    // most one clause's body ever runs) -- see `Ctx::restore_slot_mark`'s
+    // doc comment. Each clause starts allocating locals from the same
+    // baseline `mark`, and (when this `cond` isn't itself in tail
+    // position, so code follows it in the same body) each clause is
+    // padded up to whichever clause would introduce the most locals,
+    // pre-measured below -- see `measure_locals_introduced`/
+    // `pad_locals_to`'s own doc comments for why.
+    let mark = ctx.slot_mark();
+    let target = if tail {
+        mark
+    } else {
+        let mut highest = 0u8;
+        for (i, clause) in clauses.iter().enumerate() {
+            let needs =
+                cond_clause_action_locals(clause, i == clauses.len() - 1, ctx, comp, depth + 1)?;
+            highest = highest.max(needs);
+        }
+        mark + highest
+    };
 
     for (i, clause) in clauses.iter().enumerate() {
+        ctx.restore_slot_mark(mark);
         let Sexpr::List(clause_items) = clause else {
             return Err(err(format!("cond clause must be a list, found {clause:?}")));
         };
@@ -1753,6 +1904,9 @@ fn compile_cond(
         let is_else = i == clauses.len() - 1 && matches!(test, Sexpr::Symbol(s) if s == "else");
         if is_else {
             compile_sequence(rest, ctx, chunk, comp, depth + 1, tail)?;
+            if !tail {
+                pad_locals_to(chunk, ctx, target);
+            }
             end_jumps.push(chunk.emit_jump(Op::Jump));
             continue;
         }
@@ -1770,6 +1924,9 @@ fn compile_cond(
             } else {
                 chunk.emit_call(1); // [result]
             }
+            if !tail {
+                pad_locals_to(chunk, ctx, target);
+            }
             end_jumps.push(chunk.emit_jump(Op::Jump));
             chunk.patch_jump(skip);
             chunk.emit_pop(); // discard leftover t on the falsy path
@@ -1779,16 +1936,55 @@ fn compile_cond(
         compile_expr(test, ctx, chunk, comp, depth + 1, false)?;
         let skip = chunk.emit_jump(Op::JumpIfFalse);
         compile_sequence(rest, ctx, chunk, comp, depth + 1, tail)?;
+        if !tail {
+            pad_locals_to(chunk, ctx, target);
+        }
         end_jumps.push(chunk.emit_jump(Op::Jump));
         chunk.patch_jump(skip);
     }
 
+    ctx.restore_slot_mark(target);
     let idx = chunk.add_const(Const::Unspecified);
     chunk.emit_const(idx);
     for j in end_jumps {
         chunk.patch_jump(j);
     }
     Ok(())
+}
+
+/// How many new local slots a single `cond` clause's action (its
+/// `(test => func)` function expression, or its ordinary body sequence)
+/// would introduce -- see `measure_locals_introduced`'s doc comment.
+///
+/// Mutation-testing note: corrupting `is_else`/`is_arrow`'s computation
+/// below (`&&` vs `||`, `==` vs `!=`, negation) changes which of the two
+/// branches below actually runs, but never changes the *measured value*:
+/// `rest[0]` is only ever classified as arrow-shaped when it's literally
+/// the symbol `=>` (contributing zero introduced locals either way), so
+/// measuring `rest[1]` alone (the `is_arrow` branch) and measuring the
+/// whole `rest` as a sequence (the fallback) always agree on the count for
+/// every reachable clause shape. These mutants are accepted equivalent,
+/// verified by hand the same way as the `depth` ones above.
+fn cond_clause_action_locals(
+    clause: &Sexpr,
+    is_last: bool,
+    ctx: &Ctx,
+    comp: &mut Compilation,
+    depth: usize,
+) -> Result<u8, CompileError> {
+    let Sexpr::List(clause_items) = clause else {
+        return Err(err(format!("cond clause must be a list, found {clause:?}")));
+    };
+    let (test, rest) = clause_items
+        .split_first()
+        .ok_or_else(|| err("cond clause cannot be empty"))?;
+    let is_else = is_last && matches!(test, Sexpr::Symbol(s) if s == "else");
+    let is_arrow = !is_else && rest.len() == 2 && matches!(&rest[0], Sexpr::Symbol(s) if s == "=>");
+    if is_arrow {
+        measure_locals_introduced(&rest[1], ctx, comp, depth)
+    } else {
+        measure_sequence_locals_introduced(rest, ctx, comp, depth)
+    }
 }
 
 /// `case`: evaluates the key expression once, then compares it (by value
@@ -1812,11 +2008,36 @@ fn compile_case(
 
     let mut end_jumps = Vec::new();
     let mut pending_next_clause: Vec<usize> = Vec::new();
+    // Every clause's body is mutually exclusive with every other's (see
+    // `Ctx::restore_slot_mark`'s doc comment) -- each starts allocating
+    // locals from the same baseline `mark`, and (when this `case` isn't
+    // itself in tail position, so code follows it in the same body) each
+    // clause is padded up to whichever clause would introduce the most
+    // locals, pre-measured below -- see `measure_locals_introduced`/
+    // `pad_locals_to`'s own doc comments for why.
+    let mark = ctx.slot_mark();
+    let target = if tail {
+        mark
+    } else {
+        let mut highest = 0u8;
+        for clause in clauses {
+            let Sexpr::List(clause_items) = clause else {
+                return Err(err(format!("case clause must be a list, found {clause:?}")));
+            };
+            let (_selector, body) = clause_items
+                .split_first()
+                .ok_or_else(|| err("case clause cannot be empty"))?;
+            let needs = measure_sequence_locals_introduced(body, ctx, comp, depth + 1)?;
+            highest = highest.max(needs);
+        }
+        mark + highest
+    };
 
     for (i, clause) in clauses.iter().enumerate() {
         for j in pending_next_clause.drain(..) {
             chunk.patch_jump(j);
         }
+        ctx.restore_slot_mark(mark);
         let Sexpr::List(clause_items) = clause else {
             return Err(err(format!("case clause must be a list, found {clause:?}")));
         };
@@ -1828,6 +2049,9 @@ fn compile_case(
         if is_else {
             chunk.emit_pop(); // discard k, unused in the else body
             compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
+            if !tail {
+                pad_locals_to(chunk, ctx, target);
+            }
             end_jumps.push(chunk.emit_jump(Op::Jump));
             continue;
         }
@@ -1858,9 +2082,13 @@ fn compile_case(
         }
         chunk.emit_pop(); // discard k, unused in the body
         compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
+        if !tail {
+            pad_locals_to(chunk, ctx, target);
+        }
         end_jumps.push(chunk.emit_jump(Op::Jump));
     }
 
+    ctx.restore_slot_mark(target);
     for j in pending_next_clause.drain(..) {
         chunk.patch_jump(j);
     }
@@ -2943,6 +3171,191 @@ mod tests {
         let mut out = Vec::new();
         crate::vm::run(&module, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "40");
+    }
+
+    #[test]
+    fn an_if_branch_with_its_own_let_binding_does_not_corrupt_the_sibling_branchs_slots() {
+        // `next_slot` is shared (Rc<Cell<u8>>) across every Ctx clone so
+        // that genuinely sequential `let`s in one straight-line body never
+        // collide on the same runtime slot -- but `if`'s two branches are
+        // mutually exclusive (only one ever runs), so the branch NOT taken
+        // must not permanently consume slot numbers the branch that IS
+        // taken then can't use. Before the fix, compiling the then-branch's
+        // `let` first left the shared counter advanced, so the else-
+        // branch's own (independent) `let` was assigned a slot number one
+        // higher than what actually gets pushed at runtime when only the
+        // else-branch executes -- "local slot 1 out of range".
+        let src = "(display (if #f (let ((s 5)) s) (let ((x 1)) x)))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "1");
+    }
+
+    #[test]
+    fn a_cond_clauses_own_let_binding_does_not_corrupt_a_later_clauses_slots() {
+        let src = "(display (cond \
+                      (#f (let ((a 1)) a)) \
+                      (#f (let ((b 2)) b)) \
+                      (else (let ((c 3)) c))))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "3");
+    }
+
+    #[test]
+    fn a_local_declared_after_a_cond_does_not_collide_with_any_clauses_own_locals() {
+        let src = "(define (f n) \
+                      (cond \
+                        ((= n 1) (let ((a 1) (b 2) (c 3)) 0)) \
+                        ((= n 2) (let ((d 4)) 0)) \
+                        (else 0)) \
+                      (let ((y 42)) y)) \
+                    (display (f 1)) \
+                    (display (f 2)) \
+                    (display (f 3))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "424242");
+    }
+
+    #[test]
+    fn a_local_declared_after_an_if_does_not_collide_with_either_branchs_own_locals() {
+        // Whichever branch of the preceding `if` actually ran, code that
+        // follows (still in the same function body) must allocate its own
+        // new slot above whatever either branch could have consumed --
+        // never reusing a slot number either branch's (never-popped)
+        // runtime local might already occupy.
+        let src = "(define (f flag) \
+                      (if flag (let ((a 1) (b 2)) 0) (let ((c 3)) 0)) \
+                      (let ((y 42)) y)) \
+                    (display (f #t)) \
+                    (display (f #f))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "4242");
+    }
+
+    #[test]
+    fn a_local_declared_after_an_if_does_not_collide_when_the_then_branch_needs_more_padding_than_the_else_branch()
+     {
+        // The mirror image of the sibling test above: there, the else
+        // branch was the one needing padding (it introduced fewer locals
+        // than the then branch), which alone doesn't exercise the padding
+        // call placed right after the *then* branch compiles -- if that
+        // one were skipped entirely, a then-branch that already introduces
+        // at least as many locals as the else branch would never notice.
+        // Here the then branch is deliberately the smaller one, so it's
+        // the one that actually needs padding.
+        let src = "(define (f flag) \
+                      (if flag (let ((a 1)) 0) (let ((b 2) (c 3)) 0)) \
+                      (let ((y 42)) y)) \
+                    (display (f #t)) \
+                    (display (f #f))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "4242");
+    }
+
+    #[test]
+    fn a_local_declared_after_a_cond_does_not_collide_when_an_arrow_clauses_own_locals_need_padding()
+     {
+        // The arrow-clause counterpart of the two tests above: a `=>`
+        // clause has its own padding call, separate from the ordinary- and
+        // else-clause ones, placed right after its dup/swap/call bytecode.
+        // Here the arrow clause's function expression introduces fewer
+        // locals (one, via its own `let`) than the sibling else clause
+        // (three), so the arrow clause is the one that needs padding.
+        let src = "(define (f n) \
+                      (cond \
+                        ((= n 1) => (let ((z 1)) (lambda (x) x))) \
+                        (else (let ((a 1) (b 2) (c 3)) 0))) \
+                      (let ((y 42)) y)) \
+                    (display (f 1)) \
+                    (display (f 2))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "4242");
+    }
+
+    /// Builds `(let* ((v0 0) (v1 1) ... (v{n-1} n-1)) TAIL)` as source text
+    /// -- used below to push a function's baseline slot count (`mark`, in
+    /// `Ctx::slot_mark`'s own vocabulary) up to a deliberately large value
+    /// before an `if`/`cond`/`case` is measured, so that a measurement bug
+    /// which adds this baseline back in (instead of subtracting it back
+    /// out) overflows `u8` instead of merely being off by a harmless,
+    /// unobservable amount.
+    fn many_let_star_bindings_then(n: usize, tail: &str) -> String {
+        let bindings: String = (0..n).map(|i| format!("(v{i} {i}) ")).collect();
+        format!("(let* ({bindings}) {tail})")
+    }
+
+    #[test]
+    fn measuring_an_if_branchs_locals_does_not_wrongly_add_the_baseline_slot_count_back_in() {
+        // `measure_locals_introduced` must compute `ctx.slot_mark() - mark`
+        // (how many *new* slots the branch itself introduced), not
+        // `ctx.slot_mark() + mark`. With a small baseline this bug is
+        // unobservable (the padding is merely larger than strictly
+        // necessary, which is harmless); with a large one, adding the
+        // baseline back in overflows `u8` where subtracting it out would
+        // not, turning an otherwise-unremarkable compile into a panic.
+        let tail = "(if flag (let ((a 1)) 0) 0) v129";
+        let src = format!(
+            "(define (f flag) {}) (display (f #t)) (display (f #f))",
+            many_let_star_bindings_then(130, tail)
+        );
+        let forms = crate::reader::read_program(&src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "129129");
+    }
+
+    #[test]
+    fn measuring_a_cond_clauses_locals_does_not_wrongly_add_the_baseline_slot_count_back_in() {
+        // Same as the sibling `if` test above, but for
+        // `measure_sequence_locals_introduced` (the clause-body-sequence
+        // counterpart `cond`/`case` clauses use instead of
+        // `measure_locals_introduced`).
+        let tail = "(cond (flag (let ((a 1)) 0)) (else 0)) v129";
+        let src = format!(
+            "(define (f flag) {}) (display (f #t)) (display (f #f))",
+            many_let_star_bindings_then(130, tail)
+        );
+        let forms = crate::reader::read_program(&src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "129129");
+    }
+
+    #[test]
+    fn a_local_declared_after_a_case_does_not_collide_with_any_clauses_own_locals() {
+        let src = "(define (f n) \
+                      (case n \
+                        ((1) (let ((a 1) (b 2) (c 3)) 0)) \
+                        ((2) (let ((d 4)) 0)) \
+                        (else 0)) \
+                      (let ((y 42)) y)) \
+                    (display (f 1)) \
+                    (display (f 2)) \
+                    (display (f 3))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "424242");
     }
 
     #[test]
