@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use super::helpers::temp_path;
+use super::helpers::{assert_within_release_ceiling, temp_path};
 
 fn huffman_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/huffman")
@@ -201,7 +201,19 @@ fn e3_a_skewed_frequency_input_compresses_measurably_smaller_than_the_original()
 // closures at all. These two tests exercise both directions at a size
 // large enough to have been clearly infeasible before (200KB was
 // unfinished within 60s per the warden's own measurement), with a still-
-// generous ceiling the fixed implementation clears comfortably. ---
+// generous ceiling the fixed implementation clears comfortably.
+//
+// The timing checks only apply on an optimised release build (qa
+// test-design review msg #71, mirroring B21's own established
+// `assert_within_release_ceiling` pattern): an ordinary unoptimized debug
+// build runs this VM 5-20x slower for reasons unrelated to any real
+// regression, so an unconditional ceiling here would be a routine flake
+// under plain `cargo test`, not a meaningful guard. Correctness (the
+// round-tripped bytes) is still checked unconditionally in both
+// profiles. ---
+
+const REPEATED_BYTE_COMPRESS_CEILING: std::time::Duration = std::time::Duration::from_secs(20);
+const FULL_ALPHABET_ROUND_TRIP_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[test]
 fn compression_of_a_large_single_repeated_byte_input_completes_promptly_not_quadratically() {
@@ -209,10 +221,10 @@ fn compression_of_a_large_single_repeated_byte_input_completes_promptly_not_quad
     let start = std::time::Instant::now();
     let compressed = compress(&input, "perf-repeated");
     let elapsed = start.elapsed();
-    assert!(
-        elapsed.as_secs() < 20,
-        "compression took {elapsed:?} for a 2MB single-repeated-byte input -- \
-         should be linear in input size, not quadratic"
+    assert_within_release_ceiling(
+        elapsed,
+        REPEATED_BYTE_COMPRESS_CEILING,
+        "compression of a 2MB single-repeated-byte input",
     );
     let restored = decompress(&compressed, "perf-repeated");
     assert_eq!(restored, input);
@@ -238,19 +250,19 @@ fn round_trip_of_a_full_alphabet_pseudorandom_input_completes_promptly_not_quadr
     let start = std::time::Instant::now();
     let compressed = compress(&input, "perf-random");
     let compress_elapsed = start.elapsed();
-    assert!(
-        compress_elapsed.as_secs() < 30,
-        "compression took {compress_elapsed:?} for a 200KB full-alphabet input -- \
-         should be linear in input size, not quadratic"
+    assert_within_release_ceiling(
+        compress_elapsed,
+        FULL_ALPHABET_ROUND_TRIP_CEILING,
+        "compression of a 200KB full-alphabet input",
     );
 
     let start = std::time::Instant::now();
     let restored = decompress(&compressed, "perf-random");
     let decompress_elapsed = start.elapsed();
-    assert!(
-        decompress_elapsed.as_secs() < 30,
-        "decompression took {decompress_elapsed:?} for this input's compressed output -- \
-         should be linear in input size, not quadratic"
+    assert_within_release_ceiling(
+        decompress_elapsed,
+        FULL_ALPHABET_ROUND_TRIP_CEILING,
+        "decompression of this input's compressed output",
     );
     assert_eq!(restored, input);
 }

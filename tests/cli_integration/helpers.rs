@@ -223,3 +223,22 @@ pub(crate) fn run_with_peak_rss(args: &[&str]) -> (Output, u64) {
         });
     (output, rss)
 }
+
+/// Asserts `elapsed` is within `ceiling`, but only on an optimised release
+/// build (`!cfg!(debug_assertions)`) — an ordinary unoptimized debug build
+/// blows well past any of these ceilings for reasons unrelated to any real
+/// regression (qa test-design review msg #71: confirmed empirically, e.g.
+/// B21's E1 loop alone runs ~2.5s released vs ~28s debug), so a ceiling
+/// checked unconditionally would be a routine flake under `cargo test`
+/// without `--release`, not a meaningful regression guard. Correctness
+/// should still be asserted unconditionally by the caller, in both
+/// profiles — this only ever skips the *timing* check.
+pub(crate) fn assert_within_release_ceiling(elapsed: Duration, ceiling: Duration, label: &str) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    assert!(
+        elapsed <= ceiling,
+        "{label} took {elapsed:?}, exceeding the {ceiling:?} release-build ceiling"
+    );
+}

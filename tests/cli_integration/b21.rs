@@ -11,7 +11,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::helpers::{run, stdout_of, temp_path, write_source};
+use super::helpers::{assert_within_release_ceiling, run, stdout_of, temp_path, write_source};
 
 const SELF_TAIL_LOOP: &str =
     "(define (loop i limit) (if (= i limit) i (loop (+ i 1) limit))) (display (loop 0 10000000))";
@@ -26,16 +26,6 @@ const COUNTER_FACTORY_SOAK: &str = "(define (counter) (let ((n 0)) (lambda () (s
 const TEN_MILLION_LOOP_CEILING: Duration = Duration::from_secs(10);
 const FIB_27_CEILING: Duration = Duration::from_secs(20);
 const TWO_THOUSAND_LINE_COMPILE_CEILING: Duration = Duration::from_secs(5);
-
-fn assert_within_release_ceiling(elapsed: Duration, ceiling: Duration, label: &str) {
-    if cfg!(debug_assertions) {
-        return;
-    }
-    assert!(
-        elapsed <= ceiling,
-        "{label} took {elapsed:?}, exceeding the {ceiling:?} release-build ceiling"
-    );
-}
 
 fn two_thousand_line_source() -> String {
     let mut src = String::new();
