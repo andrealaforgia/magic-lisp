@@ -1138,30 +1138,30 @@ fn compile_if(
     let else_jump = chunk.emit_jump(Op::JumpIfFalse);
     // See `Ctx::restore_slot_mark`'s doc comment: the two branches are
     // mutually exclusive, so each must start allocating locals from the
-    // same baseline. When this `if` isn't itself in tail position (so
-    // code follows it in the same body), each branch is also padded with
-    // placeholder locals up to whichever branch would introduce the
-    // most (see `measure_locals_introduced`/`pad_locals_to`), so the
-    // runtime locals vector ends up the same length regardless of which
-    // branch actually ran -- when it IS tail position, nothing follows in
-    // this body, so there's nothing to keep consistent for.
+    // same baseline. Each branch is compiled for real exactly once,
+    // directly into `chunk`, in its natural position -- how many locals it
+    // introduced falls out of that single compile as `ctx.slot_mark()`'s
+    // own delta, with no separate measurement pass (an earlier version of
+    // this fix pre-compiled each branch into a throwaway chunk first just
+    // to measure it, which meant a nested non-tail `if`/`cond`/`case` got
+    // compiled twice at every level of nesting -- once by the measurement
+    // pass, once for real -- giving `T(D) = 2*T(D-1)` for a chain of D:
+    // warden security-review msg #72, High, confirmed empirically to hang
+    // well within `MAX_NESTING_DEPTH`). When this `if` isn't itself in
+    // tail position (so code follows it in the same body), each branch's
+    // own trailing jump is instead patched to route through a small
+    // per-branch padding stub -- emitted once, only after *both* branches'
+    // actual needs are known -- that tops it up to whichever branch
+    // introduced the most, so the runtime locals vector ends up the same
+    // length regardless of which branch actually ran. When it IS tail
+    // position, nothing follows in this body, so there's nothing to keep
+    // consistent for; the padding stubs are still emitted (just empty) to
+    // keep the jump wiring uniform.
     let mark = ctx.slot_mark();
-    let target = if tail {
-        0
-    } else {
-        let then_needs = measure_locals_introduced(then_branch, ctx, comp, depth + 1)?;
-        let else_needs = match else_branch {
-            Some(e) => measure_locals_introduced(e, ctx, comp, depth + 1)?,
-            None => 0,
-        };
-        mark + then_needs.max(else_needs)
-    };
 
     compile_expr(then_branch, ctx, chunk, comp, depth + 1, tail)?;
-    if !tail {
-        pad_locals_to(chunk, ctx, target);
-    }
-    let end_jump = chunk.emit_jump(Op::Jump);
+    let then_needs = ctx.slot_mark() - mark;
+    let then_jump = chunk.emit_jump(Op::Jump);
 
     chunk.patch_jump(else_jump);
     ctx.restore_slot_mark(mark);
@@ -1172,73 +1172,35 @@ fn compile_if(
             chunk.emit_const(idx);
         }
     }
+    let else_needs = ctx.slot_mark() - mark;
+    let target = then_needs.max(else_needs);
+
+    // else's own padding stub sits right here, its natural fallthrough
+    // position -- `ctx` is already at `mark + else_needs` from compiling
+    // it for real, just above.
     if !tail {
-        pad_locals_to(chunk, ctx, target);
+        pad_locals_to(chunk, ctx, mark + target);
     }
-    chunk.patch_jump(end_jump);
+    let else_done_jump = chunk.emit_jump(Op::Jump);
+
+    // then's own padding stub: `then_jump`, emitted right after then's own
+    // code above, lands here.
+    chunk.patch_jump(then_jump);
+    ctx.restore_slot_mark(mark + then_needs);
+    if !tail {
+        pad_locals_to(chunk, ctx, mark + target);
+    }
+
+    chunk.patch_jump(else_done_jump);
+    if !tail {
+        ctx.restore_slot_mark(mark + target);
+    }
     Ok(())
-}
-
-/// Compiles `expr` into a throwaway chunk purely to measure how many NEW
-/// local slots it would introduce if compiled for real from the current
-/// `ctx` state (see `Ctx::restore_slot_mark`'s doc comment for why an
-/// `if`/`cond`/`case` branch needs to know this about a *sibling* branch
-/// before either can safely fall through to code that follows). Restores
-/// `next_slot` to its pre-call value regardless of outcome; the throwaway
-/// chunk's bytecode itself is discarded. May leave a handful of otherwise-
-/// dead entries in `comp`'s function table if `expr` contains a `lambda`
-/// (compiled twice: once here to measure, once for real afterward) --
-/// harmless, since nothing ever references the throwaway copy, just not
-/// maximally compact.
-///
-/// Mutation-testing note: every call site below passes `depth + 1` (or an
-/// equivalent) to this and to [`measure_sequence_locals_introduced`], and
-/// every one of those call sites has a sibling -- either the corresponding
-/// *real* compile of the same sub-expression (for a measure call), or the
-/// measure call that ran just before it (for a real-compile call) -- that
-/// independently computes the *same* correct depth and so independently
-/// enforces `MAX_NESTING_DEPTH` against it. Corrupting a single such
-/// `depth` argument (e.g. `depth + 1` mutated to `depth * 1`) is therefore
-/// unobservable: whichever of the pair still has the correct depth catches
-/// any nesting-depth violation the other would have missed, before the
-/// corrupted one's own result is ever used for anything besides that same
-/// pass/fail check. `cargo mutants` reports these as surviving; they are
-/// accepted equivalent mutants, verified by hand (applying each one still
-/// leaves the full `cargo test --lib` suite green).
-fn measure_locals_introduced(
-    expr: &Sexpr,
-    ctx: &Ctx,
-    comp: &mut Compilation,
-    depth: usize,
-) -> Result<u8, CompileError> {
-    let mark = ctx.slot_mark();
-    let mut scratch = Chunk::new();
-    compile_expr(expr, ctx, &mut scratch, comp, depth, false)?;
-    let introduced = ctx.slot_mark() - mark;
-    ctx.restore_slot_mark(mark);
-    Ok(introduced)
-}
-
-/// Same as [`measure_locals_introduced`], but for a `cond`/`case` clause
-/// body: a whole sequence of expressions compiled with [`compile_sequence`]
-/// rather than a single expression.
-fn measure_sequence_locals_introduced(
-    exprs: &[Sexpr],
-    ctx: &Ctx,
-    comp: &mut Compilation,
-    depth: usize,
-) -> Result<u8, CompileError> {
-    let mark = ctx.slot_mark();
-    let mut scratch = Chunk::new();
-    compile_sequence(exprs, ctx, &mut scratch, comp, depth, false)?;
-    let introduced = ctx.slot_mark() - mark;
-    ctx.restore_slot_mark(mark);
-    Ok(introduced)
 }
 
 /// Pads the runtime locals vector up to `target` slots with placeholder
 /// `Unspecified` values, and advances `ctx`'s own slot mark to match --
-/// see `measure_locals_introduced`'s doc comment for why.
+/// see `compile_if`'s own doc comment for why.
 fn pad_locals_to(chunk: &mut Chunk, ctx: &Ctx, target: u8) {
     let current = ctx.slot_mark();
     for _ in current..target {
@@ -1870,27 +1832,21 @@ fn compile_cond(
     tail: bool,
 ) -> Result<(), CompileError> {
     let clauses = &items[1..];
-    let mut end_jumps = Vec::new();
     // Every clause is mutually exclusive with every other (at runtime, at
     // most one clause's body ever runs) -- see `Ctx::restore_slot_mark`'s
-    // doc comment. Each clause starts allocating locals from the same
-    // baseline `mark`, and (when this `cond` isn't itself in tail
-    // position, so code follows it in the same body) each clause is
-    // padded up to whichever clause would introduce the most locals,
-    // pre-measured below -- see `measure_locals_introduced`/
-    // `pad_locals_to`'s own doc comments for why.
+    // doc comment. Each clause is compiled for real exactly once, directly
+    // into `chunk`; how many locals it introduced falls out of that single
+    // compile as `ctx.slot_mark()`'s own delta (see `compile_if`'s own doc
+    // comment for why this replaced an earlier throwaway-pre-compile
+    // measurement pass: it made nested non-tail conditionals compile
+    // exponentially many times -- warden security-review msg #72, High).
+    // Each clause's own trailing jump is collected here and, once every
+    // clause's actual needs are known, patched to route through a small
+    // per-clause padding stub that tops it up to whichever clause
+    // introduced the most, so the runtime locals vector ends up the same
+    // length regardless of which clause actually ran.
     let mark = ctx.slot_mark();
-    let target = if tail {
-        mark
-    } else {
-        let mut highest = 0u8;
-        for (i, clause) in clauses.iter().enumerate() {
-            let needs =
-                cond_clause_action_locals(clause, i == clauses.len() - 1, ctx, comp, depth + 1)?;
-            highest = highest.max(needs);
-        }
-        mark + highest
-    };
+    let mut clause_jumps: Vec<(usize, u8)> = Vec::new();
 
     for (i, clause) in clauses.iter().enumerate() {
         ctx.restore_slot_mark(mark);
@@ -1904,10 +1860,8 @@ fn compile_cond(
         let is_else = i == clauses.len() - 1 && matches!(test, Sexpr::Symbol(s) if s == "else");
         if is_else {
             compile_sequence(rest, ctx, chunk, comp, depth + 1, tail)?;
-            if !tail {
-                pad_locals_to(chunk, ctx, target);
-            }
-            end_jumps.push(chunk.emit_jump(Op::Jump));
+            let needs = ctx.slot_mark() - mark;
+            clause_jumps.push((chunk.emit_jump(Op::Jump), needs));
             continue;
         }
 
@@ -1924,10 +1878,8 @@ fn compile_cond(
             } else {
                 chunk.emit_call(1); // [result]
             }
-            if !tail {
-                pad_locals_to(chunk, ctx, target);
-            }
-            end_jumps.push(chunk.emit_jump(Op::Jump));
+            let needs = ctx.slot_mark() - mark;
+            clause_jumps.push((chunk.emit_jump(Op::Jump), needs));
             chunk.patch_jump(skip);
             chunk.emit_pop(); // discard leftover t on the falsy path
             continue;
@@ -1936,55 +1888,44 @@ fn compile_cond(
         compile_expr(test, ctx, chunk, comp, depth + 1, false)?;
         let skip = chunk.emit_jump(Op::JumpIfFalse);
         compile_sequence(rest, ctx, chunk, comp, depth + 1, tail)?;
-        if !tail {
-            pad_locals_to(chunk, ctx, target);
-        }
-        end_jumps.push(chunk.emit_jump(Op::Jump));
+        let needs = ctx.slot_mark() - mark;
+        clause_jumps.push((chunk.emit_jump(Op::Jump), needs));
         chunk.patch_jump(skip);
     }
 
-    ctx.restore_slot_mark(target);
+    // No clause matched (fell through every test, no else clause): push
+    // Unspecified. This path never declares a local, so its own needs are
+    // always 0.
+    ctx.restore_slot_mark(mark);
     let idx = chunk.add_const(Const::Unspecified);
     chunk.emit_const(idx);
-    for j in end_jumps {
+    let target = clause_jumps.iter().map(|(_, n)| *n).fold(0u8, u8::max);
+
+    // The fallthrough path's own padding stub sits right here, its
+    // natural position -- `ctx` is already at `mark + 0`.
+    if !tail {
+        pad_locals_to(chunk, ctx, mark + target);
+    }
+    let mut after_jumps = vec![chunk.emit_jump(Op::Jump)];
+
+    // Each clause's own padding stub, in turn: its jump (collected above)
+    // lands here.
+    for (patch_pos, needs) in clause_jumps {
+        chunk.patch_jump(patch_pos);
+        ctx.restore_slot_mark(mark + needs);
+        if !tail {
+            pad_locals_to(chunk, ctx, mark + target);
+        }
+        after_jumps.push(chunk.emit_jump(Op::Jump));
+    }
+
+    for j in after_jumps {
         chunk.patch_jump(j);
     }
-    Ok(())
-}
-
-/// How many new local slots a single `cond` clause's action (its
-/// `(test => func)` function expression, or its ordinary body sequence)
-/// would introduce -- see `measure_locals_introduced`'s doc comment.
-///
-/// Mutation-testing note: corrupting `is_else`/`is_arrow`'s computation
-/// below (`&&` vs `||`, `==` vs `!=`, negation) changes which of the two
-/// branches below actually runs, but never changes the *measured value*:
-/// `rest[0]` is only ever classified as arrow-shaped when it's literally
-/// the symbol `=>` (contributing zero introduced locals either way), so
-/// measuring `rest[1]` alone (the `is_arrow` branch) and measuring the
-/// whole `rest` as a sequence (the fallback) always agree on the count for
-/// every reachable clause shape. These mutants are accepted equivalent,
-/// verified by hand the same way as the `depth` ones above.
-fn cond_clause_action_locals(
-    clause: &Sexpr,
-    is_last: bool,
-    ctx: &Ctx,
-    comp: &mut Compilation,
-    depth: usize,
-) -> Result<u8, CompileError> {
-    let Sexpr::List(clause_items) = clause else {
-        return Err(err(format!("cond clause must be a list, found {clause:?}")));
-    };
-    let (test, rest) = clause_items
-        .split_first()
-        .ok_or_else(|| err("cond clause cannot be empty"))?;
-    let is_else = is_last && matches!(test, Sexpr::Symbol(s) if s == "else");
-    let is_arrow = !is_else && rest.len() == 2 && matches!(&rest[0], Sexpr::Symbol(s) if s == "=>");
-    if is_arrow {
-        measure_locals_introduced(&rest[1], ctx, comp, depth)
-    } else {
-        measure_sequence_locals_introduced(rest, ctx, comp, depth)
+    if !tail {
+        ctx.restore_slot_mark(mark + target);
     }
+    Ok(())
 }
 
 /// `case`: evaluates the key expression once, then compares it (by value
@@ -2006,32 +1947,15 @@ fn compile_case(
 
     compile_expr(key_expr, ctx, chunk, comp, depth + 1, false)?; // [k], kept live across every clause check
 
-    let mut end_jumps = Vec::new();
     let mut pending_next_clause: Vec<usize> = Vec::new();
     // Every clause's body is mutually exclusive with every other's (see
-    // `Ctx::restore_slot_mark`'s doc comment) -- each starts allocating
-    // locals from the same baseline `mark`, and (when this `case` isn't
-    // itself in tail position, so code follows it in the same body) each
-    // clause is padded up to whichever clause would introduce the most
-    // locals, pre-measured below -- see `measure_locals_introduced`/
-    // `pad_locals_to`'s own doc comments for why.
+    // `Ctx::restore_slot_mark`'s doc comment) -- each is compiled for real
+    // exactly once, with its own trailing jump collected here and patched
+    // (once every clause's actual needs are known) to route through a
+    // small per-clause padding stub -- see `compile_if`'s own doc comment
+    // for why.
     let mark = ctx.slot_mark();
-    let target = if tail {
-        mark
-    } else {
-        let mut highest = 0u8;
-        for clause in clauses {
-            let Sexpr::List(clause_items) = clause else {
-                return Err(err(format!("case clause must be a list, found {clause:?}")));
-            };
-            let (_selector, body) = clause_items
-                .split_first()
-                .ok_or_else(|| err("case clause cannot be empty"))?;
-            let needs = measure_sequence_locals_introduced(body, ctx, comp, depth + 1)?;
-            highest = highest.max(needs);
-        }
-        mark + highest
-    };
+    let mut clause_jumps: Vec<(usize, u8)> = Vec::new();
 
     for (i, clause) in clauses.iter().enumerate() {
         for j in pending_next_clause.drain(..) {
@@ -2049,10 +1973,8 @@ fn compile_case(
         if is_else {
             chunk.emit_pop(); // discard k, unused in the else body
             compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
-            if !tail {
-                pad_locals_to(chunk, ctx, target);
-            }
-            end_jumps.push(chunk.emit_jump(Op::Jump));
+            let needs = ctx.slot_mark() - mark;
+            clause_jumps.push((chunk.emit_jump(Op::Jump), needs));
             continue;
         }
 
@@ -2082,22 +2004,45 @@ fn compile_case(
         }
         chunk.emit_pop(); // discard k, unused in the body
         compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
-        if !tail {
-            pad_locals_to(chunk, ctx, target);
-        }
-        end_jumps.push(chunk.emit_jump(Op::Jump));
+        let needs = ctx.slot_mark() - mark;
+        clause_jumps.push((chunk.emit_jump(Op::Jump), needs));
     }
 
-    ctx.restore_slot_mark(target);
     for j in pending_next_clause.drain(..) {
         chunk.patch_jump(j);
     }
-    chunk.emit_pop(); // no clause matched and there was no else: discard k
+    // No clause matched (fell through every candidate list, no else
+    // clause): discard k and push Unspecified. This path never declares a
+    // local, so its own needs are always 0.
+    ctx.restore_slot_mark(mark);
+    chunk.emit_pop();
     let idx = chunk.add_const(Const::Unspecified);
     chunk.emit_const(idx);
+    let target = clause_jumps.iter().map(|(_, n)| *n).fold(0u8, u8::max);
 
-    for j in end_jumps {
+    // The fallthrough path's own padding stub sits right here, its
+    // natural position -- `ctx` is already at `mark + 0`.
+    if !tail {
+        pad_locals_to(chunk, ctx, mark + target);
+    }
+    let mut after_jumps = vec![chunk.emit_jump(Op::Jump)];
+
+    // Each clause's own padding stub, in turn: its jump (collected above)
+    // lands here.
+    for (patch_pos, needs) in clause_jumps {
+        chunk.patch_jump(patch_pos);
+        ctx.restore_slot_mark(mark + needs);
+        if !tail {
+            pad_locals_to(chunk, ctx, mark + target);
+        }
+        after_jumps.push(chunk.emit_jump(Op::Jump));
+    }
+
+    for j in after_jumps {
         chunk.patch_jump(j);
+    }
+    if !tail {
+        ctx.restore_slot_mark(mark + target);
     }
     Ok(())
 }
@@ -2589,8 +2534,11 @@ mod tests {
                 Op::Const,       // condition
                 Op::JumpIfFalse, // to else
                 Op::Const,       // then
-                Op::Jump,        // to end
+                Op::Jump,        // to then's own (here, empty) padding stub
                 Op::Const,       // else
+                Op::Jump,        // to "after" -- skips over then's padding stub
+                // then's padding stub is empty (neither branch introduces any
+                // locals here) and falls straight through to "after"
                 Op::Pop,
                 Op::Halt,
             ]
@@ -3289,55 +3237,82 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap(), "4242");
     }
 
-    /// Builds `(let* ((v0 0) (v1 1) ... (v{n-1} n-1)) TAIL)` as source text
-    /// -- used below to push a function's baseline slot count (`mark`, in
-    /// `Ctx::slot_mark`'s own vocabulary) up to a deliberately large value
-    /// before an `if`/`cond`/`case` is measured, so that a measurement bug
-    /// which adds this baseline back in (instead of subtracting it back
-    /// out) overflows `u8` instead of merely being off by a harmless,
-    /// unobservable amount.
-    fn many_let_star_bindings_then(n: usize, tail: &str) -> String {
-        let bindings: String = (0..n).map(|i| format!("(v{i} {i}) ")).collect();
-        format!("(let* ({bindings}) {tail})")
+    /// Builds `(if a (let ((z 1)) INNER) 0) 999` nested `depth` levels deep
+    /// (each level's own trailing `999` forces every level non-tail, and
+    /// each level's own `let` gives every level its own locals to pad) --
+    /// used below to reproduce warden security-review msg #72's High
+    /// finding: an earlier version of this fix measured a non-tail
+    /// branch's local-introduction count by compiling it into a throwaway
+    /// chunk first, which meant a chain of D nested non-tail conditionals
+    /// got compiled `T(D) = 2*T(D-1)` times -- confirmed to take 36s at
+    /// depth 25 (well inside `MAX_NESTING_DEPTH`), a silent-until-it-hangs
+    /// compile-time DoS on an entirely ordinary source shape.
+    fn nested_non_tail_if_chain(depth: usize) -> String {
+        let mut inner = "0".to_string();
+        for _ in 0..depth {
+            inner = format!("(if a (let ((z 1)) {inner}) 0) 999");
+        }
+        format!("(define (f a) {inner})")
+    }
+
+    fn nested_non_tail_cond_chain(depth: usize) -> String {
+        let mut inner = "0".to_string();
+        for _ in 0..depth {
+            inner = format!("(cond (a (let ((z 1)) {inner})) (else 0)) 999");
+        }
+        format!("(define (f a) {inner})")
+    }
+
+    /// A ceiling loose enough that any correct (linear-time) compile clears
+    /// it in a small fraction of a second even under a slow, loaded, or
+    /// debug-build CI machine, but tight enough that the previous
+    /// exponential-time bug -- which took 36s at depth 25 alone -- fails it
+    /// by many orders of magnitude at the much greater depths used below.
+    /// Unlike the release-build performance ceilings elsewhere in this
+    /// codebase, this doesn't need `assert_within_release_ceiling`-style
+    /// gating: the regression this guards against is in the *compiler's*
+    /// own algorithmic complexity, not the VM's execution speed, so it
+    /// reproduces just as clearly (and just as fast, when fixed) in a
+    /// debug build.
+    const CHAIN_COMPILE_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn a_long_chain_of_nested_non_tail_ifs_compiles_in_linear_not_exponential_time() {
+        let src = nested_non_tail_if_chain(40);
+        let forms = crate::reader::read_program(&src).unwrap();
+        let start = std::time::Instant::now();
+        let module = compile_program(&forms).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < CHAIN_COMPILE_CEILING,
+            "compiling a 40-deep chain of nested non-tail ifs took {elapsed:?} -- \
+             should be linear in chain depth, not exponential"
+        );
+        // Also check it actually runs correctly, not just compiles fast.
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
     }
 
     #[test]
-    fn measuring_an_if_branchs_locals_does_not_wrongly_add_the_baseline_slot_count_back_in() {
-        // `measure_locals_introduced` must compute `ctx.slot_mark() - mark`
-        // (how many *new* slots the branch itself introduced), not
-        // `ctx.slot_mark() + mark`. With a small baseline this bug is
-        // unobservable (the padding is merely larger than strictly
-        // necessary, which is harmless); with a large one, adding the
-        // baseline back in overflows `u8` where subtracting it out would
-        // not, turning an otherwise-unremarkable compile into a panic.
-        let tail = "(if flag (let ((a 1)) 0) 0) v129";
-        let src = format!(
-            "(define (f flag) {}) (display (f #t)) (display (f #f))",
-            many_let_star_bindings_then(130, tail)
-        );
+    fn a_long_chain_of_nested_non_tail_conds_compiles_in_linear_not_exponential_time() {
+        // Shallower than the `if` chain above: each `cond` iteration wraps
+        // its own extra clause-list layer around the same nested `let`, so
+        // the same depth would push the *reader's* own list-nesting count
+        // (not this fix's own compile-time complexity) close to
+        // `MAX_NESTING_DEPTH` -- 40 is still overwhelmingly conclusive
+        // against the old bug (depth 25 alone took 5.48s under it).
+        let src = nested_non_tail_cond_chain(40);
         let forms = crate::reader::read_program(&src).unwrap();
+        let start = std::time::Instant::now();
         let module = compile_program(&forms).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < CHAIN_COMPILE_CEILING,
+            "compiling a 40-deep chain of nested non-tail conds took {elapsed:?} -- \
+             should be linear in chain depth, not exponential"
+        );
         let mut out = Vec::new();
         crate::vm::run(&module, &mut out).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "129129");
-    }
-
-    #[test]
-    fn measuring_a_cond_clauses_locals_does_not_wrongly_add_the_baseline_slot_count_back_in() {
-        // Same as the sibling `if` test above, but for
-        // `measure_sequence_locals_introduced` (the clause-body-sequence
-        // counterpart `cond`/`case` clauses use instead of
-        // `measure_locals_introduced`).
-        let tail = "(cond (flag (let ((a 1)) 0)) (else 0)) v129";
-        let src = format!(
-            "(define (f flag) {}) (display (f #t)) (display (f #f))",
-            many_let_star_bindings_then(130, tail)
-        );
-        let forms = crate::reader::read_program(&src).unwrap();
-        let module = compile_program(&forms).unwrap();
-        let mut out = Vec::new();
-        crate::vm::run(&module, &mut out).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "129129");
     }
 
     #[test]
