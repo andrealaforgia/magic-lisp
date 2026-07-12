@@ -259,3 +259,12 @@ used to live there have been relocated here (TRACE1).
 - [E4](EX1/E4.md) -- the documented run instructions are self-sufficient for a new, unaided user
 - [E5](EX1/E5.md) -- integration: the documented pipeline round-trips a real file end to end, now via a real BDD run
 
+
+## TRACE1
+
+- [E1](TRACE1/E1.md) -- a durable, committed folder holds one record per expectation, for every behaviour
+- [E2](TRACE1/E2.md) -- each record carries that expectation's evidence in full
+- [E3](TRACE1/E3.md) -- each record references the specific .feature file and scenario that crystallises it
+- [E4](TRACE1/E4.md) -- the .feature files' inline evidence comments are cleaned out, scenarios unchanged
+- [E5](TRACE1/E5.md) -- the migration is complete and lossless
+- [E6](TRACE1/E6.md) -- integration: the traceability system is navigable and the BDD suites still execute
