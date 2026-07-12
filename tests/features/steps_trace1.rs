@@ -9,6 +9,16 @@
 //! here as a standing regression guard rather than staying a one-time
 //! manual audit.
 //!
+//! qa test-design review msg #92 (still-below-floor follow-up) drove three
+//! further fixes, kept in mind below: E5 must call E1's/E2's own check
+//! functions rather than reimplementing them (no triplicated logic); E4's
+//! Then-clause claims scenario *content*, not just count, is unchanged, so
+//! its check does a real line-for-line diff against the reconstructed
+//! post-migration expectation, not just a count comparison; and no step
+//! below repurposes a `World` field for something its name doesn't
+//! describe (`notes: Vec<String>` -- a flat list of problem descriptions,
+//! empty meaning pass -- covers every need here).
+//!
 //! The traceability store's own scope is exactly the 25 files that were
 //! actually migrated (B1-B23, EX1, DOC1) -- TRACE1-traceability-store.feature
 //! itself is a later, deliberately-exempted addition (its own evidence is
@@ -28,8 +38,10 @@ use super::registry::Registry;
 /// in the `.feature` files themselves, used below as the fixed historical
 /// reference point for byte-for-byte fidelity checks. Trunk-based history
 /// never rewrites a pushed commit, so this reference is as durable as the
-/// repository itself.
-const MIGRATION_COMMIT: &str = "84f14a9";
+/// repository itself. Full 40-character SHA, not the short form, so this
+/// reference can never become ambiguous as the repository grows (qa
+/// test-design review msg #92).
+const MIGRATION_COMMIT: &str = "84f14a9d50c51feb9293e08aa0e62d8d89e9e025";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -67,11 +79,15 @@ fn behaviour_id_from_path(path: &Path) -> String {
     stem.split('-').next().unwrap().to_string()
 }
 
-/// One `Scenario: E<n> — <title>` block's raw lines, from its own header
-/// up to (not including) the next scenario or end of file.
+/// One `Scenario: E<n> — <title>` block's raw lines, from its own header up
+/// to (not including) the next scenario or end of file, plus where that
+/// range starts within the whole file it was parsed from (used to
+/// reconstruct the file with its evidence block removed, for E4's content
+/// diff).
 struct ScenarioBlock {
     expectation: String,
     title: String,
+    abs_start: usize,
     lines: Vec<String>,
 }
 
@@ -97,32 +113,41 @@ fn parse_scenarios(content: &str) -> Vec<ScenarioBlock> {
         blocks.push(ScenarioBlock {
             expectation: exp.clone(),
             title: title.clone(),
+            abs_start: *start,
             lines: lines[*start..end].iter().map(|s| s.to_string()).collect(),
         });
     }
     blocks
 }
 
-/// Extracts and normalizes a scenario block's "# Evidence[:( ]..." comment
-/// block (both the plain-colon and parenthetical-suffix forms this corpus
-/// uses), mirroring exactly the extraction the original migration used:
-/// collect the evidence line and every immediately-following comment line
-/// until a blank line or non-comment line, then strip each line's leading
-/// whitespace, its `#` marker, and one further leading space if present.
-fn extract_evidence(block: &ScenarioBlock) -> Option<String> {
+/// The block-relative (start, end) line-index range of this block's
+/// "# Evidence[:( ]..." comment (both the plain-colon and
+/// parenthetical-suffix forms this corpus uses): the evidence line itself
+/// and every immediately-following comment line, until a blank line or a
+/// non-comment line.
+fn evidence_line_range(block: &ScenarioBlock) -> Option<(usize, usize)> {
     let start = block.lines.iter().position(|l| {
         let s = l.trim_start();
         s.starts_with("# Evidence:") || s.starts_with("# Evidence")
     })?;
-    let mut collected = Vec::new();
+    let mut end = start;
     for line in &block.lines[start..] {
         let s = line.trim_start();
         if s.is_empty() || !s.starts_with('#') {
             break;
         }
-        collected.push(line.as_str());
+        end += 1;
     }
-    let normalized: Vec<String> = collected
+    Some((start, end))
+}
+
+/// Extracts and normalizes a scenario block's evidence text: strips each
+/// line's leading whitespace, its `#` marker, and one further leading
+/// space if present -- mirroring exactly the extraction the original
+/// migration used.
+fn extract_evidence(block: &ScenarioBlock) -> Option<String> {
+    let (start, end) = evidence_line_range(block)?;
+    let normalized: Vec<String> = block.lines[start..end]
         .iter()
         .map(|raw| {
             let s = raw.trim_start_matches(' ');
@@ -135,6 +160,29 @@ fn extract_evidence(block: &ScenarioBlock) -> Option<String> {
         })
         .collect();
     Some(normalized.join("\n"))
+}
+
+/// Reconstructs what `historical_content` should look like once every
+/// scenario's evidence comment block is removed -- i.e. exactly what the
+/// migration was supposed to produce -- so it can be compared line-for-line
+/// against a file's actual current content (E4's real content diff, not
+/// just a scenario count).
+fn strip_evidence_blocks(historical_content: &str) -> String {
+    let lines: Vec<&str> = historical_content.split('\n').collect();
+    let mut removed = vec![false; lines.len()];
+    for block in parse_scenarios(historical_content) {
+        if let Some((start, end)) = evidence_line_range(&block) {
+            let range = (block.abs_start + start)..(block.abs_start + end);
+            removed[range].fill(true);
+        }
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !removed[*i])
+        .map(|(_, l)| *l)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `git show <rev>:<path>` from the repo root, as raw bytes decoded lossily
@@ -171,8 +219,10 @@ fn historical_scenarios() -> Vec<(String, ScenarioBlock)> {
     out
 }
 
-/// Reads a traceability record's evidence body (the text inside its ```
-/// fenced block), and its declared feature-file/scenario references.
+/// Reads a traceability record's evidence body (the text inside its
+/// fenced block -- possibly longer than 3 backticks, if the evidence
+/// itself contains an embedded backtick run), and its declared
+/// feature-file/scenario references.
 struct Record {
     feature_file: String,
     scenario: String,
@@ -192,12 +242,6 @@ fn read_record(path: &Path) -> Record {
         .find_map(|l| l.strip_prefix("**Scenario:** "))
         .expect("record should have a Scenario reference")
         .to_string();
-    // The fence may be longer than 3 backticks if the evidence text itself
-    // contains an embedded run of backticks (e.g. EX1 E4's evidence
-    // literally says "...parses the ```sh block..."), per CommonMark's own
-    // rule that a fence must be longer than any backtick run it encloses --
-    // so find the opening fence line's exact length and match a closing
-    // line of the same length, rather than assuming exactly 3.
     let lines: Vec<&str> = content.lines().collect();
     let open_idx = lines
         .iter()
@@ -232,25 +276,130 @@ fn all_records() -> Vec<PathBuf> {
     out
 }
 
+// --- Shared checks (E5 calls these directly rather than reimplementing
+// them -- qa test-design review msg #92). Each returns a flat list of
+// problem descriptions; empty means the check passed. ---
+
+/// E1's check: every historical (behaviour, expectation) has a
+/// corresponding traceability record.
+fn check_completeness() -> Vec<String> {
+    let mut missing = Vec::new();
+    for (behaviour, block) in historical_scenarios() {
+        let record_path = traceability_dir()
+            .join(&behaviour)
+            .join(format!("{}.md", block.expectation));
+        if !record_path.is_file() {
+            missing.push(format!(
+                "{behaviour} {}: {}",
+                block.expectation, block.title
+            ));
+        }
+    }
+    missing
+}
+
+/// E2's check: every given record's evidence matches its pre-migration
+/// comment byte-for-byte.
+fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
+    let historical = historical_scenarios();
+    let mut mismatches = Vec::new();
+    for record_path in record_paths {
+        let record = read_record(record_path);
+        let behaviour = record_path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let expectation = record_path.file_stem().unwrap().to_str().unwrap();
+        let Some((_, block)) = historical
+            .iter()
+            .find(|(b, blk)| b == behaviour && blk.expectation == expectation)
+        else {
+            mismatches.push(format!(
+                "{behaviour} {expectation}: no historical scenario found"
+            ));
+            continue;
+        };
+        let expected = extract_evidence(block).unwrap_or_default();
+        if record.evidence != expected {
+            mismatches.push(format!("{behaviour} {expectation}: evidence text differs"));
+        }
+    }
+    mismatches
+}
+
+/// E3's check: every record's declared feature-file/scenario reference
+/// resolves to a real scenario in the current tree.
+fn check_resolution() -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for record_path in all_records() {
+        let record = read_record(&record_path);
+        let feature_path = repo_root().join(&record.feature_file);
+        let content = std::fs::read_to_string(&feature_path).unwrap_or_default();
+        let needle = format!("  Scenario: {}", record.scenario);
+        if !content.contains(&needle) {
+            unresolved.push(format!(
+                "{}: {} not found in {}",
+                record_path.display(),
+                record.scenario,
+                record.feature_file
+            ));
+        }
+    }
+    unresolved
+}
+
+/// E4's check, part 1: no "# Evidence" marker remains in any migrated
+/// file.
+fn check_no_leftover_markers() -> Vec<String> {
+    let mut leftover = Vec::new();
+    for path in migrated_feature_files() {
+        let content = std::fs::read_to_string(&path).unwrap();
+        if content.contains("# Evidence") {
+            leftover.push(path.display().to_string());
+        }
+    }
+    leftover
+}
+
+/// E4's check, part 2: every migrated file's *content* -- not just its
+/// scenario count -- matches its pre-migration content with the evidence
+/// blocks removed, exactly. A real line-for-line diff, per qa test-design
+/// review msg #92 (the Then-clause claims content, not just count, is
+/// unchanged).
+fn check_content_unchanged() -> Vec<String> {
+    let mut problems = Vec::new();
+    for path in migrated_feature_files() {
+        let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
+        let historical = git_show(&format!("{MIGRATION_COMMIT}^:{rel}"));
+        let expected = strip_evidence_blocks(&historical);
+        let actual = std::fs::read_to_string(&path).unwrap();
+        // Both sides come from files that end in a trailing newline;
+        // comparing line-by-line rather than the raw strings avoids a
+        // spurious mismatch from that single trailing empty element.
+        let expected_lines: Vec<&str> = expected.lines().collect();
+        let actual_lines: Vec<&str> = actual.lines().collect();
+        if expected_lines != actual_lines {
+            problems.push(format!(
+                "{rel}: content differs from the migration's own expectation"
+            ));
+        }
+    }
+    problems
+}
+
 pub(crate) fn registry() -> Registry {
     Registry::new()
-        // --- E1: completeness -- every historical (behaviour, expectation)
-        // has a corresponding record. ---
+        // --- E1: completeness. ---
         .step("the repository's traceability folder", |_w, _text, _| {
             // purely descriptive; the When step below does the real work
         })
         .step(
             "it is checked against every delivered behaviour",
             |w, _text, _| {
-                let mut missing = Vec::new();
-                for (behaviour, block) in historical_scenarios() {
-                    let record_path =
-                        traceability_dir().join(&behaviour).join(format!("{}.md", block.expectation));
-                    if !record_path.is_file() {
-                        missing.push(format!("{behaviour} {}: {}", block.expectation, block.title));
-                    }
-                }
-                w.notes = missing;
+                w.notes = check_completeness();
             },
         )
         .step(
@@ -263,8 +412,8 @@ pub(crate) fn registry() -> Registry {
                 );
             },
         )
-        // --- E2: fidelity -- a record's evidence matches the pre-migration
-        // comment byte-for-byte. ---
+        // --- E2: fidelity (a sample -- every record, since the store is
+        // small enough that "a sample" and "all of them" cost the same). ---
         .step("a record in the traceability store", |w, _text, _| {
             w.notes = all_records()
                 .iter()
@@ -274,33 +423,9 @@ pub(crate) fn registry() -> Registry {
         .step(
             "its evidence is compared against what the .feature file's comment used to say",
             |w, _text, _| {
-                let historical = historical_scenarios();
-                let record_paths = std::mem::take(&mut w.notes);
-                let mut mismatches = Vec::new();
-                for record_path_str in &record_paths {
-                    let record_path = PathBuf::from(record_path_str);
-                    let record = read_record(&record_path);
-                    let behaviour = record_path
-                        .parent()
-                        .unwrap()
-                        .file_name()
-                        .unwrap()
-                        .to_str()
-                        .unwrap();
-                    let expectation = record_path.file_stem().unwrap().to_str().unwrap();
-                    let Some((_, block)) = historical
-                        .iter()
-                        .find(|(b, blk)| b == behaviour && blk.expectation == expectation)
-                    else {
-                        mismatches.push(format!("{behaviour} {expectation}: no historical scenario found"));
-                        continue;
-                    };
-                    let expected = extract_evidence(block).unwrap_or_default();
-                    if record.evidence != expected {
-                        mismatches.push(format!("{behaviour} {expectation}: evidence text differs"));
-                    }
-                }
-                w.notes = mismatches;
+                let record_paths: Vec<PathBuf> =
+                    std::mem::take(&mut w.notes).into_iter().map(PathBuf::from).collect();
+                w.notes = check_fidelity(&record_paths);
             },
         )
         .step(
@@ -313,22 +438,7 @@ pub(crate) fn registry() -> Registry {
         .step(
             "its \"Feature file\" and \"Scenario\" reference is followed",
             |w, _text, _| {
-                let mut unresolved = Vec::new();
-                for record_path in all_records() {
-                    let record = read_record(&record_path);
-                    let feature_path = repo_root().join(&record.feature_file);
-                    let content = std::fs::read_to_string(&feature_path).unwrap_or_default();
-                    let needle = format!("  Scenario: {}", record.scenario);
-                    if !content.contains(&needle) {
-                        unresolved.push(format!(
-                            "{}: {} not found in {}",
-                            record_path.display(),
-                            record.scenario,
-                            record.feature_file
-                        ));
-                    }
-                }
-                w.notes = unresolved;
+                w.notes = check_resolution();
             },
         )
         .step(
@@ -337,68 +447,37 @@ pub(crate) fn registry() -> Registry {
                 assert!(w.notes.is_empty(), "unresolved references: {:?}", w.notes);
             },
         )
-        // --- E4: no evidence markers remain in the migrated files, and
-        // their scenario count is unchanged. ---
+        // --- E4: no evidence markers remain, and content (not just count)
+        // is otherwise unchanged. ---
         .step("every features/*.feature file after migration", |_w, _text, _| {})
         .step(
             "it is checked for leftover evidence comments and for scenario count",
             |w, _text, _| {
-                let mut leftover = Vec::new();
-                let mut current_count = 0usize;
-                for path in migrated_feature_files() {
-                    let content = std::fs::read_to_string(&path).unwrap();
-                    if content.contains("# Evidence") {
-                        leftover.push(path.display().to_string());
-                    }
-                    current_count += parse_scenarios(&content).len();
-                }
-                let historical_count = historical_scenarios().len();
-                w.notes = leftover;
-                w.rss_pairs = vec![(current_count as u64, historical_count as u64)];
+                let mut problems = check_no_leftover_markers();
+                problems.extend(check_content_unchanged());
+                w.notes = problems;
             },
         )
         .step(
             "no \"# Evidence\" marker remains anywhere in features/, and the Given/When/Then content and scenario count are unchanged from before the migration",
             |w, _text, _| {
-                assert!(
-                    w.notes.is_empty(),
-                    "leftover evidence markers in: {:?}",
-                    w.notes
-                );
-                let (current, historical) = w.rss_pairs[0];
-                assert_eq!(
-                    current, historical,
-                    "scenario count changed across the migration"
-                );
+                assert!(w.notes.is_empty(), "problems found: {:?}", w.notes);
             },
         )
         // --- E5: complete-and-lossless, restated over the full set (not a
-        // sample) -- same underlying checks as E1 (completeness) + E2
-        // (fidelity), run together here. ---
+        // sample) -- calls E1's and E2's own check functions directly
+        // rather than reimplementing them (qa test-design review msg #92). ---
         .step(
             "every expectation that had evidence before the migration",
             |_w, _text, _| {
-                // purely descriptive; the When step below recomputes the
-                // historical set itself
+                // purely descriptive; the When step below calls the shared
+                // checks, which recompute the historical set themselves
             },
         )
         .step("the store is checked against that original set", |w, _text, _| {
-            let historical = historical_scenarios();
-            let mut problems = Vec::new();
-            for (behaviour, block) in &historical {
-                let record_path = traceability_dir()
-                    .join(behaviour)
-                    .join(format!("{}.md", block.expectation));
-                if !record_path.is_file() {
-                    problems.push(format!("{behaviour} {}: missing", block.expectation));
-                    continue;
-                }
-                let record = read_record(&record_path);
-                let expected = extract_evidence(block).unwrap_or_default();
-                if record.evidence != expected {
-                    problems.push(format!("{behaviour} {}: content differs", block.expectation));
-                }
-            }
+            let mut problems = check_completeness();
+            let all: Vec<PathBuf> = all_records();
+            problems.extend(check_fidelity(&all));
             w.notes = problems;
         })
         .step(
@@ -407,9 +486,9 @@ pub(crate) fn registry() -> Registry {
                 assert!(w.notes.is_empty(), "lossless-migration problems: {:?}", w.notes);
             },
         )
-        // --- E6: integration -- completeness + resolution together. Does
-        // NOT recursively invoke `cargo test` (an established anti-pattern
-        // in this suite -- see B21's own soak-test precedent): this step
+        // --- E6: integration -- every shared check together. Does NOT
+        // recursively invoke `cargo test` (an established anti-pattern in
+        // this suite -- see B21's own soak-test precedent): this step
         // itself only runs as part of `cargo test --release --test
         // features`, so its own passing, alongside every other registered
         // scenario in the same run, already demonstrates the full suite
@@ -421,49 +500,16 @@ pub(crate) fn registry() -> Registry {
         .step(
             "a representative cross-section is followed from record to scenario, and the full BDD suite is re-run",
             |w, _text, _| {
-                let mut missing = Vec::new();
-                for (behaviour, block) in historical_scenarios() {
-                    let record_path =
-                        traceability_dir().join(&behaviour).join(format!("{}.md", block.expectation));
-                    if !record_path.is_file() {
-                        missing.push(format!("{behaviour} {}: {}", block.expectation, block.title));
-                    }
-                }
-                let mut unresolved = Vec::new();
-                for record_path in all_records() {
-                    let record = read_record(&record_path);
-                    let feature_path = repo_root().join(&record.feature_file);
-                    let content = std::fs::read_to_string(&feature_path).unwrap_or_default();
-                    let needle = format!("  Scenario: {}", record.scenario);
-                    if !content.contains(&needle) {
-                        unresolved.push(format!("{}: {}", record_path.display(), record.scenario));
-                    }
-                }
-                let mut leftover = Vec::new();
-                for path in migrated_feature_files() {
-                    let content = std::fs::read_to_string(&path).unwrap();
-                    if content.contains("# Evidence") {
-                        leftover.push(path.display().to_string());
-                    }
-                }
-                w.notes = missing;
-                w.pending_commands = vec![unresolved, leftover];
+                let mut problems = check_completeness();
+                problems.extend(check_resolution());
+                problems.extend(check_no_leftover_markers());
+                w.notes = problems;
             },
         )
         .step(
             "every followed reference resolves correctly and the full feature-scenario suite still executes green with no evidence comments left behind",
             |w, _text, _| {
-                assert!(w.notes.is_empty(), "missing records: {:?}", w.notes);
-                assert!(
-                    w.pending_commands[0].is_empty(),
-                    "unresolved references: {:?}",
-                    w.pending_commands[0]
-                );
-                assert!(
-                    w.pending_commands[1].is_empty(),
-                    "leftover evidence markers in: {:?}",
-                    w.pending_commands[1]
-                );
+                assert!(w.notes.is_empty(), "problems found: {:?}", w.notes);
             },
         )
 }
