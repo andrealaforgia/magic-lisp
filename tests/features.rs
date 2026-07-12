@@ -61,6 +61,8 @@ mod steps_b8;
 mod steps_b9;
 #[path = "features/steps_ex1.rs"]
 mod steps_ex1;
+#[path = "features/steps_trace1.rs"]
+mod steps_trace1;
 
 #[test]
 fn b1_walking_skeleton() {
@@ -235,4 +237,10 @@ fn b23_dotted_list_round_trip() {
 fn ex1_huffman_example() {
     let src = include_str!("../features/EX1-huffman-example.feature");
     registry::run_feature("EX1-huffman-example", src, &steps_ex1::registry());
+}
+
+#[test]
+fn trace1_traceability_store() {
+    let src = include_str!("../features/TRACE1-traceability-store.feature");
+    registry::run_feature("TRACE1-traceability-store", src, &steps_trace1::registry());
 }
