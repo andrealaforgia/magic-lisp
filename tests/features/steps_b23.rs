@@ -234,7 +234,7 @@ pub(crate) fn registry() -> Registry {
         .step(
             "the long dotted list runs correctly end to end and the pathologically-nested artifact is still rejected with exit code 66 -- the fix restores the round-trip guarantee without opening a hole in the malformed-input safety net",
             |w, _text, _| {
-                let dotted_list_run = &w.outputs[0];
+                let dotted_list_run = w.last_output();
                 assert_eq!(dotted_list_run.status.code(), Some(SUCCESS));
                 assert_eq!(
                     stdout_of(dotted_list_run),
