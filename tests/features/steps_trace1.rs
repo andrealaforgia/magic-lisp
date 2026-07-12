@@ -19,29 +19,33 @@
 //! describe (`notes: Vec<String>` -- a flat list of problem descriptions,
 //! empty meaning pass -- covers every need here).
 //!
-//! The traceability store's own scope is exactly the 25 files that were
-//! actually migrated (B1-B23, EX1, DOC1) -- TRACE1-traceability-store.feature
-//! itself is a later, deliberately-exempted addition (its own evidence is
-//! folded inline, the same self-disclosed-exception shape DOC1 used for
-//! non-automation), so it's excluded from the "no evidence marker
-//! remains"/"178 scenarios" checks below, which are about the migration,
-//! not a blanket ban on this directory ever having an evidence comment.
+//! The traceability store's scope is now every committed `.feature` file
+//! without exception, TRACE1-traceability-store.feature included --
+//! initially exempted (its own evidence was folded inline, the same
+//! self-disclosed-exception shape DOC1 used for non-automation), it was
+//! migrated into the store in its turn (examiner expectation TRACE1 E1-E6,
+//! second round), closing that last gap.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::registry::Registry;
 
-/// The commit that removed every migrated file's inline evidence comments
+/// The commit that removed the original 25 files' inline evidence comments
 /// (`TRACE1: migrate every scenario's evidence into a durable traceability
 /// store`) -- its parent is the last commit where that evidence still lived
-/// in the `.feature` files themselves, used below as the fixed historical
-/// reference point for byte-for-byte fidelity checks. Trunk-based history
-/// never rewrites a pushed commit, so this reference is as durable as the
-/// repository itself. Full 40-character SHA, not the short form, so this
-/// reference can never become ambiguous as the repository grows (qa
-/// test-design review msg #92).
+/// in those `.feature` files themselves. Full 40-character SHA, not the
+/// short form, so this reference can never become ambiguous as the
+/// repository grows (qa test-design review msg #92).
 const MIGRATION_COMMIT: &str = "84f14a9d50c51feb9293e08aa0e62d8d89e9e025";
+
+/// The commit that removed TRACE1-traceability-store.feature's *own*
+/// inline evidence comments (`TRACE1: migrate its own evidence into the
+/// store, closing the last gap`) -- this file didn't exist yet at
+/// `MIGRATION_COMMIT`, so it needs its own, later historical reference
+/// point. Trunk-based history never rewrites a pushed commit, so both
+/// references are as durable as the repository itself.
+const TRACE1_MIGRATION_COMMIT: &str = "0e48260e67ebab2ccf2032202dfe2c59867ac1a2";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -55,17 +59,25 @@ fn traceability_dir() -> PathBuf {
     repo_root().join("traceability")
 }
 
-/// Every `.feature` file that was actually part of the TRACE1 migration --
-/// i.e. every one except TRACE1-traceability-store.feature itself, which
-/// didn't exist at migration time and was never a migration target.
+/// The commit whose parent last had `path`'s evidence still inline --
+/// every migrated file uses `MIGRATION_COMMIT` except
+/// TRACE1-traceability-store.feature, which was migrated separately and
+/// later (see `TRACE1_MIGRATION_COMMIT`'s own doc comment).
+fn migration_commit_for(path: &Path) -> &'static str {
+    if path.file_name().and_then(|n| n.to_str()) == Some("TRACE1-traceability-store.feature") {
+        TRACE1_MIGRATION_COMMIT
+    } else {
+        MIGRATION_COMMIT
+    }
+}
+
+/// Every `.feature` file that's part of the traceability store's coverage
+/// -- now the whole `features/` directory, with no exceptions.
 fn migrated_feature_files() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(features_dir()).expect("features/ should exist") {
         let path = entry.expect("dir entry should be readable").path();
         if path.extension().and_then(|e| e.to_str()) != Some("feature") {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str()) == Some("TRACE1-traceability-store.feature") {
             continue;
         }
         out.push(path);
@@ -211,7 +223,8 @@ fn historical_scenarios() -> Vec<(String, ScenarioBlock)> {
     for path in migrated_feature_files() {
         let behaviour = behaviour_id_from_path(&path);
         let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
-        let content = git_show(&format!("{MIGRATION_COMMIT}^:{rel}"));
+        let commit = migration_commit_for(&path);
+        let content = git_show(&format!("{commit}^:{rel}"));
         for block in parse_scenarios(&content) {
             out.push((behaviour.clone(), block));
         }
@@ -357,7 +370,16 @@ fn check_no_leftover_markers() -> Vec<String> {
     let mut leftover = Vec::new();
     for path in migrated_feature_files() {
         let content = std::fs::read_to_string(&path).unwrap();
-        if content.contains("# Evidence") {
+        // A genuine comment line, trimmed and starting with "# Evidence" --
+        // not a bare substring search, which would false-positive on
+        // TRACE1-traceability-store.feature's own Then-clause prose ("no
+        // \"# Evidence\" marker remains..."), a literal mention of the
+        // marker text that is itself part of what's being described, not
+        // a leftover comment.
+        let has_marker = content
+            .lines()
+            .any(|l| l.trim_start().starts_with("# Evidence"));
+        if has_marker {
             leftover.push(path.display().to_string());
         }
     }
@@ -373,7 +395,8 @@ fn check_content_unchanged() -> Vec<String> {
     let mut problems = Vec::new();
     for path in migrated_feature_files() {
         let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
-        let historical = git_show(&format!("{MIGRATION_COMMIT}^:{rel}"));
+        let commit = migration_commit_for(&path);
+        let historical = git_show(&format!("{commit}^:{rel}"));
         let expected = strip_evidence_blocks(&historical);
         let actual = std::fs::read_to_string(&path).unwrap();
         // Both sides come from files that end in a trailing newline;
