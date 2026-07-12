@@ -2004,7 +2004,7 @@ fn compile_case(
         }
         chunk.emit_pop(); // discard k, unused in the body
         compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
-        let needs = ctx.slot_mark() - mark;
+        let needs = ctx.slot_mark();
         clause_jumps.push((chunk.emit_jump(Op::Jump), needs));
     }
 
@@ -3239,20 +3239,28 @@ mod tests {
 
     /// Builds `(if a (let ((z 1)) INNER) 0) 999` nested `depth` levels deep
     /// (each level's own trailing `999` forces every level non-tail, and
-    /// each level's own `let` gives every level its own locals to pad) --
-    /// used below to reproduce warden security-review msg #72's High
-    /// finding: an earlier version of this fix measured a non-tail
-    /// branch's local-introduction count by compiling it into a throwaway
-    /// chunk first, which meant a chain of D nested non-tail conditionals
-    /// got compiled `T(D) = 2*T(D-1)` times -- confirmed to take 36s at
-    /// depth 25 (well inside `MAX_NESTING_DEPTH`), a silent-until-it-hangs
-    /// compile-time DoS on an entirely ordinary source shape.
+    /// each level's own `let` gives every level its own locals to pad),
+    /// followed by two calls to `f` -- one taking the `then` branch at
+    /// every level, one taking `else` at every level -- so the padding
+    /// logic under test is actually *executed*, not just compiled. Used
+    /// below to reproduce warden security-review msg #72's High finding:
+    /// an earlier version of this fix measured a non-tail branch's
+    /// local-introduction count by compiling it into a throwaway chunk
+    /// first, which meant a chain of D nested non-tail conditionals got
+    /// compiled `T(D) = 2*T(D-1)` times -- confirmed to take 36s at depth
+    /// 25 (well inside `MAX_NESTING_DEPTH`), a silent-until-it-hangs
+    /// compile-time DoS on an entirely ordinary source shape. Every
+    /// level's own `if`/`cond` result is discarded (each is a non-tail
+    /// statement, not the body's last expression), so `f` always returns
+    /// the trailing `999` regardless of `a` or depth -- a wrong padding
+    /// computation at any level surfaces as a runtime "local slot out of
+    /// range" error, not a silently-wrong return value.
     fn nested_non_tail_if_chain(depth: usize) -> String {
         let mut inner = "0".to_string();
         for _ in 0..depth {
             inner = format!("(if a (let ((z 1)) {inner}) 0) 999");
         }
-        format!("(define (f a) {inner})")
+        format!("(define (f a) {inner}) (display (f #t)) (display (f #f))")
     }
 
     fn nested_non_tail_cond_chain(depth: usize) -> String {
@@ -3260,7 +3268,7 @@ mod tests {
         for _ in 0..depth {
             inner = format!("(cond (a (let ((z 1)) {inner})) (else 0)) 999");
         }
-        format!("(define (f a) {inner})")
+        format!("(define (f a) {inner}) (display (f #t)) (display (f #f))")
     }
 
     /// A ceiling loose enough that any correct (linear-time) compile clears
@@ -3288,9 +3296,12 @@ mod tests {
             "compiling a 40-deep chain of nested non-tail ifs took {elapsed:?} -- \
              should be linear in chain depth, not exponential"
         );
-        // Also check it actually runs correctly, not just compiles fast.
+        // Also check it actually runs correctly, not just compiles fast --
+        // a wrong padding computation at any nesting level would surface
+        // here as a runtime "local slot out of range" error instead.
         let mut out = Vec::new();
         crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "999999");
     }
 
     #[test]
@@ -3313,6 +3324,53 @@ mod tests {
         );
         let mut out = Vec::new();
         crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "999999");
+    }
+
+    #[test]
+    fn if_padding_arithmetic_is_correct_at_a_nonzero_slot_mark_baseline() {
+        // qa test-design review msg #75: every other if/cond padding test
+        // in this suite compiles its conditional at the very top of a
+        // function body, where the slot-mark baseline (`mark`, in
+        // `Ctx::slot_mark`'s own vocabulary) is 0 -- so `mark + x` and
+        // `x - mark` are indistinguishable from plain `x`, and a sign or
+        // operand typo in the padding-stub arithmetic (`mark + then_needs`,
+        // `mark + target`, etc.) would be invisible to every one of them.
+        // This one deliberately starts from a nonzero baseline (three prior
+        // let*-bound locals) before the if, so such a typo would produce
+        // either a wrong value or a runtime "local slot out of range"
+        // error instead of silently passing.
+        let src = "(define (f flag) \
+                      (let* ((p 10) (q 20) (r 30)) \
+                        (if flag (let ((a 1)) 0) (let ((b 2) (c 3)) 0)) \
+                        (let ((y 42)) (+ p q r y)))) \
+                    (display (f #t)) \
+                    (display (f #f))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "102102");
+    }
+
+    #[test]
+    fn cond_padding_arithmetic_is_correct_at_a_nonzero_slot_mark_baseline() {
+        // Same rationale as the sibling `if` test above, for `cond`.
+        let src = "(define (f n) \
+                      (let* ((p 10) (q 20) (r 30)) \
+                        (cond \
+                          ((= n 1) (let ((a 1)) 0)) \
+                          ((= n 2) (let ((b 2) (c 3)) 0)) \
+                          (else 0)) \
+                        (let ((y 42)) (+ p q r y)))) \
+                    (display (f 1)) \
+                    (display (f 2)) \
+                    (display (f 3))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "102102102");
     }
 
     #[test]
