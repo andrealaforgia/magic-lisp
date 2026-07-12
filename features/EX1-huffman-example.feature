@@ -53,20 +53,33 @@ Feature: EX1 — canonical worked example: a Huffman compression program written
   Scenario: E4 — the documented run instructions are self-sufficient for a new, unaided user
     Given examples/huffman/README.md, read on its own with no other context
     When its usage section's exact commands are followed unaided
-    Then a new user successfully compresses then decompresses a file, with no need to read the .ml source or ask for help
+    Then a new user successfully compresses then decompresses a file, with no need to read the .ml source or ask for help, and the check fails if the documented commands themselves ever drift from what's proven to work
     # Evidence: the Examiner followed the README's usage section exactly, unaided, as a stand-in
     #   for a new user -- reading only the README (not compress.ml/decompress.ml) before running
     #   the commands -- and every fixture above succeeded on the first attempt with no
     #   corrections needed.
-    #   Also: tests/cli_integration/ex1_huffman.rs::e4_the_readme_documents_the_exact_commands_
-    #   and_files_a_new_user_needs -- green.
+    #   Following an Examiner reinforcement (the original check only grepped the README for
+    #   keyword substrings, which proves words appear but not that the commands work), the
+    #   Builder rewrote it to extract the literal pipeline commands from the README's own fenced
+    #   usage block and execute those extracted commands directly -- confirmed by reading
+    #   tests/cli_integration/ex1_huffman.rs's extraction code, which parses the ```sh block and
+    #   runs it verbatim (only placeholder filenames substituted): green.
 
-  Scenario: E5 — integration: the documented pipeline round-trips a real file end to end
+  Scenario: E5 — integration: the documented pipeline round-trips a real file end to end, now via a real BDD run
     Given the README's full documented pipeline (compress then decompress, exactly as written)
-    When it is run end to end against a real file from the command line
-    Then the restored file is byte-for-byte identical to the original, demonstrating the whole example (algorithm + CLI + docs) works as one coherent, usable deliverable
+    When it is run end to end against a real file from the command line, executed by a real Cucumber-style step-definition runner (not just ad hoc integration tests)
+    Then the restored file is byte-for-byte identical to the original, demonstrating the whole example (algorithm + CLI + docs) works as one coherent, usable deliverable, and this feature file itself now executes rather than sitting decorative
     # Evidence: Examiner's own end-to-end run of the exact documented pipeline against the
     #   25,301-byte skewed fixture -- `cmp` reports byte-for-byte identical.
-    #   Also: tests/cli_integration/ex1_huffman.rs::e5_the_documented_compress_then_decompress_
-    #   pipeline_round_trips_a_real_file_end_to_end -- green.
-    #   Full ex1_huffman suite independently re-run by the Examiner: 8 passed, 0 failed (0.56s).
+    #   This feature file is now registered and executed by tests/features.rs
+    #   (`ex1_huffman_example ... ok`, 1.27s) via tests/features/steps_ex1.rs, closing the earlier
+    #   "pending step-def wiring" gap -- independently re-run by the Examiner.
+    #   Full tests/cli_integration/ex1_huffman.rs suite independently re-run: 10 passed, 0 failed
+    #   (9.19s) -- includes two new performance regression tests (a 2MB single-repeated-byte
+    #   input and a 200KB full-alphabet pseudorandom input, both completing well within their
+    #   ceilings) added after a genuine quadratic slowdown was found and fixed. Examiner's own,
+    #   further independent stress check with different parameters again (300KB of seed-7
+    #   pseudorandom bytes, not the Builder's own fixture): compress ~5.0s, decompress ~6.5s,
+    #   `cmp` identical -- confirms the fix generalises, not just passes the exact committed test.
+    #   Full unit suite (`cargo test --release --lib`) also independently re-run: 827 passed, 0
+    #   failed, 2 ignored.
