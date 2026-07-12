@@ -1,9 +1,10 @@
 ;; Huffman decompressor. The inverse of compress.ml — see that file for the
 ;; full payload format description.
 ;;
-;; Reads exactly one line of lowercase hex text from stdin (the compressed
-;; payload produced by compress.ml, hex-encoded), and writes exactly one
-;; line of lowercase hex text to stdout: the original bytes, hex-encoded.
+;; Reads exactly one line of hex text from stdin (upper- or lowercase digits
+;; both accepted; the compressed payload produced by compress.ml,
+;; hex-encoded), and writes exactly one line of lowercase hex text to
+;; stdout: the original bytes, hex-encoded.
 
 ;; ---- hex <-> byte helpers ----
 
@@ -24,15 +25,19 @@
   (display (hex-digit (quotient b 16)))
   (display (hex-digit (remainder b 16))))
 
+;; Walks the string's characters as a list (one single O(n) string->list
+;; pass) rather than repeated string-ref-by-index calls -- see
+;; compress.ml's own copy of this function for why: string-ref is O(current
+;; index), so indexing forward through the whole string in a loop is
+;; O(n^2).
 (define (parse-hex-bytes s)
-  (let ((n (string-length s)))
-    (let loop ((i 0) (acc '()))
-      (if (>= i n)
-          (reverse acc)
-          (loop (+ i 2)
-                (cons (+ (* (hex-value (string-ref s i)) 16)
-                         (hex-value (string-ref s (+ i 1))))
-                      acc))))))
+  (let loop ((chars (string->list s)) (acc '()))
+    (if (null? chars)
+        (reverse acc)
+        (loop (cddr chars)
+              (cons (+ (* (hex-value (car chars)) 16)
+                       (hex-value (cadr chars)))
+                    acc)))))
 
 ;; ---- big-endian byte-list -> integer ----
 
@@ -49,11 +54,20 @@
     (set-car! cur (cdr (car cur)))
     b))
 
+;; A top-level (define ...), deliberately NOT a named let -- empirically
+;; confirmed (not just theorized): a named let here creates a closure whose
+;; captured frame includes `cur`, the mutable cursor pair whose car
+;; ultimately points at the whole remaining payload list. Once registered
+;; with the cycle-safety collector, a later sweep -- triggered by anything
+;; else in the program, arbitrarily far away in execution, such as
+;; bytes->bit-list's own per-element closure creation -- must walk that
+;; entire remaining list looking for nested carriers. A plain top-level
+;; recursive function creates no closure here at all, so nothing captures
+;; `cur`.
 (define (cursor-next-n! cur n)
-  (let loop ((n n) (acc '()))
-    (if (= n 0)
-        (reverse acc)
-        (loop (- n 1) (cons (cursor-next! cur) acc)))))
+  (if (= n 0)
+      '()
+      (cons (cursor-next! cur) (cursor-next-n! cur (- n 1)))))
 
 (define (cursor-rest cur) (car cur))
 
@@ -99,27 +113,62 @@
 (define (byte->bits b)
   (map (lambda (place) (modulo (quotient b place) 2)) (list 128 64 32 16 8 4 2 1)))
 
-(define (append-bits acc bits)
-  (fold-left (lambda (a b) (cons b a)) acc bits))
+;; Plain recursion, deliberately NOT fold-left+lambda -- see compress.ml's
+;; own copy of this function for the full rationale: a closure created once
+;; per input byte (as an inner fold-left's lambda argument was) captures
+;; its whole enclosing frame, including this function's own `acc`
+;; parameter -- which by then holds the entire decoded bit-list so far --
+;; and registers that capture with the cycle-safety collector; a sweep
+;; triggered while that call's closure is still live must walk `acc`'s
+;; whole pair chain looking for nested carriers, which is the real O(n^2)
+;; cost warden security-review msg #53 measured. Plain recursion creates no
+;; closures at all, sidestepping the whole mechanism.
+(define (prepend-bits bits acc)
+  (if (null? bits)
+      acc
+      (prepend-bits (cdr bits) (cons (car bits) acc))))
+
+;; A top-level (define ...), deliberately NOT a named let: byte->bits
+;; itself creates one closure per call (its own internal map+lambda), and
+;; -- empirically confirmed, not just theorized -- a *named let*'s own
+;; self-referential letrec closure is itself a tracked cycle-collector
+;; candidate, so pairing it with a per-iteration closure-creating call
+;; while this function's own accumulator grows reproduces the same O(n^2)
+;; sweep cost the prior fold-left version had, even though this loop's own
+;; body creates no closures directly. An ordinary top-level recursive
+;; function has no such self-referential closure to track, and measures as
+;; linear.
+(define (bytes->bit-list-from byte-list acc)
+  (if (null? byte-list)
+      (reverse acc)
+      (bytes->bit-list-from (cdr byte-list) (prepend-bits (byte->bits (car byte-list)) acc))))
 
 (define (bytes->bit-list byte-list)
-  (reverse (fold-left (lambda (acc b) (append-bits acc (byte->bits b))) '() byte-list)))
+  (bytes->bit-list-from byte-list '()))
 
 ;; Walk the tree from the root, consuming one bit per internal step; on
 ;; reaching a leaf, emit its symbol and restart from the root. Stops as soon
 ;; as `len` symbols have been emitted, so trailing zero-pad bits in the
 ;; final byte are never consumed/interpreted.
+;;
+;; A top-level (define ...), deliberately NOT a named let -- as with every
+;; other rewrite in this file, a named let here would create a closure
+;; whose captured frame includes `bits` itself, the full multi-million-
+;; element decoded bitstream; the first sweep to fire anywhere near this
+;; call would then have to walk the whole thing.
+(define (decode-symbols-loop bits tree node count len)
+  (if (= count len)
+      'done
+      (if (eq? (car node) 'leaf)
+          (begin
+            (display-hex-byte (caddr node))
+            (decode-symbols-loop bits tree tree (+ count 1) len))
+          (if (= (car bits) 0)
+              (decode-symbols-loop (cdr bits) tree (caddr node) count len)
+              (decode-symbols-loop (cdr bits) tree (car (cdr (cdr (cdr node)))) count len)))))
+
 (define (decode-symbols bits tree len)
-  (let loop ((bits bits) (node tree) (count 0))
-    (if (= count len)
-        'done
-        (if (eq? (car node) 'leaf)
-            (begin
-              (display-hex-byte (caddr node))
-              (loop bits tree (+ count 1)))
-            (if (= (car bits) 0)
-                (loop (cdr bits) (caddr node) count)
-                (loop (cdr bits) (car (cdr (cdr (cdr node)))) count))))))
+  (decode-symbols-loop bits tree tree 0 len))
 
 (define (read-entries k cur)
   (if (= k 0)
@@ -143,8 +192,20 @@
     (if (< i len)
         (begin (display-hex-byte s) (loop (+ i 1))))))
 
+;; A top-level (define ...), deliberately NOT map+lambda: entries is only
+;; ever K (<=256) elements, but the lambda passed to map here would be
+;; created while `cur` -- the mutable cursor pair whose car points at the
+;; whole remaining, n-sized payload list -- is still one of this call's own
+;; parameters, hence part of the closure's eagerly-captured frame. Plain
+;; recursion creates no closure, so nothing captures `cur` here.
+(define (entries->leaves entries)
+  (if (null? entries)
+      '()
+      (cons (list 'leaf (cdr (car entries)) (car (car entries)))
+            (entries->leaves (cdr entries)))))
+
 (define (emit-decoded! entries cur len)
-  (let* ((leaves (map (lambda (e) (list 'leaf (cdr e) (car e))) entries))
+  (let* ((leaves (entries->leaves entries))
          (tree (build-tree leaves))
          (bits (bytes->bit-list (cursor-rest cur))))
     (decode-symbols bits tree len)))

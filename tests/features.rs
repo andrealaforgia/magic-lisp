@@ -59,6 +59,8 @@ mod steps_b7;
 mod steps_b8;
 #[path = "features/steps_b9.rs"]
 mod steps_b9;
+#[path = "features/steps_ex1.rs"]
+mod steps_ex1;
 
 #[test]
 fn b1_walking_skeleton() {
@@ -227,4 +229,10 @@ fn b22_cycle_safe_memory() {
 fn b23_dotted_list_round_trip() {
     let src = include_str!("../features/B23-dotted-list-round-trip.feature");
     registry::run_feature("B23-dotted-list-round-trip", src, &steps_b23::registry());
+}
+
+#[test]
+fn ex1_huffman_example() {
+    let src = include_str!("../features/EX1-huffman-example.feature");
+    registry::run_feature("EX1-huffman-example", src, &steps_ex1::registry());
 }
