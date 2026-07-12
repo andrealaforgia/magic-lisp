@@ -55,3 +55,5 @@ mod b7;
 mod b8;
 #[path = "cli_integration/b9.rs"]
 mod b9;
+#[path = "cli_integration/ex1_huffman.rs"]
+mod ex1_huffman;
