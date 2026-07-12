@@ -2004,7 +2004,7 @@ fn compile_case(
         }
         chunk.emit_pop(); // discard k, unused in the body
         compile_sequence(body, ctx, chunk, comp, depth + 1, tail)?;
-        let needs = ctx.slot_mark();
+        let needs = ctx.slot_mark() - mark;
         clause_jumps.push((chunk.emit_jump(Op::Jump), needs));
     }
 
@@ -3361,6 +3361,31 @@ mod tests {
                         (cond \
                           ((= n 1) (let ((a 1)) 0)) \
                           ((= n 2) (let ((b 2) (c 3)) 0)) \
+                          (else 0)) \
+                        (let ((y 42)) (+ p q r y)))) \
+                    (display (f 1)) \
+                    (display (f 2)) \
+                    (display (f 3))";
+        let forms = crate::reader::read_program(src).unwrap();
+        let module = compile_program(&forms).unwrap();
+        let mut out = Vec::new();
+        crate::vm::run(&module, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "102102102");
+    }
+
+    #[test]
+    fn case_padding_arithmetic_is_correct_at_a_nonzero_slot_mark_baseline() {
+        // Same rationale as the sibling `if`/`cond` tests above, for
+        // `case` -- warden security-review msg #76 (Low coverage note): the
+        // prior two tests covered `if` and `cond` but not a dedicated
+        // `case` sibling, so this specific bug class's coverage for
+        // `case`'s own ordinary-clause path was incidental (via other
+        // tests' function-parameter counts) rather than explicit.
+        let src = "(define (f n) \
+                      (let* ((p 10) (q 20) (r 30)) \
+                        (case n \
+                          ((1) (let ((a 1)) 0)) \
+                          ((2) (let ((b 2) (c 3)) 0)) \
                           (else 0)) \
                         (let ((y 42)) (+ p q r y)))) \
                     (display (f 1)) \
