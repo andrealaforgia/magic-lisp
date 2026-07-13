@@ -1,72 +1,92 @@
 # MagicLisp
 
-MagicLisp is a small Scheme-like Lisp: a reader, a macro expander, a compiler to a
-portable bytecode container format (**MLBC**), and a stack-based virtual machine that
-executes it. The same `magiclisp` binary also disassembles bytecode and hosts an
-interactive REPL. See `SPEC.md` for the full language and implementation specification.
+MagicLisp is a small Lisp — in the same family as Scheme — that you can write real
+programs in. It comes as one command-line tool, `magiclisp`, that can run your code
+directly, compile it to a portable bytecode file, run that file later, take it apart
+with a disassembler, or drop you into an interactive REPL to play around.
 
-## Building and running
+It's a hobby project built from scratch in Rust, with no dependency on any other Lisp
+or Scheme implementation.
+
+## Quick start
 
 ```sh
 cargo build --release
-magiclisp eval program.ml            # compile and run in one step
-magiclisp compile program.ml -o program.mlbc
-magiclisp run program.mlbc
-magiclisp disasm program.mlbc
-magiclisp repl
 ```
 
-## Memory and cycle-safety
+Then save this to `hello.ml`:
 
-The heap is index/handle-based in spirit but implemented with `Rc`/`RefCell`: values
-share ownership through reference counting rather than a host garbage collector, and
-`#![forbid(unsafe_code)]` holds throughout. Reference counting alone reclaims everything
-*except* one shape: a closure's captured environment holding a local variable cell that
-itself, directly or through another closure, holds a reference back to that same closure
-— whether that reference sits directly in the cell or is mediated through a pair,
-vector, hash table, or list the cell holds instead. Plain `Rc` counts never reach zero
-for a cycle like that, no matter how unreachable it becomes from the rest of the
-program.
+```scheme
+(define (fact n)
+  (if (= n 0) 1 (* n (fact (- n 1)))))
 
-MagicLisp closes this gap with a small, targeted **trial-deletion cycle collector**,
-scoped to the kinds of object that can participate in this cycle: a closure's captured
-environment, and every mutable value — a local cell itself, or any pair/vector/hash
-table nested inside one, however deep, transparently through any list along the way (a
-list is immutable, so it can never itself close a cycle, but its elements still need to
-stay visible). Every newly captured environment is registered with the collector; once
-enough have accumulated, a sweep runs:
+(display (fact 10))
+(newline)
+```
 
-1. For every tracked object, count how many references to it come from *other tracked
-   objects* (a captured-locals slot, a parent-environment link, a cell/pair/vector/hash
-   holding a closure over — or another pair/vector/hash nested inside — a tracked
-   object).
-2. Subtract that count from the object's real, total reference count. Whatever is left
-   over must be coming from *outside* the tracked set — an active call frame's own
-   locals, the operand stack, a global binding, anything at all. Any object with
-   something left over is definitely still reachable, and so is anything reachable from
-   it.
-3. Anything never reached this way is, by construction, not reachable from any real
-   owner anywhere in the running program — a genuine garbage cycle. The closure
-   references responsible are cleared, breaking the cycle so ordinary `Rc` drop glue
-   reclaims the rest exactly as it already does for everything acyclic.
+And run it:
 
-Because step 2 works directly off real reference counts, this needs no separate
-tracking of the interpreter's call stack or operand stack as a root set: an object
-still legitimately in use — even one still being read through the very cycle that
-would otherwise leak it, such as a self-referential closure being called before its
-defining `let` has returned — always has a real reference counted against it, so it is
-never mistaken for garbage.
+```sh
+target/release/magiclisp eval hello.ml
+# 3628800
+```
 
-How often a sweep runs is itself amortized rather than fixed: after each one, the next
-is scheduled at twice however many tracked objects actually survived it (never less
-than a small minimum). A workload that's mostly short-lived cycles keeps the survivor
-count — and so the sweep interval — small and frequent; a workload that legitimately
-accumulates many long-lived closures (nothing cyclic to reclaim) sees the interval
-grow with it, so total sweep work across the whole run stays proportional to the work
-done, not to its square.
+That's it — no separate build step needed. `eval` reads, compiles, and runs a
+program in one go.
 
-This keeps a self-referential closure (a cell `set!` to hold the very closure that
-captured it), a mutually-referencing pair of closures (two cells that each hold the
-other's closure), and the same shapes mediated through an intervening pair, vector, or
-hash table, all memory-bounded under sustained, repeated creation and discard — on top
-of the ordinary reference counting that already handles every acyclic closure pattern.
+## What you can do with it
+
+- **Closures that share state.** A function can return another function that
+  remembers variables from its birthplace — and if two functions capture the *same*
+  variable, changing it through one is visible through the other.
+- **Loops that never blow the stack.** Tail calls (including mutual recursion between
+  two functions calling each other) run in constant memory, however many times they
+  loop — millions of iterations are fine.
+- **The usual data you'd expect**: whole numbers and decimals, strings, characters,
+  pairs and lists, vectors, and hash tables.
+- **Macros.** Write your own syntax with `define-macro` and `gensym`, expanded before
+  your program ever runs.
+- **A full toolbox in one binary**:
+
+  | Command | What it does |
+  |---|---|
+  | `magiclisp eval file.ml` | Compile and run a program in one step |
+  | `magiclisp compile file.ml -o file.mlbc` | Compile to a portable bytecode file |
+  | `magiclisp run file.mlbc` | Run a compiled bytecode file |
+  | `magiclisp disasm file.mlbc` | Print human-readable bytecode |
+  | `magiclisp repl` | Interactive prompt |
+
+- **It doesn't crash.** Feed it garbage — a broken program, a corrupted bytecode
+  file — and it reports a clean error with a distinct exit code instead of panicking
+  or segfaulting.
+
+## How it manages memory
+
+MagicLisp doesn't have a general-purpose garbage collector. Most values are cleaned
+up the simple way — reference counting — as soon as nothing points to them anymore.
+
+There's one shape reference counting can't handle on its own: two things that end up
+pointing at each other in a loop (for example, a function that captures a variable
+which is then set to hold that very function). Nothing outside the loop points to it,
+but the pieces inside still point to each other, so plain reference counting never
+reaches zero and the memory would otherwise leak forever.
+
+To catch that, MagicLisp runs a small, focused cleanup pass every so often, only over
+the kind of values that could form such a loop. It checks whether each one is still
+reachable from somewhere outside the loop; if not, it's a genuine piece of garbage and
+gets cleared away. Anything still legitimately in use is left completely alone. This
+pass runs occasionally rather than constantly, so it stays cheap even in long-running
+programs.
+
+## See it run something real
+
+`examples/huffman/` is a full Huffman compressor and decompressor written entirely in
+MagicLisp — not a toy snippet. See `examples/huffman/README.md` to try it on a real
+file.
+
+## Want the details?
+
+- **`OVERVIEW.md`** — a guided tour of everything the project delivers, written for
+  someone who hasn't read anything else yet.
+- **`SPEC.md`** — the full, normative language and implementation specification
+  everything here was built and tested against.
