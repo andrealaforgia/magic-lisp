@@ -321,6 +321,15 @@ fn check_completeness() -> Vec<String> {
 /// is not (qa test-design review: pinning one frozen commit made the
 /// legitimately-grown records fail forever, regardless of correctness).
 fn evidence_preserves_original(record_evidence: &str, expected: &str) -> bool {
+    if expected.is_empty() {
+        // `str::strip_prefix("")` always succeeds, so without this an empty
+        // `expected` (a historical scenario with no extractable evidence
+        // comment, e.g. a future migration gap) would make every record
+        // whose text merely starts with a blank line vacuously "faithful"
+        // -- the tamper check silently no-opping instead of failing loudly
+        // on a missing baseline (warden security review, Medium finding).
+        return record_evidence.is_empty();
+    }
     record_evidence == expected
         || record_evidence
             .strip_prefix(expected)
@@ -599,5 +608,22 @@ mod tests {
         let original = "Evidence: the original round's finding.";
         let empty_addendum = "Evidence: the original round's finding.\n\n";
         assert!(!evidence_preserves_original(empty_addendum, original));
+    }
+
+    #[test]
+    fn a_missing_historical_baseline_does_not_vacuously_accept_any_record() {
+        // warden security review: `strip_prefix("")` always succeeds, so an
+        // empty `expected` (a historical scenario with no extractable
+        // evidence comment) must not make an unrelated, non-empty record
+        // "faithful" just because it happens to start with a blank line.
+        assert!(!evidence_preserves_original(
+            "\n\nsome unrelated recorded evidence",
+            ""
+        ));
+    }
+
+    #[test]
+    fn a_missing_historical_baseline_matches_only_an_equally_empty_record() {
+        assert!(evidence_preserves_original("", ""));
     }
 }
