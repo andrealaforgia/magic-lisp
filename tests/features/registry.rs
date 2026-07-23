@@ -156,37 +156,21 @@ fn run_scenarios(feature_label: &str, scenarios: &[Scenario], registry: &Registr
 mod tests {
     use super::*;
 
+    // E10's step is deliberately NOT bound in `no_op_registry` -- if the
+    // "E1 " prefix ever leaked into matching "E10 ..." too (the exact
+    // collision `run_feature_subset` guards against with its trailing-
+    // space discipline), `run_feature_subset_actually_executes_the_matched_
+    // scenarios` below would fail on an unbound step instead of passing
+    // either way (qa test-design review: the previous fixture bound all
+    // three scenarios to the same no-op step, so the test couldn't
+    // actually observe the collision it claimed to guard against).
     const SRC: &str = "Feature: fixture\n\n  \
         Scenario: E1 — first\n    Given nothing\n\n  \
         Scenario: E4 — fourth\n    Given nothing\n\n  \
-        Scenario: E10 — tenth\n    Given nothing\n";
+        Scenario: E10 — tenth\n    Given a step nothing else binds\n";
 
     fn no_op_registry() -> Registry {
         Registry::new().step("nothing", |_w, _t, _d| {})
-    }
-
-    #[test]
-    fn run_feature_subset_runs_only_the_matching_prefixes() {
-        // A run that only matches E1 and E4 must not also pull in E10 --
-        // if it did, this run would still pass today (its step is a no-op),
-        // so the real assertion is scenario *count*.
-        let feature = parse_feature(SRC);
-        let matched: Vec<_> = feature
-            .scenarios
-            .iter()
-            .filter(|s| ["E1 ", "E4 "].iter().any(|p| s.name.starts_with(p)))
-            .collect();
-        assert_eq!(
-            matched.len(),
-            2,
-            "expected exactly E1 and E4, got {matched:?}"
-        );
-    }
-
-    #[test]
-    fn an_e1_prefix_does_not_also_match_e10() {
-        assert!(!"E10 — tenth".starts_with("E1 "));
-        assert!("E1 — first".starts_with("E1 "));
     }
 
     #[test]
@@ -198,8 +182,9 @@ mod tests {
     #[test]
     fn run_feature_subset_actually_executes_the_matched_scenarios() {
         // Runs clean against the real registry -- proves the whole path
-        // (parse -> filter -> dispatch) works end to end, not just the
-        // filter predicate in isolation.
+        // (parse -> filter -> dispatch) works end to end. If "E1 " ever
+        // also matched "E10 — tenth", this would fail on E10's deliberately
+        // unbound step rather than passing regardless.
         run_feature_subset("fixture", SRC, &no_op_registry(), &["E1 ", "E4 "]);
     }
 
