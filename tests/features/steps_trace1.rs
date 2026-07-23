@@ -311,8 +311,25 @@ fn check_completeness() -> Vec<String> {
     missing
 }
 
+/// A record's evidence is faithful to its pre-migration source if it
+/// matches byte-for-byte, OR if it preserves that original text verbatim as
+/// a leading section and only *appends* further content after a blank line
+/// (a later round's own evidence, documented in addition to -- not instead
+/// of -- what came before, e.g. TRACE1's own "Round 2" self-migration
+/// addenda in E1/E4/E6, added in a commit after the pinned historical
+/// snapshot). Growth is legitimate; loss or alteration of the original text
+/// is not (qa test-design review: pinning one frozen commit made the
+/// legitimately-grown records fail forever, regardless of correctness).
+fn evidence_preserves_original(record_evidence: &str, expected: &str) -> bool {
+    record_evidence == expected
+        || record_evidence
+            .strip_prefix(expected)
+            .is_some_and(|rest| rest.starts_with("\n\n") && rest.len() > 2)
+}
+
 /// E2's check: every given record's evidence matches its pre-migration
-/// comment byte-for-byte.
+/// comment byte-for-byte, or legitimately extends it (see
+/// `evidence_preserves_original`).
 fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
     let historical = historical_scenarios();
     let mut mismatches = Vec::new();
@@ -336,7 +353,7 @@ fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
             continue;
         };
         let expected = extract_evidence(block).unwrap_or_default();
-        if record.evidence != expected {
+        if !evidence_preserves_original(&record.evidence, &expected) {
             mismatches.push(format!("{behaviour} {expectation}: evidence text differs"));
         }
     }
@@ -535,4 +552,52 @@ pub(crate) fn registry() -> Registry {
                 assert!(w.notes.is_empty(), "problems found: {:?}", w.notes);
             },
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evidence_preserves_original;
+
+    #[test]
+    fn an_exact_match_is_faithful() {
+        assert!(evidence_preserves_original("same text", "same text"));
+    }
+
+    #[test]
+    fn a_later_round_appended_after_a_blank_line_is_still_faithful() {
+        let original = "Evidence: the original round's finding.";
+        let grown = "Evidence: the original round's finding.\n\nRound 2: a further finding.";
+        assert!(evidence_preserves_original(grown, original));
+    }
+
+    #[test]
+    fn altering_a_word_inside_the_original_text_is_not_faithful() {
+        let original = "Evidence: the original round's finding.";
+        let altered = "Evidence: the original round's DIFFERENT finding.";
+        assert!(!evidence_preserves_original(altered, original));
+    }
+
+    #[test]
+    fn truncating_the_original_text_is_not_faithful() {
+        let original = "Evidence: the original round's finding, in full.";
+        let truncated = "Evidence: the original round's finding";
+        assert!(!evidence_preserves_original(truncated, original));
+    }
+
+    #[test]
+    fn appended_content_without_a_separating_blank_line_is_not_faithful() {
+        // Guards against treating an accidental run-on concatenation (or a
+        // record that merely starts with the original text as a substring
+        // of some unrelated longer passage) as a legitimate later round.
+        let original = "Evidence: the original round's finding.";
+        let run_on = "Evidence: the original round's finding.\nRound 2: no blank line before this.";
+        assert!(!evidence_preserves_original(run_on, original));
+    }
+
+    #[test]
+    fn empty_extra_content_after_the_blank_line_is_not_faithful() {
+        let original = "Evidence: the original round's finding.";
+        let empty_addendum = "Evidence: the original round's finding.\n\n";
+        assert!(!evidence_preserves_original(empty_addendum, original));
+    }
 }
