@@ -3363,6 +3363,15 @@ fn native_divide(args: &[Value]) -> Result<Value, RuntimeError> {
     let mut exact_acc = *first;
     let mut float_acc: Option<f64> = None;
     for &divisor in rest {
+        // The division rule's exact-zero check is judged by this divisor
+        // as written, not by whether the accumulator has already gone
+        // inexact from an earlier step -- checked unconditionally here,
+        // before the float-accumulator shortcut below would otherwise
+        // divide straight through it via plain IEEE 754 float division
+        // without ever noticing it was written as an exact fixnum 0.
+        if divisor == 0 {
+            return Err(error("division by exact zero"));
+        }
         if let Some(acc) = float_acc {
             float_acc = Some(acc / divisor as f64);
             continue;
@@ -5420,16 +5429,69 @@ mod tests {
     }
 
     #[test]
-    fn once_a_division_chain_goes_inexact_a_later_integer_zero_divisor_follows_float_rules() {
-        // 7/2 is already inexact (3.5), so this must NOT error like an
-        // exact int/0 division would -- it follows IEEE float rules instead.
-        assert_eq!(eval("(display (/ 7 2 0))").unwrap(), "+inf.0");
+    fn an_exact_zero_divisor_is_fatal_even_after_an_earlier_fold_step_went_inexact() {
+        // 7/2 is already inexact (3.5), but the divisor rule is judged by
+        // the operand as written, not by the accumulator's exactness so
+        // far -- 0 here is still a literal exact fixnum, so this must
+        // error exactly like an exact int/0 division from a clean start
+        // would (B24, correcting the division rule's prior mishandling of
+        // this exact shape).
+        assert!(eval("(display (/ 7 2 0))").is_err());
+    }
+
+    #[test]
+    fn a_division_chain_that_goes_inexact_still_computes_correctly_through_a_further_nonzero_divisor()
+     {
+        // Once the accumulator has gone float (1/3), it must still divide
+        // correctly through any further non-zero divisor, not merely avoid
+        // erroring -- mutation testing on this exact fold step (`/` mutated
+        // to `%`/`*`) found no existing test pinned its actual value.
+        assert_eq!(eval("(display (/ 1 3 2))").unwrap(), "0.16666666666666666");
+    }
+
+    #[test]
+    fn an_exact_zero_divisor_is_fatal_at_a_middle_or_non_final_argument_position() {
+        for src in [
+            "(display (/ 1 3 0))",
+            "(display (/ 2 5 0))",
+            "(display (/ 7 11 0))",
+            "(display (/ 8 4 0 2))",
+        ] {
+            assert!(eval(src).is_err(), "{src} should be a runtime error");
+        }
+    }
+
+    #[test]
+    fn an_exact_zero_divisor_still_errors_in_the_already_correct_cases() {
+        // No-regression set (B24/E2): these never went through the buggy
+        // path (no earlier fold step went inexact first), so they were
+        // already correct -- pinned here so a fix doesn't accidentally
+        // break them.
+        for src in [
+            "(display (/ 6 3 0))",
+            "(display (/ 5 0))",
+            "(display (/ 10 2 0))",
+        ] {
+            assert!(eval(src).is_err(), "{src} should be a runtime error");
+        }
+        assert!(eval("(display (/ 0))").is_err());
     }
 
     #[test]
     fn dividing_a_float_by_zero_follows_ieee_rules_instead_of_erroring() {
         assert_eq!(eval("(display (/ 1.0 0.0))").unwrap(), "+inf.0");
         assert_eq!(eval("(display (/ -1.0 0.0))").unwrap(), "-inf.0");
+    }
+
+    #[test]
+    fn a_variadic_division_by_a_float_zero_still_follows_ieee_rules_not_erroring() {
+        // B24/E3: a FLOAT zero divisor (0.0/-0.0) is unaffected by the
+        // exact-zero fix -- still IEEE 754, still a clean non-error exit,
+        // even amid an otherwise-integer variadic chain.
+        assert_eq!(eval("(display (/ 1 0.0))").unwrap(), "+inf.0");
+        assert_eq!(eval("(display (/ 1 3 0.0))").unwrap(), "+inf.0");
+        assert_eq!(eval("(display (/ 1 -0.0))").unwrap(), "-inf.0");
+        assert_eq!(eval("(display (/ 1 3 -0.0))").unwrap(), "-inf.0");
     }
 
     // --- B7 E1: quotient/remainder/modulo ---
