@@ -33,23 +33,3 @@ Feature: B22 — Cycle-safe memory: closure/upvalue reference cycles stay bounde
     Given a single ~60-second run that interleaves the self-referential pattern (E1), the mutual-reference pattern (E2), and the B21/E5 acyclic counter-factory pattern every iteration, with memory sampled at multiple points across the run, alongside the README's mechanism description
     When the sampled resident-memory trend is examined together with that description
     Then it stays memory-bounded across the full run, and what the README describes matches what is actually observed running -- demonstrating sustained memory-boundedness when genuine cyclic reference patterns and the acyclic pattern are exercised together, not just isolated pieces passing alone
-
-  # E5 and E6 are proven as committed, always-run Rust tests in
-  # tests/cli_integration/b22.rs rather than duplicated here as Gherkin --
-  # they check correctness (does reclaiming a cycle ever corrupt a still-live
-  # value?), not the memory-shape claims E1-E4 already cover, and a second
-  # Gherkin+step-definition copy of the same assertion would be exactly the
-  # kind of redundant test layer this project's own reviews have repeatedly
-  # flagged elsewhere (B20, B21).
-  #
-  # E5 — both cyclic shapes still compute the correct result under real,
-  # repeated automatic collection pressure (finite iteration counts, well
-  # past the collector's sweep threshold), not just "memory stays flat" --
-  # a collector that cleared a still-live cell would corrupt the answer
-  # while leaving memory looking perfectly healthy.
-  #
-  # E6 — integration: the same guarantee holds through the real compile +
-  # run path (an actual .mlbc artifact executed by the VM), not only via
-  # eval, both at a finite correctness-checked scale and, redundantly with
-  # this feature's own E4 scenario, over a sustained ~60-second soak
-  # (gated `#[ignore]`, invoke explicitly for a standalone re-check).
