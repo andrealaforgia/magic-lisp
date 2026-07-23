@@ -245,13 +245,19 @@ fn first_commit_introducing(rel: &str) -> String {
 }
 
 fn first_commit_introducing_in(dir: &Path, rel: &str) -> String {
+    // `--follow` and `--reverse` don't cooperate (a real, reproducible git
+    // limitation, not a typo): combined, they silently produce EMPTY
+    // output instead of the reversed list `--follow` alone gives -- caught
+    // by this function's own rename-tracking hermetic test. So this asks
+    // for the default newest-first order and takes the LAST line (the
+    // oldest / first-added commit) instead of reversing and taking the
+    // first.
     let out = Command::new("git")
         .args([
             "log",
             "--follow",
             "--diff-filter=A",
             "--format=%H",
-            "--reverse",
             "--",
             rel,
         ])
@@ -265,7 +271,7 @@ fn first_commit_introducing_in(dir: &Path, rel: &str) -> String {
     );
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .next()
+        .last()
         .unwrap_or_else(|| panic!("{rel}: no commit in this repository's history ever added it"))
         .to_string()
 }
@@ -273,10 +279,14 @@ fn first_commit_introducing_in(dir: &Path, rel: &str) -> String {
 /// `git show <rev>:<path>` from the repo root, as raw bytes decoded lossily
 /// -- historical content is trusted repo text, not untrusted input.
 fn git_show(rev_and_path: &str) -> String {
+    git_show_in(&repo_root(), rev_and_path)
+}
+
+fn git_show_in(dir: &Path, rev_and_path: &str) -> String {
     let out = Command::new("git")
         .arg("show")
         .arg(rev_and_path)
-        .current_dir(repo_root())
+        .current_dir(dir)
         .output()
         .expect("git should run");
     assert!(
@@ -360,9 +370,17 @@ fn parse_record(content: &str) -> Record {
     // base on an absolute component), and `..` components could escape
     // `features/`. Requires repo write access to exploit -- the same
     // trust level as every other finding in this file -- but cheap to
-    // fail loudly on rather than silently permit.
+    // fail loudly on rather than silently permit. Also requires the
+    // reference to actually land under `features/` (qa test-design
+    // review: a dot-free, relative path pointing elsewhere entirely, e.g.
+    // `src/lib.rs`, previously sailed through) -- a harmless leading
+    // `./` is tolerated, since that's still unambiguously "under features/".
+    let under_features = feature_file
+        .strip_prefix("./")
+        .unwrap_or(&feature_file)
+        .starts_with("features/");
     assert!(
-        !Path::new(&feature_file).is_absolute() && !feature_file.contains(".."),
+        !Path::new(&feature_file).is_absolute() && !feature_file.contains("..") && under_features,
         "record's Feature file reference must be a plain relative path under features/, got {feature_file:?}"
     );
     let scenario = content
@@ -492,6 +510,17 @@ fn fidelity_verdict(
     }
 }
 
+/// A record's own first-committed evidence text -- the fallback baseline
+/// [`check_fidelity`] uses for a record whose feature file postdates the
+/// fixed migration commits. Takes an explicit working directory so a
+/// hermetic test can drive this exact function, not just the
+/// `git_show`/`first_commit_introducing` primitives underneath it (qa
+/// test-design review).
+fn own_first_commit_evidence_in(dir: &Path, record_rel: &str) -> String {
+    let first_commit = first_commit_introducing_in(dir, record_rel);
+    parse_record(&git_show_in(dir, &format!("{first_commit}:{record_rel}"))).evidence
+}
+
 /// E2's check: every given record's evidence matches its pre-migration
 /// comment byte-for-byte, or legitimately extends it, via
 /// [`fidelity_verdict`]'s decision. `existed_at` is resolved once per
@@ -532,8 +561,7 @@ fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
                 .expect("record path should be under the repo root")
                 .to_str()
                 .unwrap();
-            let first_commit = first_commit_introducing(record_rel);
-            parse_record(&git_show(&format!("{first_commit}:{record_rel}"))).evidence
+            own_first_commit_evidence_in(&repo_root(), record_rel)
         };
 
         if let Some(reason) = fidelity_verdict(
@@ -654,11 +682,25 @@ fn feature_structure_mismatch(historical_stripped: &str, actual: &str) -> Option
 /// was accepted).
 fn content_baseline_rev_and_path(path: &Path) -> String {
     let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
-    let pinned = format!("{}^:{rel}", migration_commit_for(path));
-    if existed_at(&pinned) {
-        return pinned;
+    content_baseline_rev_and_path_in(&repo_root(), &rel, Some(migration_commit_for(path)))
+}
+
+/// [`content_baseline_rev_and_path`], against an arbitrary git working
+/// directory and an explicit (optional) pinned commit rather than always
+/// this project's own two fixed migration commits -- lets a hermetic test
+/// drive the real integration logic (not just the `existed_at`/
+/// `first_commit_introducing` primitives underneath it) against a small,
+/// throwaway repo (qa test-design review: the prior hermetic test only
+/// covered the primitives, not the two functions the fallback is actually
+/// wired into).
+fn content_baseline_rev_and_path_in(dir: &Path, rel: &str, pinned_commit: Option<&str>) -> String {
+    if let Some(commit) = pinned_commit {
+        let pinned = format!("{commit}^:{rel}");
+        if existed_at_in(dir, &pinned) {
+            return pinned;
+        }
     }
-    format!("{}:{rel}", first_commit_introducing(&rel))
+    format!("{}:{rel}", first_commit_introducing_in(dir, rel))
 }
 
 fn check_content_unchanged() -> Vec<String> {
@@ -805,9 +847,10 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        ScenarioBlock, content_baseline_rev_and_path, evidence_preserves_original, existed_at,
-        existed_at_in, feature_structure_mismatch, fidelity_verdict, first_commit_introducing_in,
-        missing_records,
+        ScenarioBlock, content_baseline_rev_and_path, content_baseline_rev_and_path_in,
+        evidence_preserves_original, existed_at, existed_at_in, feature_structure_mismatch,
+        fidelity_verdict, first_commit_introducing_in, git_show_in, missing_records,
+        own_first_commit_evidence_in,
     };
 
     #[test]
@@ -967,6 +1010,28 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "plain relative path")]
+    fn parse_record_rejects_a_feature_file_reference_outside_the_features_directory() {
+        // qa test-design review: a relative, dot-free path pointing
+        // somewhere else entirely (no ".." needed) previously sailed
+        // through untouched.
+        super::parse_record(
+            "**Scenario:** E1 — x\n**Feature file:** `src/lib.rs`\n\n## Evidence\n\n```\ntext\n```\n",
+        );
+    }
+
+    #[test]
+    fn parse_record_accepts_a_feature_file_reference_with_a_harmless_leading_dot_slash() {
+        // Locks in the boundary qa's review named: "unusual but
+        // legitimate" (still unambiguously under features/) vs. real
+        // traversal/misdirection.
+        let record = super::parse_record(
+            "**Scenario:** E1 — x\n**Feature file:** `./features/foo.feature`\n\n## Evidence\n\n```\ntext\n```\n",
+        );
+        assert_eq!(record.feature_file, "./features/foo.feature");
+    }
+
+    #[test]
     fn content_baseline_uses_the_pinned_migration_commit_for_an_already_migrated_file() {
         let path = Path::new("features/B1-walking-skeleton.feature");
         assert_eq!(
@@ -978,29 +1043,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_files_own_first_commit_is_correctly_identified_in_a_hermetic_repo() {
-        // A small, throwaway git repo -- NOT this project's own history --
-        // with two commits: the first has no feature file at all, the
-        // second adds one. Proves existed_at_in/first_commit_introducing_in
-        // genuinely distinguish "exists now" from "existed at some earlier
-        // commit" end to end, without waiting for (or polluting) this
-        // project's real history with an actual post-migration file (qa
-        // test-design review: the only committed way to exercise the
-        // fallback logic, since every file in THIS repo today happens to
-        // predate the fixed migration commits).
-        let dir = std::env::temp_dir().join(format!(
-            "magiclisp-trace1-hermetic-{}-{}",
-            std::process::id(),
-            "a_files_own_first_commit_is_correctly_identified_in_a_hermetic_repo"
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A small, throwaway git repo -- NOT this project's own history --
+    /// for driving TRACE1's real git-backed functions end to end without
+    /// waiting for (or polluting) this project's actual history with a
+    /// genuine post-migration file (qa test-design review). Cleaned up on
+    /// `Drop`, so a mid-test panic still removes it instead of leaking a
+    /// temp directory.
+    struct HermeticRepo {
+        dir: std::path::PathBuf,
+    }
 
-        let git = |args: &[&str]| {
+    impl HermeticRepo {
+        fn new(test_name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "magiclisp-trace1-hermetic-{}-{test_name}",
+                std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = HermeticRepo { dir };
+            repo.git(&["init", "-q"]);
+            repo.git(&["config", "user.email", "trace1-hermetic-test@example.com"]);
+            repo.git(&["config", "user.name", "TRACE1 hermetic test"]);
+            repo
+        }
+
+        fn git(&self, args: &[&str]) {
             let out = Command::new("git")
                 .args(args)
-                .current_dir(&dir)
+                .current_dir(&self.dir)
                 .output()
                 .expect("git should run");
             assert!(
@@ -1008,39 +1079,158 @@ mod tests {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "trace1-hermetic-test@example.com"]);
-        git(&["config", "user.name", "TRACE1 hermetic test"]);
-        std::fs::write(
-            dir.join("unrelated.txt"),
-            "commit 1 -- no feature file yet\n",
-        )
-        .unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-q", "-m", "commit 1"]);
+        }
 
-        std::fs::create_dir_all(dir.join("features")).unwrap();
-        std::fs::write(
-            dir.join("features/NEW-behaviour.feature"),
+        fn write(&self, rel: &str, content: &str) {
+            let path = self.dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+
+        fn commit_all(&self, message: &str) {
+            self.git(&["add", "."]);
+            self.git(&["commit", "-q", "-m", message]);
+        }
+    }
+
+    impl Drop for HermeticRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_files_own_first_commit_is_correctly_identified_in_a_hermetic_repo() {
+        // Two commits: the first has no feature file at all, the second
+        // adds one. Proves existed_at_in/first_commit_introducing_in
+        // genuinely distinguish "exists now" from "existed at some
+        // earlier commit" end to end.
+        let repo = HermeticRepo::new("first_commit");
+        repo.write("unrelated.txt", "commit 1 -- no feature file yet\n");
+        repo.commit_all("commit 1");
+        repo.write(
+            "features/NEW-behaviour.feature",
             "Feature: a behaviour born in commit 2\n",
-        )
-        .unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-q", "-m", "commit 2 -- adds the feature file"]);
+        );
+        repo.commit_all("commit 2 -- adds the feature file");
 
         let rel = "features/NEW-behaviour.feature";
-        let introducing = first_commit_introducing_in(&dir, rel);
+        let introducing = first_commit_introducing_in(&repo.dir, rel);
         assert!(
-            existed_at_in(&dir, &format!("{introducing}:{rel}")),
+            existed_at_in(&repo.dir, &format!("{introducing}:{rel}")),
             "the file should exist at its own introducing commit"
         );
         assert!(
-            !existed_at_in(&dir, &format!("{introducing}^:{rel}")),
+            !existed_at_in(&repo.dir, &format!("{introducing}^:{rel}")),
             "the file should NOT exist at the commit right before its own introduction"
         );
+    }
 
-        std::fs::remove_dir_all(&dir).unwrap();
+    #[test]
+    fn content_baseline_and_fidelity_are_derived_correctly_end_to_end_in_a_hermetic_repo() {
+        // qa test-design review: the prior hermetic test only exercised
+        // existed_at_in/first_commit_introducing_in directly -- this drives
+        // the actual integration points (content_baseline_rev_and_path_in,
+        // own_first_commit_evidence_in, feature_structure_mismatch,
+        // fidelity_verdict) a real post-migration behaviour's checks are
+        // wired through, catching a bug specific to how they're combined
+        // (wrong path construction, flipped branch, wrong comparison
+        // order) that the primitives alone can't.
+        let repo = HermeticRepo::new("content_and_fidelity");
+        repo.write("unrelated.txt", "commit 1 -- no behaviour yet\n");
+        repo.commit_all("commit 1");
+
+        repo.write(
+            "features/NEW.feature",
+            "Feature: a behaviour born after the fixed migration commits\n  \
+             Scenario: E1 — a real scenario\n    Given a real precondition\n    Then a real assertion is checked\n",
+        );
+        repo.write(
+            "traceability/NEW/E1.md",
+            "**Scenario:** E1 — a real scenario\n**Feature file:** `features/NEW.feature`\n\n## Evidence\n\n```\nOriginal, first-committed evidence.\n```\n",
+        );
+        repo.commit_all("commit 2 -- adds the behaviour and its evidence");
+
+        let feature_rel = "features/NEW.feature";
+        let record_rel = "traceability/NEW/E1.md";
+
+        // content_baseline_rev_and_path_in: no pinned commit (simulating a
+        // file that postdates both of this project's fixed migration
+        // commits) -- must fall back to the file's own first commit.
+        let baseline = content_baseline_rev_and_path_in(&repo.dir, feature_rel, None);
+        let baseline_content = git_show_in(&repo.dir, &baseline);
+        let current_content = std::fs::read_to_string(repo.dir.join(feature_rel)).unwrap();
+        assert!(
+            feature_structure_mismatch(&baseline_content, &current_content).is_none(),
+            "the file's current content should match its own unaltered first-committed baseline"
+        );
+
+        // own_first_commit_evidence_in: the record's evidence, straight
+        // from its own introducing commit.
+        let original_evidence = own_first_commit_evidence_in(&repo.dir, record_rel);
+        assert_eq!(original_evidence, "Original, first-committed evidence.");
+        assert_eq!(
+            fidelity_verdict(&original_evidence, false, None, &original_evidence),
+            None,
+            "a record's own unaltered evidence must be faithful to itself"
+        );
+
+        // Now tamper: weaken the feature's steps AND alter the record's
+        // evidence, leaving titles/references untouched, without a new
+        // commit (the working tree is what check_content_unchanged and
+        // check_fidelity actually read for the CURRENT side).
+        repo.write(
+            "features/NEW.feature",
+            "Feature: a behaviour born after the fixed migration commits\n  \
+             Scenario: E1 — a real scenario\n    Given nothing at all now (weakened)\n    Then nothing is checked (assertion dropped)\n",
+        );
+        repo.write(
+            "traceability/NEW/E1.md",
+            "**Scenario:** E1 — a real scenario\n**Feature file:** `features/NEW.feature`\n\n## Evidence\n\n```\nTampered evidence, not what was first committed.\n```\n",
+        );
+
+        let tampered_feature = std::fs::read_to_string(repo.dir.join(feature_rel)).unwrap();
+        assert!(
+            feature_structure_mismatch(&baseline_content, &tampered_feature).is_some(),
+            "weakening the steps after acceptance must be caught, not silently pass"
+        );
+
+        let tampered_record =
+            super::parse_record(&std::fs::read_to_string(repo.dir.join(record_rel)).unwrap());
+        assert!(
+            fidelity_verdict(&tampered_record.evidence, false, None, &original_evidence).is_some(),
+            "altering the record's evidence after acceptance must be caught, not silently pass"
+        );
+    }
+
+    #[test]
+    fn first_commit_introducing_follows_a_rename() {
+        // qa test-design review: --follow's rename-tracking was untested
+        // anywhere -- neither this project's real history nor the earlier
+        // hermetic test ever renames a feature file. If --follow silently
+        // became a no-op, nothing would catch it.
+        let repo = HermeticRepo::new("rename_tracking");
+        repo.write("unrelated.txt", "commit 1\n");
+        repo.commit_all("commit 1");
+        repo.write(
+            "features/ORIGINAL-NAME.feature",
+            "Feature: before the rename\n",
+        );
+        repo.commit_all("commit 2 -- adds the file under its original name");
+        let introducing = first_commit_introducing_in(&repo.dir, "features/ORIGINAL-NAME.feature");
+
+        repo.git(&[
+            "mv",
+            "features/ORIGINAL-NAME.feature",
+            "features/RENAMED.feature",
+        ]);
+        repo.commit_all("commit 3 -- renames the file");
+
+        assert_eq!(
+            first_commit_introducing_in(&repo.dir, "features/RENAMED.feature"),
+            introducing,
+            "the renamed path's introducing commit should still be the ORIGINAL adding commit, not the rename commit"
+        );
     }
 
     fn scenario(behaviour: &str, expectation: &str, title: &str) -> (String, ScenarioBlock) {
