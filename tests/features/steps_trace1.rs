@@ -257,6 +257,24 @@ fn historical_scenarios() -> Vec<(String, ScenarioBlock)> {
     out
 }
 
+/// Every (behaviour, expectation, title) triple in every CURRENTLY
+/// committed `.feature` file, read straight from the working tree --
+/// unlike `historical_scenarios`, this needs no pre-migration git
+/// snapshot, so completeness holds uniformly for a behaviour's very first
+/// `.feature` file too (B25: a brand-new file has no historical comment
+/// to diff against, but its scenarios still need traceability records).
+fn current_scenarios() -> Vec<(String, ScenarioBlock)> {
+    let mut out = Vec::new();
+    for path in migrated_feature_files() {
+        let behaviour = behaviour_id_from_path(&path);
+        let content = std::fs::read_to_string(&path).unwrap();
+        for block in parse_scenarios(&content) {
+            out.push((behaviour.clone(), block));
+        }
+    }
+    out
+}
+
 /// Reads a traceability record's evidence body (the text inside its
 /// fenced block -- possibly longer than 3 backticks, if the evidence
 /// itself contains an embedded backtick run), and its declared
@@ -318,11 +336,13 @@ fn all_records() -> Vec<PathBuf> {
 // them -- qa test-design review msg #92). Each returns a flat list of
 // problem descriptions; empty means the check passed. ---
 
-/// E1's check: every historical (behaviour, expectation) has a
-/// corresponding traceability record.
+/// E1's check: every CURRENT (behaviour, expectation) has a corresponding
+/// traceability record -- checked against what exists today, not only
+/// what existed at the migration commit, so a brand-new behaviour's
+/// first-ever `.feature` file is covered too (B25).
 fn check_completeness() -> Vec<String> {
     let mut missing = Vec::new();
-    for (behaviour, block) in historical_scenarios() {
+    for (behaviour, block) in current_scenarios() {
         let record_path = traceability_dir()
             .join(&behaviour)
             .join(format!("{}.md", block.expectation));
@@ -363,7 +383,12 @@ fn evidence_preserves_original(record_evidence: &str, expected: &str) -> bool {
 
 /// E2's check: every given record's evidence matches its pre-migration
 /// comment byte-for-byte, or legitimately extends it (see
-/// `evidence_preserves_original`).
+/// `evidence_preserves_original`) -- skipped entirely for a record whose
+/// own `.feature` file never existed at the migration commit (B25: a
+/// brand-new behaviour has no pre-migration inline comment to have lost
+/// or altered in the first place, so fidelity doesn't apply -- this is
+/// NOT the same as "no historical scenario found" within an file that
+/// WAS migrated, which is a real, still-flagged problem).
 fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
     let historical = historical_scenarios();
     let mut mismatches = Vec::new();
@@ -377,6 +402,10 @@ fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
             .to_str()
             .unwrap();
         let expectation = record_path.file_stem().unwrap().to_str().unwrap();
+        let commit = migration_commit_for(Path::new(&record.feature_file));
+        if !existed_at(&format!("{commit}^:{}", record.feature_file)) {
+            continue;
+        }
         let Some((_, block)) = historical
             .iter()
             .find(|(b, blk)| b == behaviour && blk.expectation == expectation)
