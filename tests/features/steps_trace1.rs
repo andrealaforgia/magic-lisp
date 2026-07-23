@@ -234,30 +234,40 @@ fn existed_at_in(dir: &Path, rev_and_path: &str) -> bool {
 }
 
 /// The first commit (following renames) that added `rel` to the
-/// repository -- `rel`'s own introducing commit, used as its content
-/// baseline when it postdates both fixed migration commits (warden
-/// security review, High: skipping such a file's checks entirely, rather
-/// than deriving its own baseline, permanently exempted every future
-/// `.feature` file from ever having its content compared against
-/// anything, once its evidence was accepted).
-fn first_commit_introducing(rel: &str) -> String {
+/// repository, together with the path it was actually known by AT THAT
+/// COMMIT -- `rel`'s own introducing commit, used as its content baseline
+/// when it postdates both fixed migration commits (warden security
+/// review, High: skipping such a file's checks entirely, rather than
+/// deriving its own baseline, permanently exempted every future `.feature`
+/// file from ever having its content compared against anything, once its
+/// evidence was accepted). Returning the historical path too -- not just
+/// the commit -- matters: `git show <introducing-commit>:<rel>` using
+/// `rel`'s CURRENT name fails outright once the file has ever been
+/// renamed, since that commit's tree only has it under its original name
+/// (warden security review: reproduced in a disposable repo; the doc
+/// comment's own "(following renames)" claim was false for the one thing
+/// that actually needs the historical name, not just the right commit).
+fn first_commit_introducing(rel: &str) -> (String, String) {
     first_commit_introducing_in(&repo_root(), rel)
 }
 
-fn first_commit_introducing_in(dir: &Path, rel: &str) -> String {
+fn first_commit_introducing_in(dir: &Path, rel: &str) -> (String, String) {
     // `--follow` and `--reverse` don't cooperate (a real, reproducible git
     // limitation, not a typo): combined, they silently produce EMPTY
     // output instead of the reversed list `--follow` alone gives -- caught
     // by this function's own rename-tracking hermetic test. So this asks
-    // for the default newest-first order and takes the LAST line (the
-    // oldest / first-added commit) instead of reversing and taking the
-    // first.
+    // for the default newest-first order and reads from the end (the
+    // oldest / first-added commit) instead of reversing and reading from
+    // the start. `--name-only` alongside `--diff-filter=A` prints the
+    // path exactly as it existed at each such commit, right after that
+    // commit's own marker line.
     let out = Command::new("git")
         .args([
             "log",
             "--follow",
             "--diff-filter=A",
-            "--format=%H",
+            "--name-only",
+            "--format=COMMIT:%H",
             "--",
             rel,
         ])
@@ -269,11 +279,22 @@ fn first_commit_introducing_in(dir: &Path, rel: &str) -> String {
         "git log --follow failed for {rel}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .last()
-        .unwrap_or_else(|| panic!("{rel}: no commit in this repository's history ever added it"))
-        .to_string()
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    let commit_idx = lines
+        .iter()
+        .rposition(|l| l.starts_with("COMMIT:"))
+        .unwrap_or_else(|| panic!("{rel}: no commit in this repository's history ever added it"));
+    let commit = lines[commit_idx]
+        .strip_prefix("COMMIT:")
+        .unwrap()
+        .to_string();
+    let historical_path = lines[commit_idx + 1..]
+        .iter()
+        .find(|l| !l.is_empty())
+        .unwrap_or_else(|| panic!("{rel}: introducing commit {commit} recorded no path"))
+        .to_string();
+    (commit, historical_path)
 }
 
 /// `git show <rev>:<path>` from the repo root, as raw bytes decoded lossily
@@ -517,8 +538,8 @@ fn fidelity_verdict(
 /// `git_show`/`first_commit_introducing` primitives underneath it (qa
 /// test-design review).
 fn own_first_commit_evidence_in(dir: &Path, record_rel: &str) -> String {
-    let first_commit = first_commit_introducing_in(dir, record_rel);
-    parse_record(&git_show_in(dir, &format!("{first_commit}:{record_rel}"))).evidence
+    let (commit, historical_path) = first_commit_introducing_in(dir, record_rel);
+    parse_record(&git_show_in(dir, &format!("{commit}:{historical_path}"))).evidence
 }
 
 /// E2's check: every given record's evidence matches its pre-migration
@@ -700,7 +721,8 @@ fn content_baseline_rev_and_path_in(dir: &Path, rel: &str, pinned_commit: Option
             return pinned;
         }
     }
-    format!("{}:{rel}", first_commit_introducing_in(dir, rel))
+    let (commit, historical_path) = first_commit_introducing_in(dir, rel);
+    format!("{commit}:{historical_path}")
 }
 
 fn check_content_unchanged() -> Vec<String> {
@@ -981,8 +1003,12 @@ mod tests {
         // didn't exist at some earlier real commit). Uses a real tracked
         // file's own real history instead of a stand-in path.
         let rel = "features/B23-dotted-list-round-trip.feature";
-        let first_commit = super::first_commit_introducing(rel);
-        assert!(!existed_at(&format!("{first_commit}^:{rel}")));
+        let (first_commit, historical_path) = super::first_commit_introducing(rel);
+        assert_eq!(
+            historical_path, rel,
+            "never renamed, so the same path throughout"
+        );
+        assert!(!existed_at(&format!("{first_commit}^:{historical_path}")));
     }
 
     #[test]
@@ -1115,13 +1141,17 @@ mod tests {
         repo.commit_all("commit 2 -- adds the feature file");
 
         let rel = "features/NEW-behaviour.feature";
-        let introducing = first_commit_introducing_in(&repo.dir, rel);
+        let (introducing, historical_path) = first_commit_introducing_in(&repo.dir, rel);
+        assert_eq!(
+            historical_path, rel,
+            "never renamed, so the same path throughout"
+        );
         assert!(
-            existed_at_in(&repo.dir, &format!("{introducing}:{rel}")),
+            existed_at_in(&repo.dir, &format!("{introducing}:{historical_path}")),
             "the file should exist at its own introducing commit"
         );
         assert!(
-            !existed_at_in(&repo.dir, &format!("{introducing}^:{rel}")),
+            !existed_at_in(&repo.dir, &format!("{introducing}^:{historical_path}")),
             "the file should NOT exist at the commit right before its own introduction"
         );
     }
@@ -1217,7 +1247,9 @@ mod tests {
             "Feature: before the rename\n",
         );
         repo.commit_all("commit 2 -- adds the file under its original name");
-        let introducing = first_commit_introducing_in(&repo.dir, "features/ORIGINAL-NAME.feature");
+        let (introducing, introducing_path) =
+            first_commit_introducing_in(&repo.dir, "features/ORIGINAL-NAME.feature");
+        assert_eq!(introducing_path, "features/ORIGINAL-NAME.feature");
 
         repo.git(&[
             "mv",
@@ -1226,10 +1258,26 @@ mod tests {
         ]);
         repo.commit_all("commit 3 -- renames the file");
 
+        let (after_rename_commit, after_rename_path) =
+            first_commit_introducing_in(&repo.dir, "features/RENAMED.feature");
         assert_eq!(
-            first_commit_introducing_in(&repo.dir, "features/RENAMED.feature"),
-            introducing,
+            after_rename_commit, introducing,
             "the renamed path's introducing commit should still be the ORIGINAL adding commit, not the rename commit"
+        );
+        // warden security review: the introducing commit's tree only has
+        // the file under its ORIGINAL name -- querying it with the file's
+        // CURRENT (post-rename) name fails outright. The returned
+        // historical path must be the one that actually resolves.
+        assert_eq!(
+            after_rename_path, "features/ORIGINAL-NAME.feature",
+            "the historical path must be the name the file had AT the introducing commit, not its current name"
+        );
+        assert!(
+            existed_at_in(
+                &repo.dir,
+                &format!("{after_rename_commit}:{after_rename_path}")
+            ),
+            "git show/cat-file must actually be able to resolve (commit, historical path) together"
         );
     }
 
