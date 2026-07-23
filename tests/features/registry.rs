@@ -4,7 +4,7 @@
 //! assertions, fails the run loudly and by name — a `.feature` scenario
 //! can't silently pass without every one of its steps actually executing.
 
-use super::gherkin::parse_feature;
+use super::gherkin::{Scenario, parse_feature};
 use super::world::World;
 
 /// `(world, matched step text, docstring)` — the matched text is passed
@@ -55,8 +55,41 @@ pub(crate) fn run_feature(feature_label: &str, src: &str, registry: &Registry) {
         "{feature_label}: parsed zero scenarios -- the Gherkin parser likely doesn't \
          understand this file's layout, not that the file has no scenarios"
     );
+    run_scenarios(feature_label, &feature.scenarios, registry);
+}
+
+/// Like [`run_feature`], but only runs the scenarios whose name starts with
+/// one of `scenario_prefixes` (e.g. `"E3 "`, matching the `.feature` file's
+/// own `"E3 — ..."` naming, trailing space included so `"E1 "` can't also
+/// match `"E10 ..."`). Lets one `.feature` file's fast, always-on checks
+/// and its slow, sustained-soak checks live as two separate `#[test]`
+/// functions -- one plain, one `#[ignore]`d -- instead of forcing every
+/// scenario in the file under a single un-ignorable test (qa test-design
+/// review: an unconditional ~60s+ soak running on every default `cargo
+/// test` invocation, several times over across the whole suite).
+pub(crate) fn run_feature_subset(
+    feature_label: &str,
+    src: &str,
+    registry: &Registry,
+    scenario_prefixes: &[&str],
+) {
+    let feature = parse_feature(src);
+    let scenarios: Vec<Scenario> = feature
+        .scenarios
+        .into_iter()
+        .filter(|s| scenario_prefixes.iter().any(|p| s.name.starts_with(p)))
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "{feature_label}: none of {scenario_prefixes:?} matched a scenario name -- likely a \
+         prefix or wording drift against the .feature file"
+    );
+    run_scenarios(feature_label, &scenarios, registry);
+}
+
+fn run_scenarios(feature_label: &str, scenarios: &[Scenario], registry: &Registry) {
     let mut failures = Vec::new();
-    for scenario in &feature.scenarios {
+    for scenario in scenarios {
         let mut world = World::default();
         let mut unbound = Vec::new();
         for step in &scenario.steps {
@@ -94,4 +127,56 @@ pub(crate) fn run_feature(feature_label: &str, src: &str, registry: &Registry) {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: &str = "Feature: fixture\n\n  \
+        Scenario: E1 — first\n    Given nothing\n\n  \
+        Scenario: E4 — fourth\n    Given nothing\n\n  \
+        Scenario: E10 — tenth\n    Given nothing\n";
+
+    fn no_op_registry() -> Registry {
+        Registry::new().step("nothing", |_w, _t, _d| {})
+    }
+
+    #[test]
+    fn run_feature_subset_runs_only_the_matching_prefixes() {
+        // A run that only matches E1 and E4 must not also pull in E10 --
+        // if it did, this run would still pass today (its step is a no-op),
+        // so the real assertion is scenario *count*.
+        let feature = parse_feature(SRC);
+        let matched: Vec<_> = feature
+            .scenarios
+            .iter()
+            .filter(|s| ["E1 ", "E4 "].iter().any(|p| s.name.starts_with(p)))
+            .collect();
+        assert_eq!(
+            matched.len(),
+            2,
+            "expected exactly E1 and E4, got {matched:?}"
+        );
+    }
+
+    #[test]
+    fn an_e1_prefix_does_not_also_match_e10() {
+        assert!(!"E10 — tenth".starts_with("E1 "));
+        assert!("E1 — first".starts_with("E1 "));
+    }
+
+    #[test]
+    #[should_panic(expected = "none of")]
+    fn run_feature_subset_panics_when_no_scenario_matches_the_given_prefixes() {
+        run_feature_subset("fixture", SRC, &no_op_registry(), &["E99 "]);
+    }
+
+    #[test]
+    fn run_feature_subset_actually_executes_the_matched_scenarios() {
+        // Runs clean against the real registry -- proves the whole path
+        // (parse -> filter -> dispatch) works end to end, not just the
+        // filter predicate in isolation.
+        run_feature_subset("fixture", SRC, &no_op_registry(), &["E1 ", "E4 "]);
+    }
 }

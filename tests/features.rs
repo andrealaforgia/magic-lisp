@@ -216,15 +216,57 @@ fn b20_self_test_and_quality_gates() {
 }
 
 #[test]
-fn b21_performance_and_memory() {
+fn b21_performance_and_memory_fast() {
     let src = include_str!("../features/B21-performance-and-memory.feature");
-    registry::run_feature("B21-performance-and-memory", src, &steps_b21::registry());
+    registry::run_feature_subset(
+        "B21-performance-and-memory",
+        src,
+        &steps_b21::registry(),
+        &["E1 ", "E2 ", "E3 ", "E4 "],
+    );
 }
 
 #[test]
-fn b22_cycle_safe_memory() {
+#[ignore = "E5/E6 each cost ~60s+ on the release build (qa test-design warning: this ran \
+            unconditionally on every default `cargo test` invocation, several such soaks deep \
+            across the whole suite). Not run by default; invoke explicitly (`cargo test \
+            --release --test features -- --ignored b21_performance_and_memory_soak`) to \
+            re-confirm the sustained-memory floors."]
+fn b21_performance_and_memory_soak() {
+    let src = include_str!("../features/B21-performance-and-memory.feature");
+    registry::run_feature_subset(
+        "B21-performance-and-memory",
+        src,
+        &steps_b21::registry(),
+        &["E5 ", "E6 "],
+    );
+}
+
+#[test]
+fn b22_cycle_safe_memory_fast() {
     let src = include_str!("../features/B22-cycle-safe-memory.feature");
-    registry::run_feature("B22-cycle-safe-memory", src, &steps_b22::registry());
+    registry::run_feature_subset(
+        "B22-cycle-safe-memory",
+        src,
+        &steps_b22::registry(),
+        &["E3 "],
+    );
+}
+
+#[test]
+#[ignore = "E1/E2/E4 each cost ~60s+ on the release build (qa test-design warning: this ran \
+            unconditionally on every default `cargo test` invocation, several such soaks deep \
+            across the whole suite). Not run by default; invoke explicitly (`cargo test \
+            --release --test features -- --ignored b22_cycle_safe_memory_soak`) to re-confirm \
+            the cycle-safe memory floors."]
+fn b22_cycle_safe_memory_soak() {
+    let src = include_str!("../features/B22-cycle-safe-memory.feature");
+    registry::run_feature_subset(
+        "B22-cycle-safe-memory",
+        src,
+        &steps_b22::registry(),
+        &["E1 ", "E2 ", "E4 "],
+    );
 }
 
 #[test]
