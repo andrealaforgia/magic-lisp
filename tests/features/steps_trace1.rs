@@ -1277,6 +1277,21 @@ mod tests {
         (repo, pinned_commit)
     }
 
+    /// Asserts `baseline` is the PINNED-commit form, not the fallback --
+    /// called explicitly from both the accept- and catch-side pinned-branch
+    /// tests below (qa test-design review: each must independently prove
+    /// it exercised the branch it claims to, not borrow that proof from a
+    /// sibling; a shared assertion helper trims the literal duplication
+    /// without reintroducing that coupling, since each call site still
+    /// runs it against its own baseline value).
+    fn assert_took_pinned_branch(baseline: &str, pinned_commit: &str) {
+        assert_eq!(
+            baseline,
+            format!("{pinned_commit}^:{PINNED_BRANCH_FEATURE_REL}"),
+            "OLD.feature existed at the pin, so this must take the pinned branch, not the fallback"
+        );
+    }
+
     #[test]
     fn content_baseline_accepts_an_untampered_behaviour_via_the_pinned_branch() {
         let (repo, pinned_commit) =
@@ -1286,11 +1301,7 @@ mod tests {
             PINNED_BRANCH_FEATURE_REL,
             Some(&pinned_commit),
         );
-        assert_eq!(
-            baseline,
-            format!("{pinned_commit}^:{PINNED_BRANCH_FEATURE_REL}"),
-            "OLD.feature existed at the pin, so this must take the pinned branch, not the fallback"
-        );
+        assert_took_pinned_branch(&baseline, &pinned_commit);
 
         let baseline_content = git_show_in(&repo.dir, &baseline);
         let current_content =
@@ -1316,11 +1327,7 @@ mod tests {
         // the pinned and fallback paths happen to resolve to the same
         // blob, so a regression that silently forced every lookup onto
         // the fallback wouldn't be caught by this test alone.
-        assert_eq!(
-            baseline,
-            format!("{pinned_commit}^:{PINNED_BRANCH_FEATURE_REL}"),
-            "OLD.feature existed at the pin, so this must take the pinned branch, not the fallback"
-        );
+        assert_took_pinned_branch(&baseline, &pinned_commit);
         let baseline_content = git_show_in(&repo.dir, &baseline);
 
         repo.write(
