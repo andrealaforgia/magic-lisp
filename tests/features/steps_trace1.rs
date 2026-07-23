@@ -208,14 +208,66 @@ fn strip_evidence_blocks(historical_content: &str) -> String {
 /// (examiner msgs #464/#469: reproduced live, a new file's non-existence
 /// at the pinned commit made `git show` fail and panicked five scenarios).
 fn existed_at(rev_and_path: &str) -> bool {
+    existed_at_in(&repo_root(), rev_and_path)
+}
+
+/// [`existed_at`], against an arbitrary git working directory rather than
+/// always this project's own -- lets a test exercise the real check
+/// against a small, hermetic, throwaway repo (qa test-design review: the
+/// only way to prove the fallback/skip logic works without waiting for,
+/// or polluting, this project's own history with a real post-migration
+/// file).
+fn existed_at_in(dir: &Path, rev_and_path: &str) -> bool {
     Command::new("git")
         .arg("cat-file")
         .arg("-e")
         .arg(rev_and_path)
-        .current_dir(repo_root())
+        .current_dir(dir)
+        // Suppresses git's own "fatal: path ... does not exist" on the
+        // expected-false path -- that's this function's normal, checked
+        // return value, not a test failure, and shouldn't read like one in
+        // CI output (qa test-design review).
+        .stderr(std::process::Stdio::null())
         .status()
         .expect("git should run")
         .success()
+}
+
+/// The first commit (following renames) that added `rel` to the
+/// repository -- `rel`'s own introducing commit, used as its content
+/// baseline when it postdates both fixed migration commits (warden
+/// security review, High: skipping such a file's checks entirely, rather
+/// than deriving its own baseline, permanently exempted every future
+/// `.feature` file from ever having its content compared against
+/// anything, once its evidence was accepted).
+fn first_commit_introducing(rel: &str) -> String {
+    first_commit_introducing_in(&repo_root(), rel)
+}
+
+fn first_commit_introducing_in(dir: &Path, rel: &str) -> String {
+    let out = Command::new("git")
+        .args([
+            "log",
+            "--follow",
+            "--diff-filter=A",
+            "--format=%H",
+            "--reverse",
+            "--",
+            rel,
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("git should run");
+    assert!(
+        out.status.success(),
+        "git log --follow failed for {rel}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("{rel}: no commit in this repository's history ever added it"))
+        .to_string()
 }
 
 /// `git show <rev>:<path>` from the repo root, as raw bytes decoded lossily
@@ -287,6 +339,16 @@ struct Record {
 
 fn read_record(path: &Path) -> Record {
     let content = std::fs::read_to_string(path).expect("record should be readable");
+    parse_record(&content)
+}
+
+/// [`read_record`]'s parsing, split out so a record's content can also be
+/// read from git history (a specific historical revision), not only from
+/// the working tree -- used to check a post-migration record's evidence
+/// against its own first-committed version (warden security review, High:
+/// see `content_baseline_rev_and_path`'s doc comment for the equivalent
+/// gap this closes for `.feature` file structure).
+fn parse_record(content: &str) -> Record {
     let feature_file = content
         .lines()
         .find_map(|l| l.strip_prefix("**Feature file:** `"))
@@ -383,12 +445,14 @@ fn evidence_preserves_original(record_evidence: &str, expected: &str) -> bool {
 
 /// E2's check: every given record's evidence matches its pre-migration
 /// comment byte-for-byte, or legitimately extends it (see
-/// `evidence_preserves_original`) -- skipped entirely for a record whose
-/// own `.feature` file never existed at the migration commit (B25: a
-/// brand-new behaviour has no pre-migration inline comment to have lost
-/// or altered in the first place, so fidelity doesn't apply -- this is
-/// NOT the same as "no historical scenario found" within an file that
-/// WAS migrated, which is a real, still-flagged problem).
+/// `evidence_preserves_original`). A record whose own `.feature` file
+/// never existed at the migration commit has no pre-migration inline
+/// comment to compare against -- but it must still be checked against
+/// SOMETHING: its own first-committed evidence, so tampering after
+/// initial acceptance is still caught (warden security review, High: an
+/// earlier version of this fix skipped such records outright, a
+/// permanent, indefinite bypass of this exact check for every future
+/// behaviour).
 fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
     let historical = historical_scenarios();
     let mut mismatches = Vec::new();
@@ -404,6 +468,18 @@ fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
         let expectation = record_path.file_stem().unwrap().to_str().unwrap();
         let commit = migration_commit_for(Path::new(&record.feature_file));
         if !existed_at(&format!("{commit}^:{}", record.feature_file)) {
+            let record_rel = record_path
+                .strip_prefix(repo_root())
+                .expect("record path should be under the repo root")
+                .to_str()
+                .unwrap();
+            let first_commit = first_commit_introducing(record_rel);
+            let original = parse_record(&git_show(&format!("{first_commit}:{record_rel}")));
+            if !evidence_preserves_original(&record.evidence, &original.evidence) {
+                mismatches.push(format!(
+                    "{behaviour} {expectation}: evidence text differs from its own first-committed version"
+                ));
+            }
             continue;
         }
         let Some((_, block)) = historical
@@ -489,22 +565,58 @@ fn feature_structure_mismatch(historical_stripped: &str, actual: &str) -> Option
             actual.scenarios.len()
         ));
     }
+    if expected.name != actual.name {
+        // warden security review, Medium: `Feature.name` was never
+        // compared, even though `Feature` derives `PartialEq` over both
+        // `name` and `scenarios` -- a renamed `Feature:` line passed with
+        // zero complaint.
+        return Some(format!(
+            "Feature name changed ({:?} -> {:?})",
+            expected.name, actual.name
+        ));
+    }
     if expected.scenarios != actual.scenarios {
-        return Some("a scenario's name or step content changed".to_string());
+        // qa test-design review: name which scenario/step differs, not
+        // just that something did, so a real failure doesn't need manual
+        // diffing to localize.
+        let first_diff = expected
+            .scenarios
+            .iter()
+            .zip(actual.scenarios.iter())
+            .find(|(e, a)| e != a)
+            .map(|(e, _)| e.name.clone())
+            .unwrap_or_else(|| "<unknown -- lengths matched but zip found nothing>".to_string());
+        return Some(format!(
+            "a scenario's name or step content changed (first differing scenario: {first_diff:?})"
+        ));
     }
     None
+}
+
+/// The `<rev>:<path>` to diff `path`'s content against for E4's
+/// content-unchanged check: the fixed migration commit if `path` existed
+/// there, otherwise `path`'s own first-committed version. Every file gets
+/// a REAL baseline to compare against; none are ever simply exempted
+/// (warden security review, High: the previous fix skipped this check
+/// entirely for any file postdating the fixed migration commits --
+/// permanently, since nothing re-derives a per-file baseline -- which
+/// silently exempted every future `.feature` file's Given/When/Then
+/// structure from ever being checked against anything, once its evidence
+/// was accepted).
+fn content_baseline_rev_and_path(path: &Path) -> String {
+    let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
+    let pinned = format!("{}^:{rel}", migration_commit_for(path));
+    if existed_at(&pinned) {
+        return pinned;
+    }
+    format!("{}:{rel}", first_commit_introducing(&rel))
 }
 
 fn check_content_unchanged() -> Vec<String> {
     let mut problems = Vec::new();
     for path in migrated_feature_files() {
         let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
-        let commit = migration_commit_for(&path);
-        let rev_and_path = format!("{commit}^:{rel}");
-        if !existed_at(&rev_and_path) {
-            continue;
-        }
-        let historical = git_show(&rev_and_path);
+        let historical = git_show(&content_baseline_rev_and_path(&path));
         let expected = strip_evidence_blocks(&historical);
         let actual = std::fs::read_to_string(&path).unwrap();
         if let Some(reason) = feature_structure_mismatch(&expected, &actual) {
@@ -640,7 +752,13 @@ pub(crate) fn registry() -> Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{evidence_preserves_original, existed_at, feature_structure_mismatch};
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{
+        content_baseline_rev_and_path, evidence_preserves_original, existed_at, existed_at_in,
+        feature_structure_mismatch, first_commit_introducing_in,
+    };
 
     #[test]
     fn an_exact_match_is_faithful() {
@@ -764,14 +882,98 @@ mod tests {
     }
 
     #[test]
-    fn existed_at_is_false_for_a_file_born_after_the_migration() {
-        // Examiner msgs #464/#469: reproduced live -- a brand-new .feature
-        // file has no blob at the migration commit's parent, and
-        // historical_scenarios/check_content_unchanged must skip it
-        // instead of hard-panicking on git show's failure.
+    fn existed_at_is_false_for_a_real_file_at_the_commit_right_before_its_own_first_one() {
+        // qa test-design review: a path that never existed at all doesn't
+        // test the actual hazard (a file that exists on disk NOW but
+        // didn't exist at some earlier real commit). Uses a real tracked
+        // file's own real history instead of a stand-in path.
+        let rel = "features/B23-dotted-list-round-trip.feature";
+        let first_commit = super::first_commit_introducing(rel);
+        assert!(!existed_at(&format!("{first_commit}^:{rel}")));
+    }
+
+    #[test]
+    fn existed_at_is_false_for_a_file_that_never_existed_at_all() {
         assert!(!existed_at(&format!(
             "{}^:features/this-file-does-not-exist.feature",
             super::MIGRATION_COMMIT
         )));
+    }
+
+    #[test]
+    fn content_baseline_uses_the_pinned_migration_commit_for_an_already_migrated_file() {
+        let path = Path::new("features/B1-walking-skeleton.feature");
+        assert_eq!(
+            content_baseline_rev_and_path(path),
+            format!(
+                "{}^:features/B1-walking-skeleton.feature",
+                super::MIGRATION_COMMIT
+            )
+        );
+    }
+
+    #[test]
+    fn a_files_own_first_commit_is_correctly_identified_in_a_hermetic_repo() {
+        // A small, throwaway git repo -- NOT this project's own history --
+        // with two commits: the first has no feature file at all, the
+        // second adds one. Proves existed_at_in/first_commit_introducing_in
+        // genuinely distinguish "exists now" from "existed at some earlier
+        // commit" end to end, without waiting for (or polluting) this
+        // project's real history with an actual post-migration file (qa
+        // test-design review: the only committed way to exercise the
+        // fallback logic, since every file in THIS repo today happens to
+        // predate the fixed migration commits).
+        let dir = std::env::temp_dir().join(format!(
+            "magiclisp-trace1-hermetic-{}-{}",
+            std::process::id(),
+            "a_files_own_first_commit_is_correctly_identified_in_a_hermetic_repo"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git should run");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "trace1-hermetic-test@example.com"]);
+        git(&["config", "user.name", "TRACE1 hermetic test"]);
+        std::fs::write(
+            dir.join("unrelated.txt"),
+            "commit 1 -- no feature file yet\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "commit 1"]);
+
+        std::fs::create_dir_all(dir.join("features")).unwrap();
+        std::fs::write(
+            dir.join("features/NEW-behaviour.feature"),
+            "Feature: a behaviour born in commit 2\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "commit 2 -- adds the feature file"]);
+
+        let rel = "features/NEW-behaviour.feature";
+        let introducing = first_commit_introducing_in(&dir, rel);
+        assert!(
+            existed_at_in(&dir, &format!("{introducing}:{rel}")),
+            "the file should exist at its own introducing commit"
+        );
+        assert!(
+            !existed_at_in(&dir, &format!("{introducing}^:{rel}")),
+            "the file should NOT exist at the commit right before its own introduction"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
