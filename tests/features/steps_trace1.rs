@@ -198,6 +198,26 @@ fn strip_evidence_blocks(historical_content: &str) -> String {
         .join("\n")
 }
 
+/// Whether `rev_and_path` (e.g. `"84f14a9^:features/B24-foo.feature"`)
+/// resolves to a real blob -- distinguishes "this file predates the
+/// migration and has real historical content to check" from "this file
+/// was born after the migration and was never part of what it covers."
+/// `historical_scenarios`/`check_content_unchanged` must skip the latter
+/// rather than hard-fail on it: a brand-new `.feature` file has no
+/// pre-migration inline evidence to lose or alter in the first place
+/// (examiner msgs #464/#469: reproduced live, a new file's non-existence
+/// at the pinned commit made `git show` fail and panicked five scenarios).
+fn existed_at(rev_and_path: &str) -> bool {
+    Command::new("git")
+        .arg("cat-file")
+        .arg("-e")
+        .arg(rev_and_path)
+        .current_dir(repo_root())
+        .status()
+        .expect("git should run")
+        .success()
+}
+
 /// `git show <rev>:<path>` from the repo root, as raw bytes decoded lossily
 /// -- historical content is trusted repo text, not untrusted input.
 fn git_show(rev_and_path: &str) -> String {
@@ -222,10 +242,14 @@ fn git_show(rev_and_path: &str) -> String {
 fn historical_scenarios() -> Vec<(String, ScenarioBlock)> {
     let mut out = Vec::new();
     for path in migrated_feature_files() {
-        let behaviour = behaviour_id_from_path(&path);
         let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
         let commit = migration_commit_for(&path);
-        let content = git_show(&format!("{commit}^:{rel}"));
+        let rev_and_path = format!("{commit}^:{rel}");
+        if !existed_at(&rev_and_path) {
+            continue;
+        }
+        let behaviour = behaviour_id_from_path(&path);
+        let content = git_show(&rev_and_path);
         for block in parse_scenarios(&content) {
             out.push((behaviour.clone(), block));
         }
@@ -447,7 +471,11 @@ fn check_content_unchanged() -> Vec<String> {
     for path in migrated_feature_files() {
         let rel = format!("features/{}", path.file_name().unwrap().to_str().unwrap());
         let commit = migration_commit_for(&path);
-        let historical = git_show(&format!("{commit}^:{rel}"));
+        let rev_and_path = format!("{commit}^:{rel}");
+        if !existed_at(&rev_and_path) {
+            continue;
+        }
+        let historical = git_show(&rev_and_path);
         let expected = strip_evidence_blocks(&historical);
         let actual = std::fs::read_to_string(&path).unwrap();
         if let Some(reason) = feature_structure_mismatch(&expected, &actual) {
@@ -583,7 +611,7 @@ pub(crate) fn registry() -> Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{evidence_preserves_original, feature_structure_mismatch};
+    use super::{evidence_preserves_original, existed_at, feature_structure_mismatch};
 
     #[test]
     fn an_exact_match_is_faithful() {
@@ -696,5 +724,25 @@ mod tests {
             Scenario: E1 — first\n    Given a thing\n    When it happens\n    Then it works\n";
         let mismatch = feature_structure_mismatch(FIXTURE, first_only);
         assert!(mismatch.is_some_and(|m| m.contains("count")));
+    }
+
+    #[test]
+    fn existed_at_is_true_for_a_real_pre_migration_file() {
+        assert!(existed_at(&format!(
+            "{}^:features/B1-walking-skeleton.feature",
+            super::MIGRATION_COMMIT
+        )));
+    }
+
+    #[test]
+    fn existed_at_is_false_for_a_file_born_after_the_migration() {
+        // Examiner msgs #464/#469: reproduced live -- a brand-new .feature
+        // file has no blob at the migration commit's parent, and
+        // historical_scenarios/check_content_unchanged must skip it
+        // instead of hard-panicking on git show's failure.
+        assert!(!existed_at(&format!(
+            "{}^:features/this-file-does-not-exist.feature",
+            super::MIGRATION_COMMIT
+        )));
     }
 }
