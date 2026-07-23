@@ -247,10 +247,6 @@ fn existed_at_in(dir: &Path, rev_and_path: &str) -> bool {
 /// (warden security review: reproduced in a disposable repo; the doc
 /// comment's own "(following renames)" claim was false for the one thing
 /// that actually needs the historical name, not just the right commit).
-fn first_commit_introducing(rel: &str) -> (String, String) {
-    first_commit_introducing_in(&repo_root(), rel)
-}
-
 fn first_commit_introducing_in(dir: &Path, rel: &str) -> (String, String) {
     // `--follow` and `--reverse` don't cooperate (a real, reproducible git
     // limitation, not a typo): combined, they silently produce EMPTY
@@ -1003,7 +999,7 @@ mod tests {
         // didn't exist at some earlier real commit). Uses a real tracked
         // file's own real history instead of a stand-in path.
         let rel = "features/B23-dotted-list-round-trip.feature";
-        let (first_commit, historical_path) = super::first_commit_introducing(rel);
+        let (first_commit, historical_path) = first_commit_introducing_in(&super::repo_root(), rel);
         assert_eq!(
             historical_path, rel,
             "never renamed, so the same path throughout"
@@ -1252,17 +1248,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn content_baseline_uses_the_pinned_branch_correctly_in_a_hermetic_repo() {
-        // Symmetric to the two tests above: the fallback (no-pinned-commit)
-        // branch now has hermetic coverage, but the already-migrated/
-        // pinned-commit branch was still only proven implicitly via the
-        // real trace1_traceability_store suite (qa test-design review).
-        // Simulates an "already migrated" file by treating the repo's own
-        // commit 1 as the pinned migration commit.
-        let repo = HermeticRepo::new("pinned_branch");
+    const PINNED_BRANCH_FEATURE_REL: &str = "features/OLD.feature";
+
+    /// Symmetric to `hermetic_repo_with_a_post_migration_behaviour`: the
+    /// fallback (no-pinned-commit) branch has hermetic coverage, but the
+    /// already-migrated/pinned-commit branch was still only proven
+    /// implicitly via the real `trace1_traceability_store` suite (qa
+    /// test-design review). Simulates an "already migrated" file by
+    /// treating the repo's own commit 1 as the pinned migration commit,
+    /// and returns that commit alongside the repo.
+    fn hermetic_repo_with_a_pinned_migrated_behaviour(test_name: &str) -> (HermeticRepo, String) {
+        let repo = HermeticRepo::new(test_name);
         repo.write(
-            "features/OLD.feature",
+            PINNED_BRANCH_FEATURE_REL,
             "Feature: a behaviour that predates the simulated migration commit\n  \
              Scenario: E1 — a real scenario\n    Given a real precondition\n    Then a real assertion is checked\n",
         );
@@ -1270,36 +1268,56 @@ mod tests {
         repo.write("unrelated.txt", "commit 2 -- plays the role of the pin\n");
         repo.commit_all("commit 2 -- the simulated migration commit");
 
-        let rel = "features/OLD.feature";
-        let pinned_commit = {
-            let out = Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&repo.dir)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo.dir)
+            .output()
+            .unwrap();
+        let pinned_commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (repo, pinned_commit)
+    }
 
-        let baseline = content_baseline_rev_and_path_in(&repo.dir, rel, Some(&pinned_commit));
+    #[test]
+    fn content_baseline_accepts_an_untampered_behaviour_via_the_pinned_branch() {
+        let (repo, pinned_commit) =
+            hermetic_repo_with_a_pinned_migrated_behaviour("pinned_branch_accept");
+        let baseline = content_baseline_rev_and_path_in(
+            &repo.dir,
+            PINNED_BRANCH_FEATURE_REL,
+            Some(&pinned_commit),
+        );
         assert_eq!(
             baseline,
-            format!("{pinned_commit}^:{rel}"),
+            format!("{pinned_commit}^:{PINNED_BRANCH_FEATURE_REL}"),
             "OLD.feature existed at the pin, so this must take the pinned branch, not the fallback"
         );
 
         let baseline_content = git_show_in(&repo.dir, &baseline);
-        let current_content = std::fs::read_to_string(repo.dir.join(rel)).unwrap();
+        let current_content =
+            std::fs::read_to_string(repo.dir.join(PINNED_BRANCH_FEATURE_REL)).unwrap();
         assert!(
             feature_structure_mismatch(&baseline_content, &current_content).is_none(),
             "unaltered content should match the pinned baseline"
         );
+    }
+
+    #[test]
+    fn content_baseline_catches_tampering_via_the_pinned_branch() {
+        let (repo, pinned_commit) =
+            hermetic_repo_with_a_pinned_migrated_behaviour("pinned_branch_catch");
+        let baseline = content_baseline_rev_and_path_in(
+            &repo.dir,
+            PINNED_BRANCH_FEATURE_REL,
+            Some(&pinned_commit),
+        );
+        let baseline_content = git_show_in(&repo.dir, &baseline);
 
         repo.write(
-            rel,
+            PINNED_BRANCH_FEATURE_REL,
             "Feature: a behaviour that predates the simulated migration commit\n  \
              Scenario: E1 — a real scenario\n    Given nothing now (weakened)\n    Then nothing is checked\n",
         );
-        let tampered = std::fs::read_to_string(repo.dir.join(rel)).unwrap();
+        let tampered = std::fs::read_to_string(repo.dir.join(PINNED_BRANCH_FEATURE_REL)).unwrap();
         assert!(
             feature_structure_mismatch(&baseline_content, &tampered).is_some(),
             "tampering after the pinned commit must still be caught via the pinned branch too"
