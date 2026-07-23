@@ -60,23 +60,25 @@ program in one go.
   file — and it reports a clean error with a distinct exit code instead of panicking
   or segfaulting.
 
-## How it manages memory
+## Memory and cycle-safety
 
 MagicLisp doesn't have a general-purpose garbage collector. Most values are cleaned
 up the simple way — reference counting — as soon as nothing points to them anymore.
 
-There's one shape reference counting can't handle on its own: two things that end up
-pointing at each other in a loop (for example, a function that captures a variable
-which is then set to hold that very function). Nothing outside the loop points to it,
-but the pieces inside still point to each other, so plain reference counting never
-reaches zero and the memory would otherwise leak forever.
+There's one shape reference counting can't handle on its own: a **reference cycle**,
+where two or more things end up pointing at each other in a loop — for example, a
+closure (a function that remembers a variable from where it was created) whose
+remembered variable is then set to hold that very closure. Every member of a cycle
+like this keeps every other member's count above zero forever: nothing outside the
+cycle points to it, but the pieces inside still point to each other, so those counts
+never reach zero and the memory would otherwise leak forever.
 
-To catch that, MagicLisp runs a small, focused cleanup pass every so often, only over
-the kind of values that could form such a loop. It checks whether each one is still
-reachable from somewhere outside the loop; if not, it's a genuine piece of garbage and
-gets cleared away. Anything still legitimately in use is left completely alone. This
-pass runs occasionally rather than constantly, so it stays cheap even in long-running
-programs.
+To catch that, MagicLisp runs a small, focused cleanup pass every so often, scoped
+only to the closures and variables that could form such a cycle. It checks whether
+each one is still reachable from somewhere outside the cycle; anything that isn't is
+genuinely unreachable and gets reclaimed. Anything still legitimately in use is left
+completely alone. This pass runs occasionally rather than constantly, so it stays
+cheap even in long-running programs.
 
 ## See it run something real
 

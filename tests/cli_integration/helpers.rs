@@ -242,3 +242,67 @@ pub(crate) fn assert_within_release_ceiling(elapsed: Duration, ceiling: Duration
         "{label} took {elapsed:?}, exceeding the {ceiling:?} release-build ceiling"
     );
 }
+
+/// Spawns `magiclisp` with `args`, samples its resident memory at roughly
+/// 1s (post-startup warmup), 15s, 30s, 45s, and 60s, then kills it -- for
+/// any long-running soak program whose own iteration count is astronomically
+/// large so it never finishes on its own; only the live sampling window
+/// matters. Takes the full argument list (rather than assuming `eval file`)
+/// so a soak run through `run artifact.mlbc` can reuse the identical
+/// spawn/sample/kill shape B21 established for `eval`.
+pub(crate) fn sample_rss_over_a_minute(args: &[&str]) -> Vec<u64> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_magiclisp"))
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should spawn");
+    let pid = child.id();
+
+    std::thread::sleep(Duration::from_secs(1));
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        samples.push(sample_rss_kb(pid));
+        std::thread::sleep(Duration::from_secs(14));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    samples
+}
+
+fn sample_rss_kb(pid: u32) -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps should run");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("could not parse ps rss output: {:?}", out.stdout))
+}
+
+/// Asserts a series of RSS samples plateaus rather than growing without
+/// bound: the growth in the run's second half must not exceed the growth
+/// in its first half by more than a generous slack, AND must itself stay
+/// under a generous absolute cap -- together these catch both an
+/// accelerating leak and a slow-but-steady one, while tolerating the
+/// allocator/OS noise a single-digit-KB comparison would not. Mirrors
+/// B21's own `assert_plateaus` (duplicated there rather than shared, per
+/// that module's pre-existing shape); shared here since B22 needs the
+/// identical check a second time in the same binary.
+pub(crate) fn assert_plateaus(samples: &[u64]) {
+    assert_eq!(samples.len(), 5, "expected 5 RSS samples, got {samples:?}");
+    let first_half_growth = samples[2].saturating_sub(samples[0]) as i64;
+    let second_half_growth = samples[4].saturating_sub(samples[2]) as i64;
+    const GENEROUS_SLACK_KB: i64 = 20_000;
+    assert!(
+        second_half_growth <= first_half_growth + GENEROUS_SLACK_KB,
+        "memory grew faster in the second half of the run ({second_half_growth} KB) than the \
+         first ({first_half_growth} KB) -- samples: {samples:?}"
+    );
+    assert!(
+        second_half_growth <= GENEROUS_SLACK_KB,
+        "memory grew by {second_half_growth} KB in the run's second half -- samples: {samples:?}"
+    );
+}
