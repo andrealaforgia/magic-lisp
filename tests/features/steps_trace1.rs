@@ -1156,80 +1156,177 @@ mod tests {
         );
     }
 
+    const POST_MIGRATION_FEATURE_REL: &str = "features/NEW.feature";
+    const POST_MIGRATION_RECORD_REL: &str = "traceability/NEW/E1.md";
+
+    /// A hermetic repo with one commit that adds a post-migration
+    /// behaviour (a `.feature` file + matching traceability record) on
+    /// top of an earlier, unrelated commit -- shared setup for the
+    /// accept/catch test pair below (qa test-design review: split from
+    /// one bundled 5-assertion test into one purpose per test).
+    fn hermetic_repo_with_a_post_migration_behaviour(test_name: &str) -> HermeticRepo {
+        let repo = HermeticRepo::new(test_name);
+        repo.write("unrelated.txt", "commit 1 -- no behaviour yet\n");
+        repo.commit_all("commit 1");
+        repo.write(
+            POST_MIGRATION_FEATURE_REL,
+            "Feature: a behaviour born after the fixed migration commits\n  \
+             Scenario: E1 — a real scenario\n    Given a real precondition\n    Then a real assertion is checked\n",
+        );
+        repo.write(
+            POST_MIGRATION_RECORD_REL,
+            "**Scenario:** E1 — a real scenario\n**Feature file:** `features/NEW.feature`\n\n## Evidence\n\n```\nOriginal, first-committed evidence.\n```\n",
+        );
+        repo.commit_all("commit 2 -- adds the behaviour and its evidence");
+        repo
+    }
+
     #[test]
-    fn content_baseline_and_fidelity_are_derived_correctly_end_to_end_in_a_hermetic_repo() {
+    fn content_baseline_and_fidelity_accept_an_untampered_post_migration_behaviour() {
         // qa test-design review: the prior hermetic test only exercised
         // existed_at_in/first_commit_introducing_in directly -- this drives
         // the actual integration points (content_baseline_rev_and_path_in,
         // own_first_commit_evidence_in, feature_structure_mismatch,
         // fidelity_verdict) a real post-migration behaviour's checks are
         // wired through, catching a bug specific to how they're combined
-        // (wrong path construction, flipped branch, wrong comparison
-        // order) that the primitives alone can't.
-        let repo = HermeticRepo::new("content_and_fidelity");
-        repo.write("unrelated.txt", "commit 1 -- no behaviour yet\n");
-        repo.commit_all("commit 1");
+        // that the primitives alone can't.
+        let repo = hermetic_repo_with_a_post_migration_behaviour("content_and_fidelity_accept");
 
-        repo.write(
-            "features/NEW.feature",
-            "Feature: a behaviour born after the fixed migration commits\n  \
-             Scenario: E1 — a real scenario\n    Given a real precondition\n    Then a real assertion is checked\n",
-        );
-        repo.write(
-            "traceability/NEW/E1.md",
-            "**Scenario:** E1 — a real scenario\n**Feature file:** `features/NEW.feature`\n\n## Evidence\n\n```\nOriginal, first-committed evidence.\n```\n",
-        );
-        repo.commit_all("commit 2 -- adds the behaviour and its evidence");
-
-        let feature_rel = "features/NEW.feature";
-        let record_rel = "traceability/NEW/E1.md";
-
-        // content_baseline_rev_and_path_in: no pinned commit (simulating a
-        // file that postdates both of this project's fixed migration
-        // commits) -- must fall back to the file's own first commit.
-        let baseline = content_baseline_rev_and_path_in(&repo.dir, feature_rel, None);
+        // No pinned commit (simulating a file that postdates both of this
+        // project's fixed migration commits) -- must fall back to the
+        // file's own first commit.
+        let baseline =
+            content_baseline_rev_and_path_in(&repo.dir, POST_MIGRATION_FEATURE_REL, None);
         let baseline_content = git_show_in(&repo.dir, &baseline);
-        let current_content = std::fs::read_to_string(repo.dir.join(feature_rel)).unwrap();
+        let current_content =
+            std::fs::read_to_string(repo.dir.join(POST_MIGRATION_FEATURE_REL)).unwrap();
         assert!(
             feature_structure_mismatch(&baseline_content, &current_content).is_none(),
             "the file's current content should match its own unaltered first-committed baseline"
         );
 
-        // own_first_commit_evidence_in: the record's evidence, straight
-        // from its own introducing commit.
-        let original_evidence = own_first_commit_evidence_in(&repo.dir, record_rel);
+        let original_evidence = own_first_commit_evidence_in(&repo.dir, POST_MIGRATION_RECORD_REL);
         assert_eq!(original_evidence, "Original, first-committed evidence.");
         assert_eq!(
             fidelity_verdict(&original_evidence, false, None, &original_evidence),
             None,
             "a record's own unaltered evidence must be faithful to itself"
         );
+    }
 
-        // Now tamper: weaken the feature's steps AND alter the record's
+    #[test]
+    fn content_baseline_and_fidelity_catch_a_tampered_post_migration_behaviour() {
+        let repo = hermetic_repo_with_a_post_migration_behaviour("content_and_fidelity_catch");
+        let baseline =
+            content_baseline_rev_and_path_in(&repo.dir, POST_MIGRATION_FEATURE_REL, None);
+        let baseline_content = git_show_in(&repo.dir, &baseline);
+        let original_evidence = own_first_commit_evidence_in(&repo.dir, POST_MIGRATION_RECORD_REL);
+
+        // Tamper: weaken the feature's steps AND alter the record's
         // evidence, leaving titles/references untouched, without a new
-        // commit (the working tree is what check_content_unchanged and
+        // commit (the working tree is what check_content_unchanged/
         // check_fidelity actually read for the CURRENT side).
         repo.write(
-            "features/NEW.feature",
+            POST_MIGRATION_FEATURE_REL,
             "Feature: a behaviour born after the fixed migration commits\n  \
              Scenario: E1 — a real scenario\n    Given nothing at all now (weakened)\n    Then nothing is checked (assertion dropped)\n",
         );
         repo.write(
-            "traceability/NEW/E1.md",
+            POST_MIGRATION_RECORD_REL,
             "**Scenario:** E1 — a real scenario\n**Feature file:** `features/NEW.feature`\n\n## Evidence\n\n```\nTampered evidence, not what was first committed.\n```\n",
         );
 
-        let tampered_feature = std::fs::read_to_string(repo.dir.join(feature_rel)).unwrap();
+        let tampered_feature =
+            std::fs::read_to_string(repo.dir.join(POST_MIGRATION_FEATURE_REL)).unwrap();
         assert!(
             feature_structure_mismatch(&baseline_content, &tampered_feature).is_some(),
             "weakening the steps after acceptance must be caught, not silently pass"
         );
 
-        let tampered_record =
-            super::parse_record(&std::fs::read_to_string(repo.dir.join(record_rel)).unwrap());
+        let tampered_record = super::parse_record(
+            &std::fs::read_to_string(repo.dir.join(POST_MIGRATION_RECORD_REL)).unwrap(),
+        );
         assert!(
             fidelity_verdict(&tampered_record.evidence, false, None, &original_evidence).is_some(),
             "altering the record's evidence after acceptance must be caught, not silently pass"
+        );
+    }
+
+    #[test]
+    fn content_baseline_uses_the_pinned_branch_correctly_in_a_hermetic_repo() {
+        // Symmetric to the two tests above: the fallback (no-pinned-commit)
+        // branch now has hermetic coverage, but the already-migrated/
+        // pinned-commit branch was still only proven implicitly via the
+        // real trace1_traceability_store suite (qa test-design review).
+        // Simulates an "already migrated" file by treating the repo's own
+        // commit 1 as the pinned migration commit.
+        let repo = HermeticRepo::new("pinned_branch");
+        repo.write(
+            "features/OLD.feature",
+            "Feature: a behaviour that predates the simulated migration commit\n  \
+             Scenario: E1 — a real scenario\n    Given a real precondition\n    Then a real assertion is checked\n",
+        );
+        repo.commit_all("commit 1 -- predates the simulated migration commit");
+        repo.write("unrelated.txt", "commit 2 -- plays the role of the pin\n");
+        repo.commit_all("commit 2 -- the simulated migration commit");
+
+        let rel = "features/OLD.feature";
+        let pinned_commit = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo.dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let baseline = content_baseline_rev_and_path_in(&repo.dir, rel, Some(&pinned_commit));
+        assert_eq!(
+            baseline,
+            format!("{pinned_commit}^:{rel}"),
+            "OLD.feature existed at the pin, so this must take the pinned branch, not the fallback"
+        );
+
+        let baseline_content = git_show_in(&repo.dir, &baseline);
+        let current_content = std::fs::read_to_string(repo.dir.join(rel)).unwrap();
+        assert!(
+            feature_structure_mismatch(&baseline_content, &current_content).is_none(),
+            "unaltered content should match the pinned baseline"
+        );
+
+        repo.write(
+            rel,
+            "Feature: a behaviour that predates the simulated migration commit\n  \
+             Scenario: E1 — a real scenario\n    Given nothing now (weakened)\n    Then nothing is checked\n",
+        );
+        let tampered = std::fs::read_to_string(repo.dir.join(rel)).unwrap();
+        assert!(
+            feature_structure_mismatch(&baseline_content, &tampered).is_some(),
+            "tampering after the pinned commit must still be caught via the pinned branch too"
+        );
+    }
+
+    #[test]
+    fn hermetic_repo_cleans_up_even_when_a_panic_unwinds_through_it() {
+        // qa test-design review: Drop-on-panic cleanup was an asserted
+        // claim, not a proven one -- no committed test unwound through a
+        // HermeticRepo. Moves it into a panicking closure so its Drop
+        // runs during unwinding, not merely at normal scope exit.
+        let repo = HermeticRepo::new("panic_cleanup");
+        let dir = repo.dir.clone();
+        assert!(
+            dir.exists(),
+            "sanity check: the repo should exist before the panic"
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _repo = repo;
+            panic!("deliberate -- proving Drop runs during unwind, not just normal scope exit");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !dir.exists(),
+            "HermeticRepo's Drop should have removed the directory during the panic's unwind"
         );
     }
 
