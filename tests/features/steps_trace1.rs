@@ -408,24 +408,34 @@ fn all_records() -> Vec<PathBuf> {
 // them -- qa test-design review msg #92). Each returns a flat list of
 // problem descriptions; empty means the check passed. ---
 
+/// The pure decision behind E1's completeness check: which (behaviour,
+/// expectation) scenarios have no corresponding record, given a predicate
+/// for "does a record exist". Hermetically testable against literal
+/// in-memory fixtures, no filesystem needed (qa test-design review: the
+/// switch from historical- to current-scenario-based completeness had no
+/// committed coverage of its own decision logic).
+fn missing_records(
+    scenarios: &[(String, ScenarioBlock)],
+    record_exists: impl Fn(&str, &str) -> bool,
+) -> Vec<String> {
+    scenarios
+        .iter()
+        .filter(|(behaviour, block)| !record_exists(behaviour, &block.expectation))
+        .map(|(behaviour, block)| format!("{behaviour} {}: {}", block.expectation, block.title))
+        .collect()
+}
+
 /// E1's check: every CURRENT (behaviour, expectation) has a corresponding
 /// traceability record -- checked against what exists today, not only
 /// what existed at the migration commit, so a brand-new behaviour's
 /// first-ever `.feature` file is covered too (B25).
 fn check_completeness() -> Vec<String> {
-    let mut missing = Vec::new();
-    for (behaviour, block) in current_scenarios() {
-        let record_path = traceability_dir()
-            .join(&behaviour)
-            .join(format!("{}.md", block.expectation));
-        if !record_path.is_file() {
-            missing.push(format!(
-                "{behaviour} {}: {}",
-                block.expectation, block.title
-            ));
-        }
-    }
-    missing
+    missing_records(&current_scenarios(), |behaviour, expectation| {
+        traceability_dir()
+            .join(behaviour)
+            .join(format!("{expectation}.md"))
+            .is_file()
+    })
 }
 
 /// A record's evidence is faithful to its pre-migration source if it
@@ -453,18 +463,45 @@ fn evidence_preserves_original(record_evidence: &str, expected: &str) -> bool {
             .is_some_and(|rest| rest.starts_with("\n\n") && !rest.trim().is_empty())
 }
 
+/// The pure per-record fidelity decision (qa test-design review: neither
+/// branch had committed coverage of its own logic, since every record in
+/// this repository today happens to be migrated, so the untested branch
+/// was permanently unreachable by anything in the real suite).
+/// `historical_evidence` is `Some(extracted comment text)` when the
+/// record's expectation was found in its migrated file's historical
+/// snapshot, `None` when that specific expectation is missing from an
+/// otherwise-migrated file (a real problem); `own_first_commit_evidence`
+/// is the fallback baseline for a file that postdates both fixed
+/// migration commits (warden security review, High).
+fn fidelity_verdict(
+    record_evidence: &str,
+    file_existed_at_migration: bool,
+    historical_evidence: Option<&str>,
+    own_first_commit_evidence: &str,
+) -> Option<&'static str> {
+    if file_existed_at_migration {
+        match historical_evidence {
+            None => Some("no historical scenario found"),
+            Some(expected) if evidence_preserves_original(record_evidence, expected) => None,
+            Some(_) => Some("evidence text differs"),
+        }
+    } else if evidence_preserves_original(record_evidence, own_first_commit_evidence) {
+        None
+    } else {
+        Some("evidence text differs from its own first-committed version")
+    }
+}
+
 /// E2's check: every given record's evidence matches its pre-migration
-/// comment byte-for-byte, or legitimately extends it (see
-/// `evidence_preserves_original`). A record whose own `.feature` file
-/// never existed at the migration commit has no pre-migration inline
-/// comment to compare against -- but it must still be checked against
-/// SOMETHING: its own first-committed evidence, so tampering after
-/// initial acceptance is still caught (warden security review, High: an
-/// earlier version of this fix skipped such records outright, a
-/// permanent, indefinite bypass of this exact check for every future
-/// behaviour).
+/// comment byte-for-byte, or legitimately extends it, via
+/// [`fidelity_verdict`]'s decision. `existed_at` is resolved once per
+/// FEATURE FILE and reused across that file's records (qa test-design
+/// review: the answer never varies within one file, so re-deriving it per
+/// record spawned ~7x more `git` subprocesses than necessary).
 fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
     let historical = historical_scenarios();
+    let mut existed_cache: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
     let mut mismatches = Vec::new();
     for record_path in record_paths {
         let record = read_record(record_path);
@@ -477,33 +514,35 @@ fn check_fidelity(record_paths: &[PathBuf]) -> Vec<String> {
             .unwrap();
         let expectation = record_path.file_stem().unwrap().to_str().unwrap();
         let commit = migration_commit_for(Path::new(&record.feature_file));
-        if !existed_at(&format!("{commit}^:{}", record.feature_file)) {
+        let feature_file = record.feature_file.clone();
+        let file_existed = *existed_cache
+            .entry(feature_file.clone())
+            .or_insert_with(|| existed_at(&format!("{commit}^:{feature_file}")));
+
+        let historical_evidence = historical
+            .iter()
+            .find(|(b, blk)| b == behaviour && blk.expectation == expectation)
+            .map(|(_, blk)| extract_evidence(blk).unwrap_or_default());
+
+        let own_first_commit_evidence = if file_existed {
+            String::new() // unused by fidelity_verdict in this branch
+        } else {
             let record_rel = record_path
                 .strip_prefix(repo_root())
                 .expect("record path should be under the repo root")
                 .to_str()
                 .unwrap();
             let first_commit = first_commit_introducing(record_rel);
-            let original = parse_record(&git_show(&format!("{first_commit}:{record_rel}")));
-            if !evidence_preserves_original(&record.evidence, &original.evidence) {
-                mismatches.push(format!(
-                    "{behaviour} {expectation}: evidence text differs from its own first-committed version"
-                ));
-            }
-            continue;
-        }
-        let Some((_, block)) = historical
-            .iter()
-            .find(|(b, blk)| b == behaviour && blk.expectation == expectation)
-        else {
-            mismatches.push(format!(
-                "{behaviour} {expectation}: no historical scenario found"
-            ));
-            continue;
+            parse_record(&git_show(&format!("{first_commit}:{record_rel}"))).evidence
         };
-        let expected = extract_evidence(block).unwrap_or_default();
-        if !evidence_preserves_original(&record.evidence, &expected) {
-            mismatches.push(format!("{behaviour} {expectation}: evidence text differs"));
+
+        if let Some(reason) = fidelity_verdict(
+            &record.evidence,
+            file_existed,
+            historical_evidence.as_deref(),
+            &own_first_commit_evidence,
+        ) {
+            mismatches.push(format!("{behaviour} {expectation}: {reason}"));
         }
     }
     mismatches
@@ -766,8 +805,9 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        content_baseline_rev_and_path, evidence_preserves_original, existed_at, existed_at_in,
-        feature_structure_mismatch, first_commit_introducing_in,
+        ScenarioBlock, content_baseline_rev_and_path, evidence_preserves_original, existed_at,
+        existed_at_in, feature_structure_mismatch, fidelity_verdict, first_commit_introducing_in,
+        missing_records,
     };
 
     #[test]
@@ -1001,5 +1041,81 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scenario(behaviour: &str, expectation: &str, title: &str) -> (String, ScenarioBlock) {
+        (
+            behaviour.to_string(),
+            ScenarioBlock {
+                expectation: expectation.to_string(),
+                title: title.to_string(),
+                abs_start: 0,
+                lines: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn missing_records_reports_only_the_scenario_the_predicate_says_has_no_record() {
+        // qa test-design review: check_completeness's switch to
+        // current-scenario-based lookup had no committed coverage of its
+        // own decision logic (every real file today already has every
+        // record, so the "missing" branch was unreachable by anything in
+        // the real suite).
+        let scenarios = vec![
+            scenario("B25", "E1", "first"),
+            scenario("B25", "E2", "second"),
+        ];
+        let missing = missing_records(&scenarios, |b, e| b == "B25" && e == "E1");
+        assert_eq!(missing, vec!["B25 E2: second".to_string()]);
+    }
+
+    #[test]
+    fn missing_records_reports_nothing_when_every_scenario_has_a_record() {
+        let scenarios = vec![scenario("B25", "E1", "first")];
+        assert!(missing_records(&scenarios, |_, _| true).is_empty());
+    }
+
+    #[test]
+    fn fidelity_verdict_flags_a_migrated_files_missing_historical_scenario() {
+        assert_eq!(
+            fidelity_verdict("some evidence", true, None, ""),
+            Some("no historical scenario found")
+        );
+    }
+
+    #[test]
+    fn fidelity_verdict_flags_a_migrated_files_altered_evidence() {
+        assert_eq!(
+            fidelity_verdict("altered", true, Some("original"), ""),
+            Some("evidence text differs")
+        );
+    }
+
+    #[test]
+    fn fidelity_verdict_accepts_a_migrated_files_unaltered_evidence() {
+        assert_eq!(
+            fidelity_verdict("original", true, Some("original"), ""),
+            None
+        );
+    }
+
+    #[test]
+    fn fidelity_verdict_accepts_a_post_migration_records_unaltered_evidence() {
+        // warden security review, High: this is the exact branch that was
+        // previously either a hard skip or an always-false-positive --
+        // now a real, hermetically-tested comparison.
+        assert_eq!(
+            fidelity_verdict("first-commit text", false, None, "first-commit text"),
+            None
+        );
+    }
+
+    #[test]
+    fn fidelity_verdict_flags_a_post_migration_records_altered_evidence() {
+        assert_eq!(
+            fidelity_verdict("tampered", false, None, "first-commit text"),
+            Some("evidence text differs from its own first-committed version")
+        );
     }
 }
