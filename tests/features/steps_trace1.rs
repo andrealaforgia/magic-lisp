@@ -1310,6 +1310,17 @@ mod tests {
             PINNED_BRANCH_FEATURE_REL,
             Some(&pinned_commit),
         );
+        // warden security review: without re-asserting this here, the test
+        // borrows its "actually took the pinned branch" proof from its
+        // sibling instead of verifying it independently -- in this fixture
+        // the pinned and fallback paths happen to resolve to the same
+        // blob, so a regression that silently forced every lookup onto
+        // the fallback wouldn't be caught by this test alone.
+        assert_eq!(
+            baseline,
+            format!("{pinned_commit}^:{PINNED_BRANCH_FEATURE_REL}"),
+            "OLD.feature existed at the pin, so this must take the pinned branch, not the fallback"
+        );
         let baseline_content = git_show_in(&repo.dir, &baseline);
 
         repo.write(
