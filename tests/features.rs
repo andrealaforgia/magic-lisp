@@ -215,6 +215,18 @@ fn b20_self_test_and_quality_gates() {
     );
 }
 
+/// The fast/soak scenario-prefix split for B21 and B22 (see
+/// `registry::run_feature_subset`'s own doc comment): named once here, in
+/// the one place both halves of each split AND the coverage test below
+/// read from, so the two lists can't silently drift apart from the
+/// scenarios actually in the `.feature` file (warden security review: an
+/// earlier version had no automated guarantee the two lists' union
+/// equalled the full scenario set).
+const B21_FAST_SCENARIOS: &[&str] = &["E1 ", "E2 ", "E3 ", "E4 "];
+const B21_SOAK_SCENARIOS: &[&str] = &["E5 ", "E6 "];
+const B22_FAST_SCENARIOS: &[&str] = &["E3 "];
+const B22_SOAK_SCENARIOS: &[&str] = &["E1 ", "E2 ", "E4 "];
+
 #[test]
 fn b21_performance_and_memory_fast() {
     let src = include_str!("../features/B21-performance-and-memory.feature");
@@ -222,7 +234,7 @@ fn b21_performance_and_memory_fast() {
         "B21-performance-and-memory",
         src,
         &steps_b21::registry(),
-        &["E1 ", "E2 ", "E3 ", "E4 "],
+        B21_FAST_SCENARIOS,
     );
 }
 
@@ -238,7 +250,7 @@ fn b21_performance_and_memory_soak() {
         "B21-performance-and-memory",
         src,
         &steps_b21::registry(),
-        &["E5 ", "E6 "],
+        B21_SOAK_SCENARIOS,
     );
 }
 
@@ -249,7 +261,7 @@ fn b22_cycle_safe_memory_fast() {
         "B22-cycle-safe-memory",
         src,
         &steps_b22::registry(),
-        &["E3 "],
+        B22_FAST_SCENARIOS,
     );
 }
 
@@ -265,7 +277,21 @@ fn b22_cycle_safe_memory_soak() {
         "B22-cycle-safe-memory",
         src,
         &steps_b22::registry(),
-        &["E1 ", "E2 ", "E4 "],
+        B22_SOAK_SCENARIOS,
+    );
+}
+
+#[test]
+fn b21_and_b22_fast_plus_soak_prefixes_cover_every_scenario() {
+    registry::assert_full_scenario_coverage(
+        "B21-performance-and-memory",
+        include_str!("../features/B21-performance-and-memory.feature"),
+        &[B21_FAST_SCENARIOS, B21_SOAK_SCENARIOS].concat(),
+    );
+    registry::assert_full_scenario_coverage(
+        "B22-cycle-safe-memory",
+        include_str!("../features/B22-cycle-safe-memory.feature"),
+        &[B22_FAST_SCENARIOS, B22_SOAK_SCENARIOS].concat(),
     );
 }
 

@@ -87,6 +87,29 @@ pub(crate) fn run_feature_subset(
     run_scenarios(feature_label, &scenarios, registry);
 }
 
+/// Asserts every scenario in `src` is covered by at least one of
+/// `all_prefixes` -- meant to be called with the UNION of every split
+/// (fast + soak, or however many) [`run_feature_subset`] prefix lists for
+/// one `.feature` file. `run_feature_subset` alone only guards against a
+/// prefix matching *nothing*; it has no way to know about a sibling
+/// split's prefixes, so a future scenario left out of every list would
+/// silently never run under any invocation, default or `--ignored` (warden
+/// security review) -- this closes that gap with a loud, always-on check.
+pub(crate) fn assert_full_scenario_coverage(feature_label: &str, src: &str, all_prefixes: &[&str]) {
+    let feature = parse_feature(src);
+    let uncovered: Vec<&str> = feature
+        .scenarios
+        .iter()
+        .filter(|s| !all_prefixes.iter().any(|p| s.name.starts_with(p)))
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "{feature_label}: scenario(s) not covered by any prefix list, so they'd never run \
+         under any split test: {uncovered:?}"
+    );
+}
+
 fn run_scenarios(feature_label: &str, scenarios: &[Scenario], registry: &Registry) {
     let mut failures = Vec::new();
     for scenario in scenarios {
@@ -178,5 +201,19 @@ mod tests {
         // (parse -> filter -> dispatch) works end to end, not just the
         // filter predicate in isolation.
         run_feature_subset("fixture", SRC, &no_op_registry(), &["E1 ", "E4 "]);
+    }
+
+    #[test]
+    fn full_scenario_coverage_passes_when_the_union_of_prefixes_covers_every_scenario() {
+        assert_full_scenario_coverage("fixture", SRC, &["E1 ", "E4 ", "E10 "]);
+    }
+
+    #[test]
+    #[should_panic(expected = "E10")]
+    fn full_scenario_coverage_panics_when_a_scenario_is_left_out_of_every_prefix_list() {
+        // The exact drift warden's review warned about: a scenario (E10
+        // here) not named by any split's prefix list would otherwise
+        // silently never run under any invocation.
+        assert_full_scenario_coverage("fixture", SRC, &["E1 ", "E4 "]);
     }
 }
