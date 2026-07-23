@@ -29,6 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::gherkin::parse_feature;
 use super::registry::Registry;
 
 /// The commit that removed the original 25 files' inline evidence comments
@@ -333,7 +334,7 @@ fn evidence_preserves_original(record_evidence: &str, expected: &str) -> bool {
     record_evidence == expected
         || record_evidence
             .strip_prefix(expected)
-            .is_some_and(|rest| rest.starts_with("\n\n") && rest.len() > 2)
+            .is_some_and(|rest| rest.starts_with("\n\n") && !rest.trim().is_empty())
 }
 
 /// E2's check: every given record's evidence matches its pre-migration
@@ -412,11 +413,35 @@ fn check_no_leftover_markers() -> Vec<String> {
     leftover
 }
 
-/// E4's check, part 2: every migrated file's *content* -- not just its
-/// scenario count -- matches its pre-migration content with the evidence
-/// blocks removed, exactly. A real line-for-line diff, per qa test-design
-/// review msg #92 (the Then-clause claims content, not just count, is
-/// unchanged).
+/// E4's check, part 2: every migrated file's *executable Gherkin
+/// structure* -- scenario names, count, and each step's own text/docstring
+/// -- matches its pre-migration content with the evidence blocks removed,
+/// exactly. Compares parsed scenarios (the same parser that actually
+/// drives every other behaviour's tests), not raw file lines, so a later,
+/// legitimate comment addition (prose that isn't a Given/When/Then/And/But
+/// step) doesn't register as drift -- only a change to the executable
+/// content itself, or to how many scenarios exist, does. qa test-design
+/// review: this check, still pinned line-for-line against one frozen
+/// commit, reproduced the exact "legitimately grew past the pin" failure
+/// `evidence_preserves_original` was already fixed for elsewhere in this
+/// file, when a documentation-only comment was added to a migrated
+/// feature file.
+fn feature_structure_mismatch(historical_stripped: &str, actual: &str) -> Option<String> {
+    let expected = parse_feature(historical_stripped);
+    let actual = parse_feature(actual);
+    if expected.scenarios.len() != actual.scenarios.len() {
+        return Some(format!(
+            "scenario count changed ({} -> {})",
+            expected.scenarios.len(),
+            actual.scenarios.len()
+        ));
+    }
+    if expected.scenarios != actual.scenarios {
+        return Some("a scenario's name or step content changed".to_string());
+    }
+    None
+}
+
 fn check_content_unchanged() -> Vec<String> {
     let mut problems = Vec::new();
     for path in migrated_feature_files() {
@@ -425,15 +450,8 @@ fn check_content_unchanged() -> Vec<String> {
         let historical = git_show(&format!("{commit}^:{rel}"));
         let expected = strip_evidence_blocks(&historical);
         let actual = std::fs::read_to_string(&path).unwrap();
-        // Both sides come from files that end in a trailing newline;
-        // comparing line-by-line rather than the raw strings avoids a
-        // spurious mismatch from that single trailing empty element.
-        let expected_lines: Vec<&str> = expected.lines().collect();
-        let actual_lines: Vec<&str> = actual.lines().collect();
-        if expected_lines != actual_lines {
-            problems.push(format!(
-                "{rel}: content differs from the migration's own expectation"
-            ));
+        if let Some(reason) = feature_structure_mismatch(&expected, &actual) {
+            problems.push(format!("{rel}: {reason}"));
         }
     }
     problems
@@ -565,7 +583,7 @@ pub(crate) fn registry() -> Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::evidence_preserves_original;
+    use super::{evidence_preserves_original, feature_structure_mismatch};
 
     #[test]
     fn an_exact_match_is_faithful() {
@@ -625,5 +643,58 @@ mod tests {
     #[test]
     fn a_missing_historical_baseline_matches_only_an_equally_empty_record() {
         assert!(evidence_preserves_original("", ""));
+    }
+
+    #[test]
+    fn a_whitespace_only_addendum_after_the_blank_line_is_not_faithful() {
+        // qa test-design review: one increment past the covered "empty
+        // addendum" case -- whitespace alone adds no real content either.
+        let original = "Evidence: the original round's finding.";
+        let whitespace_only = "Evidence: the original round's finding.\n\n   ";
+        assert!(!evidence_preserves_original(whitespace_only, original));
+    }
+
+    const FIXTURE: &str = "Feature: fixture\n\n  \
+        Scenario: E1 — first\n    Given a thing\n    When it happens\n    Then it works\n\n  \
+        Scenario: E2 — second\n    Given another thing\n    Then it also works\n";
+
+    #[test]
+    fn identical_content_has_no_structure_mismatch() {
+        assert!(feature_structure_mismatch(FIXTURE, FIXTURE).is_none());
+    }
+
+    #[test]
+    fn a_later_comment_added_anywhere_is_not_a_structure_mismatch() {
+        // The exact class of legitimate growth that broke this check
+        // (qa test-design review): a documentation-only line, not a
+        // Given/When/Then/And/But step.
+        let grown = "Feature: fixture\n\n  # A later, purely explanatory comment.\n  \
+            Scenario: E1 — first\n    Given a thing\n    When it happens\n    Then it works\n\n  \
+            Scenario: E2 — second\n    Given another thing\n    Then it also works\n";
+        assert!(feature_structure_mismatch(FIXTURE, grown).is_none());
+    }
+
+    #[test]
+    fn adding_a_whole_new_scenario_is_a_structure_mismatch() {
+        let with_extra_scenario = format!(
+            "{FIXTURE}\n  Scenario: E3 — third\n    Given a third thing\n    Then it works too\n"
+        );
+        let mismatch = feature_structure_mismatch(FIXTURE, &with_extra_scenario);
+        assert!(mismatch.is_some_and(|m| m.contains("count")));
+    }
+
+    #[test]
+    fn altering_a_steps_wording_is_a_structure_mismatch() {
+        let altered = FIXTURE.replace("it works", "it works differently");
+        let mismatch = feature_structure_mismatch(FIXTURE, &altered);
+        assert!(mismatch.is_some_and(|m| m.contains("step")));
+    }
+
+    #[test]
+    fn removing_a_scenario_is_a_structure_mismatch() {
+        let first_only = "Feature: fixture\n\n  \
+            Scenario: E1 — first\n    Given a thing\n    When it happens\n    Then it works\n";
+        let mismatch = feature_structure_mismatch(FIXTURE, first_only);
+        assert!(mismatch.is_some_and(|m| m.contains("count")));
     }
 }

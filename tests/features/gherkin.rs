@@ -5,7 +5,7 @@
 //! to drive real step definitions from the files themselves — no external
 //! dependency needed for a subset this small and stable.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Step {
     /// The step's text with its leading keyword (Given/When/Then/And/But)
     /// stripped and any wrapped continuation lines joined with a single
@@ -20,13 +20,13 @@ pub(crate) struct Step {
     pub(crate) docstring: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Scenario {
     pub(crate) name: String,
     pub(crate) steps: Vec<Step>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Feature {
     pub(crate) name: String,
     pub(crate) scenarios: Vec<Scenario>,
