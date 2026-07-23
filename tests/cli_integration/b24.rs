@@ -168,18 +168,20 @@ fn e5_property_generated_variadic_divisions_match_the_independent_zero_anywhere_
 // --- E5(b): metamorphic -- flat vs. left-folded/nested form of the same operands. ---
 
 #[test]
-#[ignore = "open question for the Examiner, not a bug in this test: the flat and \
-            left-folded forms of the same operands disagree whenever an intermediate \
-            left-fold step goes inexact before reaching a later exact-zero divisor -- \
-            e.g. operands [-1, 4, 0]: flat `(/ -1 4 0)` errors (0 is an exact-fixnum \
-            divisor in the original, all-integer argument list), but left-folded \
-            `(/ (/ -1 4) 0)` does not, because by the time the outer call runs its \
-            dividend is already a runtime Float, routing it through the any_float/IEEE-754 \
-            path -- the same path an already-accepted case (B4/E7e, `(/ 6.0 0)` -> \
-            `+inf.0`, non-error) also relies on. Fixing native_divide so this relation \
-            always holds would also flip B4/E7e's accepted result, which B24's own \
-            expectation doesn't mention either way. Flagging upstream rather than \
-            silently choosing a side -- see the evidence message referencing this test."]
+#[ignore = "RESOLVED, not an open question anymore (Examiner verdict, relay msg #464): the \
+            flat and left-folded forms of the same operands disagree whenever an intermediate \
+            left-fold step goes inexact before reaching a later exact-zero divisor -- e.g. \
+            operands [-1, 4, 0]: flat `(/ -1 4 0)` errors (0 is an exact-fixnum divisor in the \
+            original, all-integer argument list), but left-folded `(/ (/ -1 4) 0)` does not, \
+            because by the time the outer call runs its dividend is already a runtime Float, \
+            routing it through the any_float/IEEE-754 path -- the same path an already-accepted \
+            case (B4/E7e, `(/ 6.0 0)` -> `+inf.0`, non-error) also relies on. The Examiner ruled \
+            this a genuine, orthogonal boundary (a sub-expression's fully-evaluated float RESULT \
+            is indistinguishable from a literal float dividend, which is B4/E7e's territory, not \
+            B24's single-fold-going-inexact scope) and confirmed E5 is satisfied by E5(a)'s \
+            property oracle alone. Kept disabled deliberately, as a documented boundary, not \
+            dead weight -- not because the relation is wrong, but because it correctly names a \
+            fixed, accepted asymmetry between two unrelated behaviours' scopes."]
 fn e5_metamorphic_flat_and_left_folded_division_agree_on_error_status() {
     let mut rng = Lcg::new(0x0FEE_DB24);
     const TRIALS: usize = 150;
@@ -210,6 +212,13 @@ fn e5_metamorphic_flat_and_left_folded_division_agree_on_error_status() {
 
 #[test]
 fn e6_the_full_observable_acceptance_set_holds_together() {
+    // Deliberately one bundled smoke test, not split by group: E1-E3 each
+    // already have their own dedicated, per-case test above with a full
+    // localizing message; this one exists only to prove the three
+    // categories hold TOGETHER in a single pass, so a shared failure here
+    // means the interaction, not any individual case, needs the
+    // already-precise tests above for localization (qa test-design
+    // review).
     // Previously-broken zero-not-last cases now error.
     for src in ["(display (/ 1 3 0))", "(display (/ 8 4 0 2))"] {
         let file = write_source("b24-e6-fixed.ml", src);
