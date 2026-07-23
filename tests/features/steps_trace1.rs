@@ -355,6 +355,16 @@ fn parse_record(content: &str) -> Record {
         .and_then(|s| s.strip_suffix('`'))
         .expect("record should have a Feature file reference")
         .to_string();
+    // warden security review: `repo_root().join(&record.feature_file)`
+    // would follow an absolute path outright (`PathBuf::join` replaces the
+    // base on an absolute component), and `..` components could escape
+    // `features/`. Requires repo write access to exploit -- the same
+    // trust level as every other finding in this file -- but cheap to
+    // fail loudly on rather than silently permit.
+    assert!(
+        !Path::new(&feature_file).is_absolute() && !feature_file.contains(".."),
+        "record's Feature file reference must be a plain relative path under features/, got {feature_file:?}"
+    );
     let scenario = content
         .lines()
         .find_map(|l| l.strip_prefix("**Scenario:** "))
@@ -898,6 +908,22 @@ mod tests {
             "{}^:features/this-file-does-not-exist.feature",
             super::MIGRATION_COMMIT
         )));
+    }
+
+    #[test]
+    #[should_panic(expected = "plain relative path")]
+    fn parse_record_rejects_an_absolute_feature_file_reference() {
+        super::parse_record(
+            "**Scenario:** E1 — x\n**Feature file:** `/etc/passwd`\n\n## Evidence\n\n```\ntext\n```\n",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "plain relative path")]
+    fn parse_record_rejects_a_feature_file_reference_containing_dot_dot() {
+        super::parse_record(
+            "**Scenario:** E1 — x\n**Feature file:** `features/../../../etc/passwd`\n\n## Evidence\n\n```\ntext\n```\n",
+        );
     }
 
     #[test]
